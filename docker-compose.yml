@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: sender_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./exports:/app/exports
+      - ./downloads:/app/downloads
+
+  db:
+    image: mysql:8.0
+    container_name: sender_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASS}
+      TZ: UTC
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password
+
+  redis:
+    image: redis:alpine
+    container_name: sender_redis
+    restart: always
+    command: /bin/sh -c "redis-server --requirepass $${REDIS_PASS:-''}"
+    environment:
+      REDIS_PASS: ${REDIS_PASS}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  mysql_data:
+  redis_data:
