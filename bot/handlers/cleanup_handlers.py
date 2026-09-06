@@ -59,7 +59,7 @@ async def execute_leave_groups(callback: types.CallbackQuery, state: FSMContext)
     domain = data.get("leave_domain", "groups")
     await state.clear()
     
-    status_msg = await safe_edit_or_answer(callback.message, "⏳ در حال اجرای عملیات خروج، لطفاً صبور باشید...")
+    await safe_edit_or_answer(callback.message, "⏳ در حال اجرای عملیات خروج، لطفاً صبور باشید...")
     
     report = []
     for acc_id, client in list(worker_pool.items()):
@@ -99,7 +99,7 @@ async def execute_leave_groups(callback: types.CallbackQuery, state: FSMContext)
         report.append(f"• اکانت <code>{acc_id}</code>: {success} موفق ✅ | {errors} خطا ❌")
         
     final_text = "📊 <b>گزارش نهایی خروج از چت‌ها:</b>\n\n" + "\n".join(report)
-    await status_msg.edit_text(final_text)
+    await safe_edit_or_answer(callback.message, final_text)
 
 # ==========================================
 # فیچر ۲: پاکسازی تاریخچه چت‌ها (DeleteChats)
@@ -135,7 +135,7 @@ async def execute_delete_chats(callback: types.CallbackQuery, state: FSMContext)
     domain = data.get("delete_domain", "dm")
     await state.clear()
     
-    status_msg = await safe_edit_or_answer(callback.message, "⏳ در حال اجرای عملیات حذف تاریخچه چت‌ها...")
+    await safe_edit_or_answer(callback.message, "⏳ در حال اجرای عملیات حذف تاریخچه چت‌ها...")
     
     report = []
     for acc_id, client in list(worker_pool.items()):
@@ -166,7 +166,7 @@ async def execute_delete_chats(callback: types.CallbackQuery, state: FSMContext)
         report.append(f"• اکانت <code>{acc_id}</code>: {success} موفق ✅ | {errors} خطا ❌")
         
     final_text = "📊 <b>گزارش نهایی حذف چت‌ها:</b>\n\n" + "\n".join(report)
-    await status_msg.edit_text(final_text)
+    await safe_edit_or_answer(callback.message, final_text)
 
 # ==========================================
 # هندلر عمومی لغو عملیات (Cancel)

@@ -52,20 +52,20 @@ def _warmup_hours() -> int:
     except (AttributeError, TypeError, ValueError):
         return 24
 
-
 async def _is_warmed_up(session: AsyncSession, acc: Account, now: datetime) -> bool:
     """
-    🔥 فاز ۶ (R7): اکانت تا پایان دوره‌ی گرم‌شدن (warmed_up_at) هیچ chunk نمی‌گیرد.
-    - ست شده → مقایسه با now.
-    - NULL (مسیر لاگینی که start_single_worker را رد نکرده) → مقداردهی تنبل
-      محافظه‌کارانه: پایان دوره = الان + MIN_WARMUP_HOURS، ثبت در همین تراکنش
-      دیسپچر (گارد IS NULL → idempotent)؛ در همین سیکل هم chunk نمی‌گیرد.
-    - datetime های naive خوانده‌شده از MySQL به UTC تفسیر می‌شوند (هم‌راستا با
-      مقایسه‌ی موجود flood_wait_until با now(utc)).
+    🔥 فاز ۶ (R7) + سوییچ دستی بای‌پَس
     """
+    # ==============================================================
+    # 🟢 سوییچ دستی: با True کردن این مقدار، تمام اکانت‌ها (حتی جدید) بلافاصله کار می‌کنند.
+    # برای فعال شدن مجدد "دوره گرم‌شدن" (مثلاً ۲۴ ساعته)، فقط کافیست آن را False کنید.
+    # ==============================================================
+    BYPASS_WARMUP = True
+
     warmed = acc.warmed_up_at
     if warmed is None:
         try:
+            # زمان پایان دوره گرم‌شدن همچنان در دیتابیس ثبت می‌شود تا دیتای شما تمیز بماند
             await session.execute(
                 update(Account)
                 .where(Account.id == acc.id, Account.warmed_up_at.is_(None))
@@ -74,11 +74,15 @@ async def _is_warmed_up(session: AsyncSession, acc: Account, now: datetime) -> b
             )
         except Exception as e:
             logger.warning(f"Warmup lazy-init failed for account {acc.id}: {e}")
+        
+        if BYPASS_WARMUP:
+            return True
         return False
+
     if warmed.tzinfo is None:
         warmed = warmed.replace(tzinfo=timezone.utc)
-    return now >= warmed
-
+        
+    return BYPASS_WARMUP or (now >= warmed)
 
 # ==========================================
 # 🚪 فاز ۶ (R3-ب): عضویت‌های «به‌خاطر سفارش» + leave بعد از اتمام
@@ -342,17 +346,7 @@ async def _salvage_unsent_after_crash(
     targets: List[str],
 ) -> List[str]:
     """
-    🔴 مکمل فاز ۲ (یافته ۵): بازیابی پس از کرش execute_bulk_send.
-    قبلاً هر exception خامِ فرارکرده از execute_bulk_send کل chunk را گم می‌کرد
-    (تارگت‌ها هنگام dispatch از order.target_data بریده شده بودند).
-    استراتژی:
-    ۱) commit لاگ‌های در جریان (session.add شده اما هنوز commit نشده) تا معلوم شود
-       کدام تارگت‌ها واقعاً پردازش شده‌اند؛
-    ۲) فقط تارگت‌های «بدون لاگ» (پردازش‌نشده) یا با آخرین لاگِ retryable
-       (FloodWait/UserRestricted — در فلو عادی هم requeue می‌شوند) برمی‌گردند.
-    تارگت‌های موفق یا با خطای دائمی (UserIsBlocked/PeerIdInvalid/…) requeue نمی‌شوند —
-    دوباره‌ارسال آن‌ها یعنی پیام تکراری برای کاربر = دقیقاً سیگنال اسپم.
-    هر خطای خودِ بازیابی → [] (مسیر امن: بدون requeue).
+    🔴 مکمل فاز ۲ و ۶: بازیابی امن پس از کرش با پشتیبانی از Chunkهای عظیم
     """
     try:
         await session.commit()
@@ -363,16 +357,22 @@ async def _salvage_unsent_after_crash(
         except Exception:
             pass
         return []
+        
+    log_rows = []
+    chunk_size = 500  # 🟢 فاز ۶: قطعه‌بندی برای جلوگیری از شکستن محدودیت پارامترهای SQL
     try:
-        log_rows = (await session.execute(
-            select(OrderLog.target, OrderLog.status, OrderLog.error_message)
-            .where(
-                OrderLog.order_id == order_id,
-                OrderLog.account_id == account_db_id,
-                OrderLog.target.in_(targets),
-            )
-            .order_by(OrderLog.id.asc())
-        )).all()
+        for i in range(0, len(targets), chunk_size):
+            batch = targets[i:i + chunk_size]
+            rows = (await session.execute(
+                select(OrderLog.target, OrderLog.status, OrderLog.error_message)
+                .where(
+                    OrderLog.order_id == order_id,
+                    OrderLog.account_id == account_db_id,
+                    OrderLog.target.in_(batch),
+                )
+                .order_by(OrderLog.id.asc())
+            )).all()
+            log_rows.extend(rows)
     except Exception as e:
         logger.error(f"Salvage: log query failed for Order #{order_id}: {e}")
         return []
@@ -390,34 +390,37 @@ async def _salvage_unsent_after_crash(
             continue
         log = last_log_by_target.get(t)
         if log is None:
-            unsent.append(t)  # هرگز پردازش نشده
+            unsent.append(t)
             continue
         _, err = log
         if (
             "FloodWait" in (err or "")
-            or "TransientConnection" in (err or "")  # 🛡 فاز ۴ (BUG-08/ج): abort گذرا
+            or "TransientConnection" in (err or "")
             or err == "UserRestricted"
         ):
-            unsent.append(t)  # retryable — در فلو عادی هم requeue می‌شد
-        # بقیه: خطای دائمی/مصرف‌شده → requeue نمی‌شود (هم‌راستا با فلو عادی)
+            unsent.append(t)
+            
     return unsent
+
 
 def _build_chunk_order(order: Order, banner: Banner) -> Order:
     """
     🎨 چرخش بنر: ساخت نمونه‌ی Order جدا و transient برای هر chunk.
+    در منطق جدید، بنر همیشه به عنوان پیام دوم (message_2_text) در نظر گرفته می‌شود 
+    تا در هر دو حالت (هوشمند و عادی) پیام اول شما دست‌نخورده باقی بماند.
     """
     return Order(
         id=order.id,
         order_type=order.order_type,
-        message_text=banner.text,
-        media_path=banner.media_path,
-        media_type=banner.media_type,
+        message_text=order.message_text,       # حفظ پیام اول کاربر (یخ‌شکن)
+        media_path=order.media_path,
+        media_type=order.media_type,
         button_text=order.button_text,
         button_url=order.button_url,
-        message_2_text=order.message_2_text,
-        media_2_path=order.media_2_path,
-        media_2_type=order.media_2_type,
-        message_3_text=order.message_3_text,
+        message_2_text=banner.text,            # تزریق بنر همیشه به جایگاه پیام دوم
+        media_2_path=banner.media_path,
+        media_2_type=banner.media_type,
+        message_3_text=order.message_3_text,   # حفظ پیام سوم کاربر
         media_3_path=order.media_3_path,
         media_3_type=order.media_3_type,
         smart_flow=order.smart_flow,
@@ -425,7 +428,6 @@ def _build_chunk_order(order: Order, banner: Banner) -> Order:
         source_channel_id=order.source_channel_id,
         source_message_ids=order.source_message_ids,
     )
-
 
 async def extractor_task_wrapper(
     client: Client,
@@ -1052,16 +1054,35 @@ _order_finalize_locks: Dict[int, asyncio.Lock] = {}
 _order_finalize_locks_guard = asyncio.Lock()
 
 
-async def _get_order_finalize_lock(order_id: int) -> asyncio.Lock:
-    """ساخت تنبلِ قفل per-order (الگوی _get_login_capacity_lock در login_handlers)."""
-    async with _order_finalize_locks_guard:
-        lock = _order_finalize_locks.get(order_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _order_finalize_locks[order_id] = lock
-        return lock
+class DistributedFinalizeLock:
+    def __init__(self, order_id: int):
+        self.order_id = order_id
+        self.lock_key = f"finalize_lock:{order_id}"
+        self.acquired = False
 
+    async def __aenter__(self):
+        redis = _get_redis()
+        # تلاش برای دریافت قفل (Spinlock با سقف ۶۰ ثانیه صبر)
+        for _ in range(120):
+            # قفل با انقضای ۳۰ ثانیه‌ای (Self-healing در صورت کرش ناگهانی سرور)
+            self.acquired = await redis.set(self.lock_key, "1", nx=True, ex=30)
+            if self.acquired:
+                break
+            await asyncio.sleep(0.5)
+        
+        if not self.acquired:
+            logger.warning(f"Timeout acquiring Redis finalize lock for Order #{self.order_id}. Proceeding anyway...")
+        return self
 
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # آزادسازی هوشمند قفل پس از خروج از بلوک
+        if self.acquired:
+            try:
+                redis = _get_redis()
+                await redis.delete(self.lock_key)
+            except Exception as e:
+                logger.error(f"Failed to release Redis lock {self.lock_key}: {e}")
+    
 def _is_extract_order(order: Order) -> bool:
     """
     تشخیص سفارش استخراج — سازگار با هر دو شکل مقدار order_type در مدل
@@ -1084,7 +1105,6 @@ def _spawn_background_task(coro) -> asyncio.Task:
     _running_background_tasks.add(task)
     task.add_done_callback(_running_background_tasks.discard)
     return task
-
 async def _finalize_chunk(
     order_id: int,
     unsent_targets: List[str],
@@ -1096,8 +1116,8 @@ async def _finalize_chunk(
     admin_notify_text: Optional[str] = None
     media_paths_to_clean: List[str] = []
 
-    finalize_lock = await _get_order_finalize_lock(order_id)
-    async with finalize_lock:
+    # 🟢 فاز ۵: استفاده مستقیم از کانتکست منیجر کلاس قفل توزیع‌شده (Stateless)
+    async with DistributedFinalizeLock(order_id):
         try:
             async with session_maker() as session:
                 async with session.begin():

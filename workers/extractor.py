@@ -35,20 +35,20 @@ async def safe_join_chat(client: Client, group_link: str) -> Tuple[str, Optional
     chat_obj = None
     joined_now = False
     
-    # --- فیکس فرمت لینک برای جلوگیری از خطای Pyrogram ---
     target_chat = group_link.strip()
-    # اگر لینک خصوصی نیست (حاوی + یا joinchat نیست)، آن را به یوزرنیم استاندارد تبدیل می‌کنیم
-    if "+" not in target_chat and "joinchat" not in target_chat:
+    is_private = "+" in target_chat or "joinchat" in target_chat
+    
+    if not is_private:
         target_chat = re.sub(r"^https?://(www\.)?t\.me/", "", target_chat)
         target_chat = target_chat.replace("t.me/", "").strip("/")
         if not target_chat.startswith("@"):
             target_chat = f"@{target_chat}"
-    # --------------------------------------------------
 
     try:
         await asyncio.sleep(random.uniform(2, 5))
-        # اکنون از target_chat اصلاح‌شده استفاده می‌کنیم
         chat_obj = await client.join_chat(target_chat)
+        if chat_obj and getattr(chat_obj, "id", None):
+            chat_obj = await client.get_chat(chat_obj.id)
         joined_now = True
         logger.info(f"Worker {client.name} joined {chat_obj.title} successfully.")
 
@@ -57,17 +57,28 @@ async def safe_join_chat(client: Client, group_link: str) -> Tuple[str, Optional
         await asyncio.sleep(e.value + random.uniform(2, 5))
         try:
             chat_obj = await client.join_chat(target_chat)
+            if chat_obj and getattr(chat_obj, "id", None):
+                chat_obj = await client.get_chat(chat_obj.id)
             joined_now = True
         except UserAlreadyParticipant:
-            logger.info(f"Worker {client.name} is already a member of the target group.")
-            chat_obj = await client.get_chat(target_chat)
+            logger.info(f"Worker {client.name} is already a member (after retry).")
+            joined_now = False
+            # 🟢 فیکس قطعی: استفاده از لینک اصلی برای بازسازی کش در صورت عضویت قبلی
+            chat_obj = await client.get_chat(group_link)
         except Exception as inner_e:
             logger.error(f"Worker {client.name} failed after FloodWait retry: {inner_e}")
             return ("error", None, False)
 
     except UserAlreadyParticipant:
         logger.info(f"Worker {client.name} is already a member of the target group.")
-        chat_obj = await client.get_chat(target_chat)
+        joined_now = False
+        try:
+            # 🟢 فیکس قطعی: برخلاف تصور قبلی، get_chat از لینک‌های خصوصی پشتیبانی می‌کند
+            # این کار باعث دانلود اطلاعات گروه و آپدیت شدن حافظه Pyrogram می‌شود.
+            chat_obj = await client.get_chat(group_link)
+        except Exception as e:
+            logger.error(f"Worker {client.name}: get_chat failed for already-joined link {group_link}: {e}")
+            return ("error", None, False)
 
     except InviteRequestSent:
         logger.warning(f"Worker {client.name} sent join request to {target_chat}. Requires admin approval.")
@@ -98,6 +109,7 @@ async def safe_join_chat(client: Client, group_link: str) -> Tuple[str, Optional
 
     await asyncio.sleep(random.uniform(3, 6))
     return ("success", chat_obj, joined_now)
+
 
 # ==========================================
 # 🔵 زیرساخت مشترک: گام دوم — جمع‌آوری ادمین‌ها جهت فیلترینگ
@@ -156,10 +168,20 @@ async def iter_group_members(client: Client, chat_id: int, admin_ids: Set[int]) 
             logger.warning(f"FloodWait {e.value}s in iter_group_members. Retries left: {retries-1}")
             await asyncio.sleep(e.value + random.uniform(2, 5))
             retries -= 1
+            
+        except (PeerIdInvalid, ChannelPrivate) as e:
+            # 🟢 جلوگیری از موفقیت قلابی: خطاهای بحرانی عدم دسترسی پرتاب می‌شوند
+            logger.error(f"Critical access error in iter_group_members for chat {chat_id}: {e.__class__.__name__}")
+            raise 
+            
         except Exception as e:
             logger.error(f"Error in iter_group_members: {e}")
-            # بازگشت بدون ارور برای حفظ نتایج جزئی
+            # اگر هیچ عضوی استخراج نشده، یعنی عملیات کاملاً شکست خورده است
+            if member_count == 0:
+                raise
+            # بازگشت بدون ارور فقط برای حفظ نتایج جزئی (Partial Success)
             break
+
 
 # ==========================================
 # ⚡️ بخش الف — فیلتر مشترک کاربران (_passes_filter)
@@ -210,7 +232,6 @@ async def extract_active_users(client: Client, group_link: str, filter_type: str
     is_partial = False
 
     try:
-        # انتقال گام اول به داخل بلاک try
         join_status, chat_obj, joined_now = await safe_join_chat(client, group_link)
         chat_id = chat_obj.id if chat_obj else None
         
@@ -236,12 +257,14 @@ async def extract_active_users(client: Client, group_link: str, filter_type: str
             elif filter_type == "golden":
                 active_user_ids: Set[int] = set()
                 message_count = 0
+                last_msg_id = 0  # 🟢 فاز ۶: ذخیره آخرین شناسه پیام برای Resume
                 logger.info("Fetching chat history to bypass Hidden Last Seen...")
                 
                 retries = 3
                 while retries > 0:
                     try:
-                        async for message in client.get_chat_history(chat_id, limit=2000):
+                        async for message in client.get_chat_history(chat_id, limit=2000, offset_id=last_msg_id):
+                            last_msg_id = message.id  # 🟢 فاز ۶: آپدیت نقطه توقف
                             message_count += 1
                             if message_count % 100 == 0:
                                 await asyncio.sleep(random.uniform(3, 7))
@@ -268,11 +291,13 @@ async def extract_active_users(client: Client, group_link: str, filter_type: str
         elif filter_type == "messages":
             logger.info("Extracting users purely based on chat history (Messages)...")
             message_count = 0
+            last_msg_id = 0  # 🟢 فاز ۶: جلوگیری از لوپ بی‌نهایت
             retries = 3
 
             while retries > 0:
                 try:
-                    async for message in client.get_chat_history(chat_id, limit=5000):
+                    async for message in client.get_chat_history(chat_id, limit=5000, offset_id=last_msg_id):
+                        last_msg_id = message.id  # 🟢 فاز ۶: آپدیت نقطه توقف
                         message_count += 1
                         if message_count % 200 == 0:
                             await asyncio.sleep(random.uniform(3, 7))
@@ -317,10 +342,7 @@ async def extract_active_users(client: Client, group_link: str, filter_type: str
 
     logger.info(f"Extraction complete! {len(golden_usernames)} targets saved to {file_path}")
 
-    # برگرداندن وضعیت بر اساس کیفیت خروجی استخراج
-    final_status = "partial_success" if is_partial else "success"
-    return (final_status, file_path, chat_id, joined_now)
-
+    return ("partial_success" if is_partial else "success", file_path, chat_id, joined_now)
 
 # ==========================================
 # 🔵 رفع باگ لینک: استخراج ممبرها برای «سفارش ارسال از نوع link»

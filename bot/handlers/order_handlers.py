@@ -771,18 +771,14 @@ async def ask_send_method_question(message: types.Message, state: FSMContext) ->
         reply_markup=get_send_method_keyboard(),
     )
 
-
 @router.message(CreateOrderStates.waiting_for_send_method, F.text.in_(SEND_METHOD_BY_TEXT))
 async def process_send_method_selection(message: types.Message, state: FSMContext) -> None:
     send_method = SEND_METHOD_BY_TEXT[message.text.strip()]
     await state.update_data(send_method=send_method)
 
     if send_method == "direct":
-        await state.set_state(CreateOrderStates.waiting_for_messages)
-        await message.answer(
-            with_cancel_hint("💬 <b>پیام خود را ارسال کنید:</b>"),
-            reply_markup=get_flow_nav_keyboard(),
-        )
+        # 🟢 فاز ۳: هدایت هوشمند به سوال بنر، قبل از دریافت هرگونه پیام
+        await ask_banner_pool_question(message, state)
     else:
         await state.update_data(source_message_ids=[])
         await state.set_state(CreateOrderStates.waiting_for_source_channel)
@@ -825,19 +821,33 @@ _SOURCE_CHANNEL_NOT_ACCESSIBLE_TEXT = (
 
 
 def _normalize_channel_input(raw: str) -> Optional[str]:
-    text = raw.strip()
+    # ۱. گرفتن خط اول در صورت ارسال چندخطی
+    text = raw.split('\n')[0].strip()
+    
+    # ۲. پاک‌سازی کاراکترهای نامرئی (مثل نیم‌فاصله یا کاراکترهای کنترلی کپی‌شده از تلگرام)
+    text = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f]', '', text).strip()
 
-    m = re.fullmatch(r"(?:https?://)?t\.me/c/(\d{4,12})/?", text, re.IGNORECASE)
+    # ۳. لینک‌های خصوصی پیام‌دار (مثل https://t.me/c/1234567890/123)
+    m = re.search(r"(?:https?://)?(?:t|telegram)\.me/c/(\d{4,15})(?:/\d+)?", text, re.IGNORECASE)
     if m:
         return f"-100{m.group(1)}"
+        
+    # ۴. لینک‌های دعوت (مثل https://t.me/+Hash یا https://t.me/joinchat/Hash)
+    # حتی اگر لینک پیام از گروه خصوصی باشد (https://t.me/+Hash/123)، بخش پیام نادیده گرفته می‌شود
+    m = re.search(r"(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)([A-Za-z0-9_\-]+)(?:/\d+)?", text, re.IGNORECASE)
+    if m:
+        return f"https://t.me/+{m.group(1)}"
 
-    m = re.fullmatch(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,64})/?", text, re.IGNORECASE)
+    # ۵. لینک‌های عمومی با/بدون پیام (مثل https://t.me/channelname/123)
+    m = re.search(r"(?:https?://)?(?:t|telegram)\.me/([A-Za-z0-9_]{4,64})(?:/\d+)?/?$", text, re.IGNORECASE)
     if m:
         return f"@{m.group(1)}"
 
+    # ۶. یوزرنیم با یا بدون @
     if re.fullmatch(r"@?[A-Za-z0-9_]{4,64}", text):
         return text if text.startswith("@") else f"@{text}"
 
+    # ۷. آیدی عددی (مثل -1001234567890)
     if re.fullmatch(r"-?\d{4,}", text):
         return text
 
@@ -1184,8 +1194,8 @@ async def process_source_forward(message: types.Message, state: FSMContext) -> N
     )
 
 
+# 🟢 ۱. تغییر تابع پایان جمع‌آوری پیام‌ها برای پرسیدن سوال جدید
 async def finish_source_message_collection(message: types.Message, state: FSMContext, bot: Bot) -> None:
-    """پایان جمع‌آوری پیام‌های نمونه — در حالت کپی مستقیماً به انتخاب فیلتر می‌رویم"""
     fsm_data = await state.get_data()
     source_channel_id = fsm_data.get("source_channel_id")
     source_message_ids = fsm_data.get("source_message_ids", [])
@@ -1198,18 +1208,49 @@ async def finish_source_message_collection(message: types.Message, state: FSMCon
 
     ids_display = ", ".join(f"<code>{mid}</code>" for mid in source_message_ids)
 
+    # رفتن به استیت جدید
+    await state.set_state(CreateOrderStates.waiting_for_forward_style)
+    
+    # ساخت کیبورد موقت دکمه‌ای
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="👁 نمایش فوروارد (نقل قول)"), types.KeyboardButton(text="👻 مخفی کردن (کپی پیام)")],
+            [types.KeyboardButton(text="❌ انصراف"), types.KeyboardButton(text="🏛 منوی اصلی")]
+        ],
+        resize_keyboard=True
+    )
+
     await message.answer(
         "📋 <b>پیام‌های کانال مبدا ثبت شد.</b>\n\n"
         f"🆔 کانال مبدا: <code>{source_channel_id}</code>\n"
         f"📨 پیام‌ها ({len(source_message_ids)}): {ids_display}\n\n"
-        "ℹ️ در حالت کپی:\n"
-        "• برای هر تارگت یکی از پیام‌های بالا به‌صورت تصادفی کپی می‌شود\n"
-        "• ظاهر پیام طبیعی است (بدون هدر «فوروارد شده از»)\n"
-        "• ایموجی‌های پریمیوم و قالب‌بندی پیام مبدا دقیقاً حفظ می‌شوند\n"
-        "• شخصی‌سازی {first_name} و جهش متن اعمال نمی‌شود"
+        "❓ <b>نحوه ارسال پیام‌ها را انتخاب کنید:</b>\n\n"
+        "👁 <b>نمایش فوروارد:</b> بالای پیام نوشته می‌شود «فوروارد شده از...» (لینک و اعتبار منبع حفظ می‌شود).\n"
+        "👻 <b>مخفی کردن:</b> پیام‌ها دقیقاً کپی می‌شوند و هیچ اثری از کانال مبدا نخواهد بود.",
+        reply_markup=kb
     )
 
+# 🟢 ۲. اضافه کردن هندلر برای جواب کاربر
+@router.message(CreateOrderStates.waiting_for_forward_style, F.text.in_(["👁 نمایش فوروارد (نقل قول)", "👻 مخفی کردن (کپی پیام)"]))
+async def process_forward_style(message: types.Message, state: FSMContext, bot: Bot) -> None:
+    if "مخفی" in message.text:
+        await state.update_data(forward_style="copy")
+    else:
+        await state.update_data(forward_style="forward")
+    
     await proceed_to_filter_selection(message, state, bot)
+
+@router.message(CreateOrderStates.waiting_for_forward_style)
+async def forward_style_fallback(message: types.Message, state: FSMContext) -> None:
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="👁 نمایش فوروارد (نقل قول)"), types.KeyboardButton(text="👻 مخفی کردن (کپی پیام)")],
+            [types.KeyboardButton(text="❌ انصراف"), types.KeyboardButton(text="🏛 منوی اصلی")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("⚠️ لطفاً با دکمه‌های زیر یکی از گزینه‌ها را انتخاب کنید.", reply_markup=kb)
+
 
 
 # ==========================================
@@ -1765,18 +1806,24 @@ async def orders_back_to_list_handler(callback: types.CallbackQuery, state: FSMC
 @router.message(CreateOrderStates.waiting_for_messages, F.text == END_COLLECTION_TEXT)
 async def end_messages_text(message: types.Message, state: FSMContext) -> None:
     fsm_data = await state.get_data()
-    if not fsm_data.get("order_messages"):
+    order_messages = fsm_data.get("order_messages", [])
+    
+    # 🟢 فاز ۳: چون جایگاه دوم ممکن است با متن خالی رزرو شده باشد، فقط پیام‌های واقعی را می‌شماریم
+    real_messages = [m for m in order_messages if m.get("text") != "" or m.get("media_path") is not None]
+    
+    if not real_messages:
         return await message.answer(
             with_cancel_hint("⚠️ لطفاً حداقل یک پیام ارسال کنید!"),
             reply_markup=get_end_collection_keyboard(),
         )
-    await ask_banner_pool_question(message, state)
-
+        
+    await ask_smart_flow_question(message, state)
 
 @router.message(CreateOrderStates.waiting_for_messages)
 async def process_order_messages(message: types.Message, state: FSMContext, bot: Bot) -> None:
     fsm_data = await state.get_data()
     order_messages = fsm_data.get("order_messages", [])
+    use_banner_pool = fsm_data.get("use_banner_pool", False)
 
     msg_text = message.text or message.caption or ""
     media_path = None
@@ -1841,20 +1888,30 @@ async def process_order_messages(message: types.Message, state: FSMContext, bot:
         "media_path": media_path,
         "media_type": media_type,
     })
+    
+    # 🟢 فاز ۳: تزریق پیام خالی (رزرو جایگاه بنر) تا جایگاه پیام سوم به هم نریزد
+    if use_banner_pool and len(order_messages) == 1:
+        order_messages.append({
+            "text": "",
+            "media_path": None,
+            "media_type": None,
+        })
 
     await state.update_data(order_messages=order_messages)
     msg_count = len(order_messages)
 
     if msg_count < 3:
+        if use_banner_pool:
+            prompt = "💬 <b>پیام سوم (اختیاری) را ارسال کنید:</b>\n\nℹ️ جایگاه دوم به بنر اختصاص یافته است."
+        else:
+            prompt = f"💬 <b>پیام {msg_count + 1} را ارسال کنید:</b>\n\n❕ تا ۳ پیام می‌توانید ارسال کنید."
+            
         await message.answer(
-            with_cancel_hint(
-                f"💬 <b>پیام {msg_count + 1} را ارسال کنید:</b>\n\n"
-                f"❕ تا ۳ پیام می‌توانید ارسال کنید."
-            ),
+            with_cancel_hint(prompt),
             reply_markup=get_end_collection_keyboard(),
         )
     else:
-        await ask_banner_pool_question(message, state)
+        await ask_smart_flow_question(message, state)
 
 
 # ==========================================
@@ -1866,15 +1923,37 @@ async def ask_banner_pool_question(message: types.Message, state: FSMContext) ->
     await message.answer(
         with_cancel_hint(
             "🎨 <b>استفاده از مخزن بنر</b>\n\n"
-            "استفاده از مخزن بنر (به‌جای متن این سفارش)؟\n\n"
-            "🟢 <b>بله:</b> متن و مدیای این سفارش نادیده گرفته می‌شود و هر اکانت برای "
-            "هر دسته از تارگت‌ها یک بنر تصادفی از مخزن دریافت می‌کند.\n"
-            "⚪️ <b>خیر:</b> ارسال با متن و مدیای همین سفارش انجام می‌شود.\n\n"
-            "<i>نکته: اگر هنگام ارسال هیچ بنر فعالی در مخزن نباشد، سفارش به‌صورت خودکار "
-            "با متن خودش ادامه می‌دهد و به شما هشدار داده می‌شود.</i>"
+            "آیا می‌خواهید برای این سفارش از مخزن بنر استفاده کنید؟\n\n"
+            "🟢 <b>بله:</b> جایگاه پیام دوم (تبلیغ اصلی) در سیستم رزرو می‌شود و نیازی به تایپ آن نیست. شما فقط پیام اول (یخ‌شکن) و پیام سوم (اختیاری) را وارد می‌کنید.\n"
+            "⚪️ <b>خیر:</b> ارسال با پیام‌هایی که در مرحله بعد وارد می‌کنید انجام می‌شود.\n\n"
+            "<i>نکته: اگر هنگام ارسال، هیچ بنر فعالی در مخزن نباشد، ربات جایگاه بنر را خالی رد کرده و پیام‌های شما را می‌فرستد.</i>"
         ),
         reply_markup=get_banner_pool_keyboard(),
     )
+
+
+@router.message(CreateOrderStates.waiting_for_banner_pool, F.text == BANNER_POOL_YES_TEXT)
+async def banner_pool_yes_handler(message: types.Message, state: FSMContext) -> None:
+    await state.update_data(use_banner_pool=True)
+    await state.set_state(CreateOrderStates.waiting_for_messages)
+    await message.answer(
+        with_cancel_hint(
+            "💬 <b>پیام اول (یخ‌شکن) خود را ارسال کنید:</b>\n\n"
+            "ℹ️ <i>یادآوری: جایگاه پیام دوم برای <b>بنر</b> رزرو شده است.</i>"
+        ),
+        reply_markup=get_flow_nav_keyboard(),
+    )
+
+
+@router.message(CreateOrderStates.waiting_for_banner_pool, F.text == BANNER_POOL_NO_TEXT)
+async def banner_pool_no_handler(message: types.Message, state: FSMContext) -> None:
+    await state.update_data(use_banner_pool=False)
+    await state.set_state(CreateOrderStates.waiting_for_messages)
+    await message.answer(
+        with_cancel_hint("💬 <b>پیام اول خود را ارسال کنید:</b>\n\n❕ تا ۳ پیام می‌توانید ارسال کنید."),
+        reply_markup=get_flow_nav_keyboard(),
+    )
+
 
 
 @router.message(CreateOrderStates.waiting_for_banner_pool, F.text == BANNER_POOL_YES_TEXT)
@@ -2195,7 +2274,12 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
 
     source_channel_id = fsm_data.get("source_channel_id")
     source_message_ids_list = fsm_data.get("source_message_ids") or []
-    source_message_ids_str = ",".join(str(mid) for mid in source_message_ids_list) or None
+    forward_style = fsm_data.get("forward_style", "copy") 
+    
+    source_message_ids_str = None
+    if source_message_ids_list:
+        joined_ids = ",".join(str(mid) for mid in source_message_ids_list)
+        source_message_ids_str = f"{joined_ids}|{forward_style}"
 
     if not messages and not source_message_ids_list and not use_banner_pool:
         await cleanup_fsm_temp_files(state)
@@ -2513,8 +2597,11 @@ async def generate_dashboard_data(
 
     send_method_line = ""
     if order.source_message_ids:
-        src_count = len([p for p in order.source_message_ids.split(",") if p.strip().isdigit()])
-        send_method_line = f"📋 روش ارسال: کپی از مبدا <code>{order.source_channel_id}</code> ({src_count} پیام)\n"
+        parts = order.source_message_ids.split("|")
+        src_count = len([p for p in parts[0].split(",") if p.strip().isdigit()])
+        style_text = "کپی (مخفی)" if len(parts) < 2 or parts[1] == "copy" else "فوروارد (نقل قول)"
+        send_method_line = f"📋 روش ارسال: <b>{style_text}</b> از <code>{order.source_channel_id}</code> ({src_count} پیام)\n"
+        
 
     sec1 = [
         "🔰 <b>بخش ۱ — شناسایی سفارش</b>",
@@ -2737,8 +2824,8 @@ async def export_order_results(callback: types.CallbackQuery, session: AsyncSess
                 return await safe_edit_message(
                     wait_msg,
                     "⚠️ <b>فایل استخراج هنوز آماده نیست.</b>\n"
-                    "لطفاً تا تکمیل شدن سفارش منتظر بمانید.",
-                    reply_markup=get_main_menu_button()
+                    "لطفاً تا تکمیل شدن سفارش منتظر بمانید."
+
                 )
             
             # ارسال فایل استخراج شده
@@ -2753,8 +2840,8 @@ async def export_order_results(callback: types.CallbackQuery, session: AsyncSess
                     logger.error(f"Error sending stored extract file for order {order_id}: {e}")
                     return await safe_edit_message(
                         wait_msg,
-                        "❌ خطا در ارسال فایل گزارش.\nلطفاً دوباره تلاش کنید.",
-                        reply_markup=get_main_menu_button()
+                        "❌ خطا در ارسال فایل گزارش.\nلطفاً دوباره تلاش کنید."
+
                     )
                 with suppress(Exception):
                     await wait_msg.delete()
@@ -2762,8 +2849,8 @@ async def export_order_results(callback: types.CallbackQuery, session: AsyncSess
             else:
                 return await safe_edit_message(
                     wait_msg,
-                    "❌ <b>خطا:</b> فایل خروجی استخراج روی سرور یافت نشد یا حذف شده است.",
-                    reply_markup=get_main_menu_button()
+                    "❌ <b>خطا:</b> فایل خروجی استخراج روی سرور یافت نشد یا حذف شده است."
+
                 )
         # -------------------------------------------------------------------------
         
@@ -2776,16 +2863,14 @@ async def export_order_results(callback: types.CallbackQuery, session: AsyncSess
             await session.rollback()
             return await safe_edit_message(
                 wait_msg,
-                report_db_error("گزارش سفارش", e),
-                reply_markup=get_main_menu_button()
+                report_db_error("گزارش سفارش", e)
             )
 
         if not logs:
             return await safe_edit_message(
                 wait_msg,
                 "⚠️ <b>هیچ گزارش ارسالی برای این سفارش ثبت نشده است.</b>\n"
-                "ممکن است سفارش هنوز شروع نشده یا در صف انتظار باشد.",
-                reply_markup=get_main_menu_button()
+                "ممکن است سفارش هنوز شروع نشده یا در صف انتظار باشد."
             )
 
         os.makedirs("exports", exist_ok=True)
@@ -2806,15 +2891,15 @@ async def export_order_results(callback: types.CallbackQuery, session: AsyncSess
             return await safe_edit_message(
                 wait_msg,
                 "❌ خطا در تولید فایل گزارش.\n"
-                "لطفاً دوباره تلاش کنید.",
-                reply_markup=get_main_menu_button()
+                "لطفاً دوباره تلاش کنید."
+
             )
 
         if successful_targets == 0:
             return await safe_edit_message(
                 wait_msg,
-                "⚠️ <b>هیچ ارسال موفقی برای این سفارش ثبت نشده است.</b>",
-                reply_markup=get_main_menu_button()
+                "⚠️ <b>هیچ ارسال موفقی برای این سفارش ثبت نشده است.</b>"
+
             )
 
         document = FSInputFile(file_path)
@@ -2829,8 +2914,8 @@ async def export_order_results(callback: types.CallbackQuery, session: AsyncSess
             return await safe_edit_message(
                 wait_msg,
                 "❌ خطا در ارسال فایل گزارش.\n"
-                "لطفاً دوباره تلاش کنید.",
-                reply_markup=get_main_menu_button()
+                "لطفاً دوباره تلاش کنید."
+
             )
 
         with suppress(Exception):

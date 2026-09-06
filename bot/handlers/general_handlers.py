@@ -198,15 +198,15 @@ async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
     if not worker_id_str or not target_id:
         await state.clear()
         return await message.answer(
-            "⚠️ اطلاعات نشست از دست رفته است. لطفاً دوباره روی دکمه پاسخ کلیک کنید.",
-            reply_markup=get_main_menu_button()
+            "⚠️ اطلاعات نشست از دست رفته است. لطفاً دوباره روی دکمه پاسخ کلیک کنید."
+            
         )
 
     reply_text = message.text or message.caption or ""
     if not reply_text:
         return await message.answer(
-            with_cancel_hint("⚠️ لطفاً فقط متن ارسال کنید."),
-            reply_markup=get_crm_cancel_keyboard()
+            with_cancel_hint("⚠️ لطفاً فقط متن ارسال کنید.")
+            
         )
 
     try:
@@ -214,8 +214,8 @@ async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
     except ValueError:
         await state.clear()
         return await message.answer(
-            "⚠️ خطای سیستمی: آیدی ورکر نامعتبر است.",
-            reply_markup=get_main_menu_button()
+            "⚠️ خطای سیستمی: آیدی ورکر نامعتبر است."
+            
         )
 
     client = worker_pool.get(worker_id_int)
@@ -224,20 +224,20 @@ async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
         await state.clear()
         return await message.answer(
             f"⚠️ <b>ارسال ناموفق:</b>\n"
-            f"اکانت ورکر <code>{worker_id_str}</code> در حال حاضر آفلاین است یا اتصال آن با تلگرام قطع شده است.",
-            reply_markup=get_main_menu_button()
+            f"اکانت ورکر <code>{worker_id_str}</code> در حال حاضر آفلاین است یا اتصال آن با تلگرام قطع شده است."
+            
         )
 
     try:
         await client.send_message(chat_id=int(target_id), text=reply_text)
         await message.answer(
-            f"✅ <b>پیام شما با موفقیت ارسال شد!</b>\n👤 <b>مقصد:</b> <code>{target_id}</code>",
-            reply_markup=get_main_menu_button()
+            f"✅ <b>پیام شما با موفقیت ارسال شد!</b>\n👤 <b>مقصد:</b> <code>{target_id}</code>"
+            
         )
     except Exception as e:
         await message.answer(
-            f"❌ <b>خطا در ارسال پیام:</b>\n<code>{html.escape(str(e))}</code>",
-            reply_markup=get_main_menu_button()
+            f"❌ <b>خطا در ارسال پیام:</b>\n<code>{html.escape(str(e))}</code>"
+            
         )
     finally:
         await state.clear()

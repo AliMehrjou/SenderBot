@@ -514,7 +514,6 @@ async def _notify_admins_on_source_failure(
         logger.warning(f"Source-failure notification (HTTP session) failed for Order #{order_id}: {e}")
 
 # مسیر فایل: workers/sender.py
-# تابع: execute_bulk_send
 async def execute_bulk_send(
     client: Client, 
     account_db_id: int, 
@@ -528,21 +527,25 @@ async def execute_bulk_send(
     success_count = 0
     unsent_targets = []
     
-    # 📋 حالت کپی از کانال مبدا: پارس لیست id پیام‌ها ("12,34,56")
+    # 📋 حالت کپی/فوروارد از کانال مبدا
     copy_source_ids: List[int] = []
+    forward_style = "copy"
+    
     if order.source_channel_id and order.source_message_ids:
+        parts = order.source_message_ids.split("|")
+        id_parts = parts[0]
+        if len(parts) > 1:
+            forward_style = parts[1]
+            
         copy_source_ids = [
             int(part.strip())
-            for part in order.source_message_ids.split(",")
+            for part in id_parts.split(",")
             if part.strip().isdigit()
         ]
-    # 🧹 فاز ۴ (رفع آنتی‌پترن): عبارت قبلی «bool(copy_mode and copy_source_ids)
-    # if False else bool(copy_source_ids)» شاخه‌ی if False هرگز اجرا نمی‌شد و
-    # در صورت اجرا با NameError شکست می‌خورد (copy_mode پارامترِ این تابع نیست).
-    # فرم منطقاً معادل و تمیز: copy_mode فقط زمانی True است که source_ids معتبر
-    # موجود باشد (همان else شاخه‌ی قبلی که همیشه اجرا می‌شد).
-    copy_mode = bool(copy_source_ids)
-
+        
+    copy_mode = bool(copy_source_ids and forward_style == "copy")
+    forward_mode = bool(copy_source_ids and forward_style == "forward")
+    is_source_mode = copy_mode or forward_mode  # هر نوع ارسالی از کانال مبدا
     try:
         account_created_at = await session.scalar(
             select(Account.created_at).where(Account.id == account_db_id)
@@ -555,7 +558,7 @@ async def execute_bulk_send(
         )
         daily_limit = effective_daily_limit(None)
 
-    # 📋 شمارنده‌های خطای کانال مبدا — برای تشخیص «شکست کل chunk» و error کردن سفارش
+    # 📋 شمارنده‌های خطای کانال مبدا
     copy_attempts = 0
     source_error_count = 0
     last_source_error: Optional[str] = None
@@ -564,29 +567,29 @@ async def execute_bulk_send(
     safe_message = ""
     safe_message_2 = ""
     smart_flow_active = False
+    send_message_2 = False
 
     if not copy_mode:
         raw_message = order.message_text or ""
         
-        # تبدیل دکمه شیشه‌ای به لینک (سازگار با یوزربات)
         if order.button_text and order.button_url:
             raw_message += f"\n\n🔗 <a href='{order.button_url}'>{order.button_text}</a>"
 
         safe_message = raw_message.replace("{first_name}", "[[FIRST_NAME]]").replace("{username}", "[[USERNAME]]")
 
-        # 🧠 جریان هوشمند (Smart Flow): فقط با وجود «پیام دوم» (بنر) فعال می‌شود
-        smart_flow_active = bool(order.smart_flow and order.message_2_text)
+        # 🧠 بررسی وجود پیام دوم (چه بنر باشد چه پیام عادی)
+        send_message_2 = bool(order.message_2_text) or bool(order.media_2_path and order.media_2_type)
+        raw_message_2 = order.message_2_text or ""
+        safe_message_2 = raw_message_2.replace("{first_name}", "[[FIRST_NAME]]").replace("{username}", "[[USERNAME]]")
+        
+        # جریان هوشمند فقط زمانی فعال می‌شود که هم فلگ روشن باشد و هم پیام دومی وجود داشته باشد
+        smart_flow_active = bool(order.smart_flow and send_message_2)
 
-        # آماده‌سازی متن بنر (پیام دوم) — همان خط لوله‌ی پیام اول (spintax + شخصی‌سازی)
         if smart_flow_active:
-            raw_message_2 = order.message_2_text or ""
-            safe_message_2 = raw_message_2.replace("{first_name}", "[[FIRST_NAME]]").replace("{username}", "[[USERNAME]]")
             logger.info(f"Worker user_{account_db_id}/ SmartFlow ENABLED for Order #{order.id} (icebreaker → seen-wait → banner).")
+        elif send_message_2:
+            logger.info(f"Worker user_{account_db_id}/ Normal Flow: message 2 ENABLED for Order #{order.id}.")
 
-        # 📌 فاز ۷ (BUG-10): آماده‌سازی پیام سوم — در «فلو عادی» (پس از پیام ۱) و در
-        # SmartFlow (پس از بنر/پیام ۲) ارسال می‌شود؛ همان semantics پیام ۲: تاخیر جدا +
-        # پشتیبانی مدیا + شمارش در بودجه‌ی روزانه. در حالت کپی، مثل بقیه‌ی متن/مدیای
-        # سفارش نادیده گرفته می‌شود.
         raw_message_3 = order.message_3_text or ""
         safe_message_3 = raw_message_3.replace("{first_name}", "[[FIRST_NAME]]").replace("{username}", "[[USERNAME]]")
         send_message_3 = bool(order.message_3_text) or bool(order.media_3_path and order.media_3_type)
@@ -596,15 +599,11 @@ async def execute_bulk_send(
                 f"(text={bool(order.message_3_text)}, media={bool(order.media_3_path)})."
             )
 
-        # 🛡 فاز ۷ (BUG-15): get_users فقط وقتی یکی از پیام‌ها واقعاً به دیتای کاربر
-        # (placeholder) نیاز دارد صدا زده می‌شود — فعال‌بودن SmartFlow به‌تنهایی دلیل
-        # فراخوانی نیست؛ peer_id از مسیر user_id-first (تارگت عددی) یا از peerِ
-        # resolveشده در خودِ ارسال (chat.id پیام برگشتی) تأمین می‌شود.
         needs_user_data = (
             "[[FIRST_NAME]]" in safe_message
             or "[[USERNAME]]" in safe_message
             or (
-                smart_flow_active
+                send_message_2
                 and ("[[FIRST_NAME]]" in safe_message_2 or "[[USERNAME]]" in safe_message_2)
             )
             or (
@@ -612,20 +611,14 @@ async def execute_bulk_send(
                 and ("[[FIRST_NAME]]" in safe_message_3 or "[[USERNAME]]" in safe_message_3)
             )
         )
-        # کش per-chunk نتیجه‌ی get_users — بازاستفاده روی تکرار همان تارگت
         user_data_cache: dict = {}
     else:
-        # 📋 در حالت کپی، متن/مدیای سفارش نادیده گرفته می‌شود؛ جریان هوشمند و بنر هم
-        # معنا ندارند (پیام مبدا باید عیناً و دست‌نخورده کپی شود)
         logger.info(
             f"Worker user_{account_db_id}/ COPY MODE for Order #{order.id}: "
             f"{len(copy_source_ids)} source message(s) from channel {order.source_channel_id}."
         )
 
     for i, target in enumerate(targets):
-        # 🛡 فاز ۲ (BUG-03): چک سقف روزانه قبل از هر ارسال — دیسپچر هم همین چک را
-        # دارد، اما chunk ممکن است دقیقاً روی مرز سقف شروع شده باشد؛ اینجا قطعی
-        # می‌شود. باقیمانده‌ی تارگت‌ها unsent برمی‌گردند تا برای اکانت/روز دیگر صف شوند.
         if await daily_cap_reached(account_db_id, daily_limit):
             logger.warning(
                 f"Worker user_{account_db_id}/ reached DAILY_SEND_LIMIT_PER_ACCOUNT={daily_limit}; "
@@ -639,7 +632,6 @@ async def execute_bulk_send(
             continue
 
         if i % 10 == 0:
-            # ─── BUG-09: commit افزایشی ───
             try:
                 await session.commit()
             except Exception as db_err:
@@ -651,26 +643,32 @@ async def execute_bulk_send(
                 unsent_targets.extend(targets[i:])
                 break
 
-            # ─── BUG-02: Kill Switch واقعی ───
             if await is_order_killed(order.id):
                 logger.warning(f"Kill Switch activated! Worker user_{account_db_id}/ aborting chunk.")
                 unsent_targets.extend(targets[i:])
-                break # خروج فوری از حلقه ارسال
+                break 
 
-        if copy_mode:
+        if is_source_mode:
             msg_id = random.choice(copy_source_ids)
             log_entry = OrderLog(order_id=order.id, account_id=account_db_id, target=target)
             copy_attempts += 1
 
-            # 🛡 فاز ۲ (BUG-03): شمارش تلاش ارسال (کپی) در بودجه‌ی روزانه
             await incr_daily_sent_count(account_db_id)
 
             try:
-                copied_msg = await client.copy_message(
-                    chat_id=target,
-                    from_chat_id=order.source_channel_id,
-                    message_id=msg_id,
-                )
+                if copy_mode:
+                    copied_msg = await client.copy_message(
+                        chat_id=target,
+                        from_chat_id=order.source_channel_id,
+                        message_id=msg_id,
+                    )
+                else:
+                    copied_msg = await client.forward_messages(
+                        chat_id=target,
+                        from_chat_id=order.source_channel_id,
+                        message_ids=msg_id,
+                    )
+                    
                 if getattr(copied_msg, "chat", None) is not None:
                     _spawn_crm_mark(copied_msg.chat.id)
 
@@ -689,11 +687,9 @@ async def execute_bulk_send(
 
             except UserRestricted as e:
                 logger.warning(f"Worker user_{account_db_id}/ is RESTRICTED (Spam limit). Triggering SpamBot appeal.")
-
                 log_entry.status = LOG_STATUS_RESTRICTED
                 log_entry.error_message = "UserRestricted"
                 session.add(log_entry)
-
                 asyncio.create_task(appeal_to_spambot(client, account_db_id))
                 unsent_targets.extend(targets[i:])
                 break
@@ -708,7 +704,6 @@ async def execute_bulk_send(
             except (ChannelInvalid, ChatForwardsRestricted) as e:
                 error_name = e.__class__.__name__
                 logger.error(f"Worker user_{account_db_id}/ copy source error on {target}: {error_name}")
-
                 log_entry.status = LOG_STATUS_ERROR
                 log_entry.error_message = f"SourceChannel: {error_name}"
                 session.add(log_entry)
@@ -717,7 +712,6 @@ async def execute_bulk_send(
                 continue
 
             except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-
                 logger.warning(
                     f"Worker user_{account_db_id}/ transient connection error on {target} "
                     f"({e.__class__.__name__}: {e}); aborting chunk for Order #{order.id}, "
@@ -740,7 +734,6 @@ async def execute_bulk_send(
             session.add(log_entry)
             success_count += 1
 
-            # 🛡 فاز ۴ (R8): تاخیر انسانی با ضریب کاهش بار سراسری (×۲–۳ در slowdown)
             await asyncio.sleep(await _humanized_send_delay())
             continue
 
@@ -774,7 +767,6 @@ async def execute_bulk_send(
             final_text = mutate_text(final_text, send_index)
 
         log_entry = OrderLog(order_id=order.id, account_id=account_db_id, target=target)
-
         await incr_daily_sent_count(account_db_id)
 
         if smart_flow_active and smart_flow_peer_id is not None:
@@ -802,11 +794,9 @@ async def execute_bulk_send(
         except FloodWait as e:
             wait_seconds = e.value
             logger.warning(f"Worker user_{account_db_id}/ triggered FloodWait ({wait_seconds}s).")
-            
             log_entry.status = LOG_STATUS_FLOOD
             log_entry.error_message = f"FloodWait: {wait_seconds}s"
             session.add(log_entry)
-
             dismiss_seen_event(client, smart_flow_peer_id)
             await apply_adaptive_flood_wait(session=session, account_id=account_db_id, wait_seconds=wait_seconds)
             await mark_global_slowdown(wait_seconds)
@@ -815,11 +805,9 @@ async def execute_bulk_send(
             
         except UserRestricted as e:
             logger.warning(f"Worker user_{account_db_id}/ is RESTRICTED (Spam limit). Triggering SpamBot appeal.")
-            
             log_entry.status = LOG_STATUS_RESTRICTED
             log_entry.error_message = "UserRestricted"
             session.add(log_entry)
-
             dismiss_seen_event(client, smart_flow_peer_id)
             asyncio.create_task(appeal_to_spambot(client, account_db_id))
             unsent_targets.extend(targets[i:])
@@ -857,8 +845,9 @@ async def execute_bulk_send(
         if sent_message is not None and getattr(sent_message, "chat", None) is not None:
             _spawn_crm_mark(sent_message.chat.id)
 
-        # ─── 🧠 مراحل ۲ تا ۴: فقط در حالت جریان هوشمند اجرا می‌شوند ───
+        # ─── مرحله ۲: ارسال پیام دوم / بنر ───
         if smart_flow_active:
+            # === منطق جریان هوشمند ===
             if smart_flow_peer_id is not None:
                 seen = await wait_for_seen(client, smart_flow_peer_id, timeout=random.uniform(120, 420))
             else:
@@ -935,6 +924,71 @@ async def execute_bulk_send(
 
             logger.info(f"Worker user_{account_db_id}/ SmartFlow '{target}': seen={seen}; banner delivered.")
 
+        elif send_message_2:
+            # === منطق جریان ارسال عادی برای پیام دوم ===
+            await asyncio.sleep(await _humanized_send_delay())
+
+            if await daily_cap_reached(account_db_id, daily_limit):
+                logger.warning(
+                    f"Worker user_{account_db_id}/ reached DAILY_SEND_LIMIT_PER_ACCOUNT={daily_limit} "
+                    f"before message 2; aborting chunk for Order #{order.id}."
+                )
+                log_entry.status = LOG_STATUS_SUCCESS 
+                session.add(log_entry)
+                success_count += 1
+                unsent_targets.extend(targets[i + 1:])
+                break
+
+            banner_text = parse_spintax(safe_message_2)
+            if "[[FIRST_NAME]]" in banner_text or "[[USERNAME]]" in banner_text:
+                banner_text = banner_text.replace("[[FIRST_NAME]]", target_first_name).replace("[[USERNAME]]", target_username)
+
+            await incr_daily_sent_count(account_db_id)
+
+            try:
+                if order.media_2_path and order.media_2_type:
+                    if order.media_2_type == "photo":
+                        await client.send_photo(chat_id=target, photo=order.media_2_path, caption=banner_text)
+                    elif order.media_2_type == "video":
+                        await client.send_video(chat_id=target, video=order.media_2_path, caption=banner_text)
+                    elif order.media_2_type == "document":
+                        await client.send_document(chat_id=target, document=order.media_2_path, caption=banner_text)
+                else:
+                    await client.send_message(chat_id=target, text=banner_text)
+            except FloodWait as e:
+                wait_seconds = e.value
+                logger.warning(f"Worker user_{account_db_id}/ message-2 FloodWait ({wait_seconds}s).")
+                log_entry.status = LOG_STATUS_SUCCESS
+                log_entry.error_message = f"Message2 FloodWait: {wait_seconds}s"
+                session.add(log_entry)
+                success_count += 1
+                await apply_adaptive_flood_wait(session=session, account_id=account_db_id, wait_seconds=wait_seconds)
+                await mark_global_slowdown(wait_seconds)
+                unsent_targets.extend(targets[i + 1:])
+                break
+            except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+                logger.warning(
+                    f"Worker user_{account_db_id}/ message-2 transient error on {target} "
+                    f"({e.__class__.__name__}: {e}); aborting chunk for Order #{order.id}, "
+                    f"{len(targets) - i - 1} target(s) re-queued."
+                )
+                log_entry.status = LOG_STATUS_SUCCESS
+                log_entry.error_message = f"Message2 Transient: {e.__class__.__name__}: {e}"
+                session.add(log_entry)
+                success_count += 1
+                unsent_targets.extend(targets[i + 1:])
+                break
+            except Exception as e:
+                logger.error(f"Worker user_{account_db_id}/ message-2 error on {target}: {e}")
+                log_entry.status = LOG_STATUS_SUCCESS
+                log_entry.error_message = f"Message2: {e.__class__.__name__}: {e}"
+                session.add(log_entry)
+                success_count += 1
+                continue
+            
+            logger.info(f"Worker user_{account_db_id}/ Normal Flow: message 2 delivered to '{target}'.")
+
+        # ─── مرحله ۳: ارسال پیام سوم ───
         if send_message_3:
             await asyncio.sleep(await _humanized_send_delay())
 
@@ -1004,7 +1058,6 @@ async def execute_bulk_send(
         
         await asyncio.sleep(await _humanized_send_delay())
 
-    # ─── 📋 تشخیص شکست کل chunk با خطای کانال مبدا ───
     copy_source_broken = (
         copy_mode
         and copy_attempts > 0

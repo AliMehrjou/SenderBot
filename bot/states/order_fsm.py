@@ -15,3 +15,4 @@ class CreateOrderStates(StatesGroup):
     waiting_for_button = State()     
     waiting_for_schedule = State()  
     waiting_for_filter = State()
+    waiting_for_forward_style = State()

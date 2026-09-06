@@ -189,39 +189,43 @@ async def process_extraction_link(message: types.Message, state: FSMContext, ses
     if not valid_links:
         return await message.answer(
             with_cancel_hint(
-                "⚠️ هیچ لینک معتبری یافت نشد. لطفاً فقط یکی از الگوهای زیر را ارسال کنید:\n"
-                "• <code>t.me/username</code>\n"
-                "• <code>t.me/joinchat/...</code> یا <code>t.me/+...</code>\n"
-                "• <code>@username</code>"
+                "⚠️ هیچ لینک معتبری یافت نشد. لطفاً فقط یکی از الگوهای مجاز را ارسال کنید."
             ),
             reply_markup=get_cancel_keyboard()
         )
         
-    first_line_link = valid_links[0]
-    link = "\n".join(valid_links)
+    # 🟢 فیکس فاز اول: جلوگیری از ورود چند لینک برای جلوگیری از اوررایت شدن خروجی استخراج
+    if len(valid_links) > 1:
+        return await message.answer(
+            with_cancel_hint(
+                "⚠️ <b>خطا: استخراج هم‌زمان مجاز نیست.</b>\n\n"
+                "برای جلوگیری از تداخل داده‌ها، سفارشات استخراج فقط باید شامل <b>یک لینک</b> باشند.\n"
+                "لطفاً فقط یک گروه را برای استخراج ارسال کنید."
+            ),
+            reply_markup=get_cancel_keyboard()
+        )
+        
+    # حالا مطمئنیم که دقیقاً یک لینک معتبر داریم
+    target_link = valid_links[0]
 
-    # دریافت نوع آنالیز از استیت ماشین
     fsm_data = await state.get_data()
     analysis_type = fsm_data.get("analysis_type", "users")
-
     await state.clear()
 
-    # تولید کد رهگیری یکتا
     chars = string.ascii_uppercase + string.digits
     random_str = ''.join(random.choices(chars, k=6))
     tracking_code = f"EXT-{random_str}"
 
-    # ترجمه نوع آنالیز برای نمایش به ادمین در پیام موفقیت
     type_fa = "استخراج کاربران (ساده)"
     if analysis_type == "messages":
         type_fa = "استخراج پیام‌ها (تارگت‌های فعال)"
     elif analysis_type == "golden":
         type_fa = "استخراج طلایی (دقیق و تقاطعی)"
 
-    # ثبت به عنوان یک سفارش استاندارد در دیتابیس
+    # 🟢 فقط همان یک لینک به عنوان تارگت ذخیره می‌شود
     new_order = Order(
         order_type="extract",
-        target_data=link, # ذخیره نسخه کامل کاربر (حتی چندخطی)
+        target_data=target_link,
         filter_type=analysis_type,
         status=OrderStatus.pending,
         tracking_code=tracking_code
@@ -238,7 +242,6 @@ async def process_extraction_link(message: types.Message, state: FSMContext, ses
             reply_markup=get_main_menu_keyboard()
         )
 
-    # 1. Update user success message
     builder = InlineKeyboardBuilder()
     builder.button(text="📊 داشبورد استخراج", callback_data=f"ext_dashboard_{tracking_code}/")
     builder.button(text="📋 سفارشات استخراج", callback_data="ext_list_page_1/")
@@ -254,17 +257,12 @@ async def process_extraction_link(message: types.Message, state: FSMContext, ses
         reply_markup=builder.as_markup()
     )
 
-    # 2. Send approval request to the admin
     admin_builder = InlineKeyboardBuilder()
     admin_builder.button(text="✅ تایید و شروع", callback_data=f"approve_order_{new_order.id}/")
     admin_builder.button(text="❌ رد سفارش", callback_data=f"reject_order_{new_order.id}/")
     admin_builder.adjust(2)
     
-    lines = [t for t in link.split('\n') if t.strip()]
-    if len(lines) > 1:
-        target_summary = f"چند لینک ({len(lines)} خط)"
-    else:
-        target_summary = html.escape(first_line_link)
+    target_summary = html.escape(target_link)
         
     try:
         await message.bot.send_message(
@@ -293,20 +291,7 @@ async def render_extraction_orders_list(
     state: Optional[FSMContext] = None,
     page: int = 1,
 ) -> None:
-    """
-    📄 فاز ۵: رندر لیست سفارشات استخراج با صفحه‌بندی استاندارد.
-
-    - ۱۰ سفارش در هر صفحه (PAGINATION_SIZE) با کوئری‌های efficient:
-      یک COUNT + یک OFFSET/LIMIT + یک کوئری تجمعی برای تعداد
-      استخراج‌شده‌های همان صفحه (بدون N+1)
-    - دکمهٔ 🔄 بروزرسانی = رفرش همان صفحه (همان callback ناوبری)
-    - دکمهٔ هر آیتم → داشبورد استخراج همان سفارش (ext_dashboard_{code}/)
-
-    نکته: این تابع callback را answer نمی‌کند؛ فراخوانی‌کننده باید قبل از
-    فراخوانش callback را پاسخ داده باشد.
-    """
     try:
-        # ── ۱. شمارش کل + اصلاح هوشمند شماره صفحه ──
         total_count = await session.scalar(
             select(func.count(Order.id)).where(Order.order_type == "extract")
         ) or 0
@@ -314,7 +299,6 @@ async def render_extraction_orders_list(
         page = clamp_page(page, total_pages)
         offset = get_page_offset(page)
 
-        # ── ۲. سفارشات استخراج صفحهٔ فعلی (جدیدترین اول) ──
         orders = (
             await session.scalars(
                 select(Order)
@@ -325,33 +309,19 @@ async def render_extraction_orders_list(
             )
         ).all()
 
-        # ── ۳. تعداد استخراج‌شده‌های همین صفحه — یک کوئری تجمعی (بدون N+1) ──
-        extracted_map: dict = {}
-        if orders:
-            rows = (
-                await session.execute(
-                    select(OrderLog.order_id, func.count(OrderLog.id))
-                    .where(
-                        OrderLog.order_id.in_([o.id for o in orders]),
-                        OrderLog.status == "success",
-                    )
-                    .group_by(OrderLog.order_id)
-                )
-            ).all()
-            extracted_map = dict(rows)
+        # 🟢 فیکس فاز دوم: منطق اشتباهِ شمردن OrderLog از این قسمت کاملاً حذف شد.
+        # تعداد استخراجی فقط زمانی معتبر است که ورکر آن را صراحتاً در extracted_count ثبت کرده باشد.
     except Exception as e:
         await session.rollback()
         return await answer_callback_error(
             callback, report_db_error("سفارشات استخراج", e), get_main_menu_button()
         )
 
-    # 📄 فاز ۵: ثبت صفحهٔ فعلی در FSM (دکمهٔ «🔙 بازگشت» داشبورد به همان صفحه برمی‌گردد)
     if state is not None:
         await state.update_data(ext_list_page=page)
 
     builder = InlineKeyboardBuilder()
 
-    # ── لیست خالی ──
     if total_count == 0:
         builder.row(types.InlineKeyboardButton(text="🔙 بازگشت به آنالیز", callback_data="menu_analysis/"))
         builder.row(types.InlineKeyboardButton(text="🏛 منوی اصلی", callback_data="menu_home/"))
@@ -372,7 +342,8 @@ async def render_extraction_orders_list(
     for idx, order in enumerate(orders, start=offset + 1):
         badge = get_extraction_status_badge(order.status)
         type_label = EXTRACTION_TYPE_LABELS.get(order.filter_type, "❔ نامشخص")
-        extracted = order.extracted_count if order.extracted_count is not None else extracted_map.get(order.id, 0)
+        # 🟢 فیکس فاز دوم: اگر ثبت نشده باشد (درحال اجرا)، صرفا 0 نشان داده می‌شود
+        extracted = order.extracted_count or 0 
         created_date = order.created_at.strftime("%Y/%m/%d") if order.created_at else "نامشخص"
 
         code = order.tracking_code
@@ -383,8 +354,6 @@ async def render_extraction_orders_list(
             )
             builder.button(text=f"📊 {code}", callback_data=f"ext_dashboard_{code}/")
         else:
-            # حالت دفاعی: سفارش extract بدون کد رهگیری (دادهٔ legacy) — داشبورد
-            # عمومی از طریق کامند در دسترس است
             text += (
                 f"<b>{idx}.</b> 🆔 <code>#{order.id}</code> · {badge}\n"
                 f"🧮 {type_label} · 👥 {extracted} استخراج‌شده · 📅 {created_date}\n"
@@ -395,9 +364,7 @@ async def render_extraction_orders_list(
 
     text += "👇 برای مشاهدهٔ داشبورد هر استخراج، روی دکمهٔ مربوطه کلیک کنید:"
 
-    # ── ناوبری صفحات + دکمه‌های پایانی ──
     add_pagination_nav_row(builder, page, total_pages, callback_prefix="ext_list_")
-
     builder.row(types.InlineKeyboardButton(text="🔄 بروزرسانی", callback_data=f"ext_list_page_{page}/"))
     builder.row(
         types.InlineKeyboardButton(text="🔙 بازگشت به آنالیز", callback_data="menu_analysis/"),
@@ -405,7 +372,6 @@ async def render_extraction_orders_list(
     )
 
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
-
 
 @router.callback_query(F.data.startswith("ext_list_page_"))
 async def extraction_orders_list_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
@@ -426,7 +392,6 @@ async def extraction_orders_list_handler(callback: types.CallbackQuery, state: F
 async def build_extraction_dashboard_view(
     session: AsyncSession, tracking_code: str, back_page: int = 1
 ) -> tuple[Optional[str], Optional[types.InlineKeyboardMarkup]]:
-    """ساخت متن و کیبورد داشبورد استخراج (مشترک بین callback و پیام کد رهگیری)."""
     try:
         extraction = await session.scalar(
             select(Order).where(
@@ -437,17 +402,13 @@ async def build_extraction_dashboard_view(
         if not extraction:
             return None, None
 
-        if extraction.extracted_count is not None:
-            extracted_count = extraction.extracted_count
-        else:
-            extracted_count = await session.scalar(
-                select(func.count(OrderLog.id)).where(
-                    OrderLog.order_id == extraction.id,
-                    OrderLog.status == "success",
-                )
-            ) or 0
+        # 🟢 فیکس فاز دوم: حذف کوئری غلط روی جدول OrderLog
+        extracted_count = extraction.extracted_count or 0
+
     except Exception as e:
-        raise e
+        # 🟢 فیکس ضدالگوی پرتاب عریان خطا
+        logger.error(f"Error building extraction dashboard for {tracking_code}: {e}", exc_info=True)
+        return None, None
 
     badge = get_extraction_status_badge(extraction.status)
     type_label = EXTRACTION_TYPE_LABELS.get(extraction.filter_type, "❔ نامشخص")
@@ -471,7 +432,6 @@ async def build_extraction_dashboard_view(
     builder = InlineKeyboardBuilder()
     builder.button(text="🔄 بروزرسانی", callback_data=f"ext_dashboard_{tracking_code}/")
     
-    # دکمه خروجی فقط در صورتی نمایش داده شود که وضعیت سفارش "تکمیل شده" باشد
     if extraction.status == OrderStatus.completed:
         builder.button(text="📥 خروجی", callback_data=f"export_order_{extraction.id}/")
         builder.button(text="🔙 بازگشت به لیست استخراج", callback_data=f"ext_list_page_{back_page}/")
@@ -483,6 +443,7 @@ async def build_extraction_dashboard_view(
         builder.adjust(1, 1, 1)
 
     return text, builder.as_markup()
+
 
 @router.callback_query(F.data.startswith("ext_dashboard_") & F.data.endswith("/"))
 async def show_extraction_dashboard(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
