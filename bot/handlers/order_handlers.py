@@ -2148,6 +2148,20 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
     target_data = fsm_data.get("target_data")
     target_count = fsm_data.get("target_count", 0)
     
+    # +++ منطق جدید: بررسی موجود بودن اکانت فعال در دسته‌بندی‌های انتخاب شده +++
+    active_accounts_count = 0
+    if cat_ids:
+        try:
+            stmt_acc = select(func.count(Account.id)).where(
+                Account.category_id.in_(cat_ids),
+                Account.is_banned == False,
+                Account.session_string.is_not(None)
+            )
+            active_accounts_count = await session.scalar(stmt_acc) or 0
+        except Exception as e:
+            logger.warning(f"Failed to check active accounts count: {e}")
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    
     list_source_path: Optional[str] = None
     if order_type == "list":
         list_source_path = target_data
@@ -2268,6 +2282,20 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
             f"<code>{source_channel_id}</code> ({len(source_message_ids_list)} پیام)"
         )
 
+    # +++ منطق جدید: آماده‌سازی متن هشدار برای کاربر و ادمین +++
+    warning_user = ""
+    warning_admin = ""
+    if active_accounts_count == 0:
+        warning_user = (
+            "\n\n⚠️ <b>توجه:</b> در دسته‌بندی(های) انتخاب‌شده هیچ اکانت فعالی وجود ندارد. "
+            "سفارش شما در سیستم ثبت شد، اما تا زمانی که از منوی اصلی شماره‌های جدیدی به این دسته اضافه نکنید، ارسال آغاز نخواهد شد."
+        )
+        warning_admin = (
+            "\n\n⚠️ <b>هشدار به ادمین:</b> در حال حاضر هیچ اکانت فعالی در دسته‌های انتخاب‌شده وجود ندارد! "
+            "حتی پس از تایید، این سفارش در حالت Pending گیر خواهد کرد تا زمانی که شماره جدیدی اضافه شود."
+        )
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
     await state.clear()
     
     # 📩 ۱. پیام تایید برای کاربری که در حال ثبت است
@@ -2275,7 +2303,7 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
         f"✅ <b>سفارش با موفقیت ثبت شد و در انتظار تایید است.</b>\n"
         f"🎟 کد رهگیری: <code>{new_order.tracking_code}</code>\n"
         f"{banner_pool_note}"
-        f"{copy_source_note}\n\n"
+        f"{copy_source_note}{warning_user}\n\n"
         f"♻️ مشاهده داشبورد زنده: {tracking_cmd}",
         reply_markup=get_main_menu_reply_keyboard(),
     )
@@ -2294,7 +2322,7 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
         f"🎯 هدف: {target_display}\n"
         f"👤 تعداد تارگت: <code>{target_count}</code>\n"
         f"🗂 دسته‌ها: {cat_names}\n"
-        f"📊 داشبورد: {tracking_cmd}\n\n"
+        f"📊 داشبورد: {tracking_cmd}{warning_admin}\n\n"
         f"<i>لطفاً جهت ورود این سفارش به صف اجرا (Task Queue) آن را تایید کنید.</i>"
     )
     
