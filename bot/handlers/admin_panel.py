@@ -10,6 +10,6 @@ async def show_main_menu_command(message: types.Message) -> None:
     A simple command to display the main menu.
     """
     await message.answer(
-        "🎛 <b>Master Control Panel</b>\n\nSelect an option below:",
+        "🎛 <b>پنل کنترل اصلی</b>\n\nلطفاً یک گزینه را انتخاب کنید:",
         reply_markup=get_main_menu_keyboard()
     )

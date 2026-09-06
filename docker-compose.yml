@@ -1,49 +1,136 @@
-version: '3.8'
-
 services:
+  # ==========================================
+  # 0. Init Directories — فاز ۳ (BUG-22 permanent fix)
+  # ==========================================
+  # 🛡 قبل از بالا آمدن bot، دایرکتوری‌های bind-mount روی هاست ساخته و مالک
+  # می‌شود تا کاربر غیر-root کانتینر (UID 1000) بتواند در banners/ و
+  # profile_photos/ بنویسد. این سرویس root می‌دوند و بعد از اتمام exit می‌کند.
+  # bot با depends_on: service_completed_successfully صبر می‌کند تا init حاضر شود.
+  # اگر directory از قبل روی هاست با owner درست وجود داشت، idempotent است.
+  init-dirs:
+    image: alpine:3.19
+    container_name: sender_bot_init_dirs
+    restart: "no"
+    user: "0:0"
+    volumes:
+      - ./sessions:/mnt/sessions
+      - ./downloads:/mnt/downloads
+      - ./exports:/mnt/exports
+      - ./banners:/mnt/banners
+      - ./profile_photos:/mnt/profile_photos
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        APP_UID="${APP_UID:-1000}"
+        APP_GID="${APP_GID:-1000}"
+        for d in sessions downloads exports banners profile_photos; do
+          mkdir -p "/mnt/$${d}"
+          chown -R "$${APP_UID}:$${APP_GID}" "/mnt/$${d}"
+        done
+        echo "[init-dirs] runtime directories ready (uid=$${APP_UID} gid=$${APP_GID})."
+
+  # ==========================================
+  # 1. Bot Application Service
+  # ==========================================
   bot:
     build: .
-    container_name: sender_bot
-    restart: unless-stopped
+    container_name: sender_bot_app
+    restart: always
     env_file:
       - .env
-    environment:
-      TZ: UTC
     depends_on:
-      - db
-      - redis
+      init-dirs:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
-      - ./exports:/app/exports
-      - ./downloads:/app/downloads
+      # 📦 فاز ۱۲ (BUG-22/DEP-2): همهٔ دایرکتوری‌های runtime باید bind-mount باشند،
+      # وگرنه هر up --build محتوایشان را همراه لایهٔ کانتینر حذف می‌کند.
+      # 🛡 فاز ۳ (BUG-22 permanent): مالکیت این پوشه‌ها توسط سرویس init-dirs
+      # تضمین می‌شود — دیگر نیازی به mkdir/chown دستی روی هاست نیست.
+      - ./sessions:/app/sessions              # سشن‌های Pyrogram
+      - ./downloads:/app/downloads            # مدیای سفارش‌ها (orders.media_path)
+      - ./exports:/app/exports                # خروجی اکسترکتور
+      - ./banners:/app/banners                # فایل‌های بنر (banners.media_path)
+      - ./profile_photos:/app/profile_photos  # پکیج‌های عکس پروفایل (profile_photos/{pkg_id}/)
+    networks:
+      - sender_network
 
+  # ==========================================
+  # 2. MySQL Database Service
+  # ==========================================
   db:
     image: mysql:8.0
-    container_name: sender_mysql
+    container_name: sender_bot_db
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: ${DB_NAME}
       MYSQL_USER: ${DB_USER}
       MYSQL_PASSWORD: ${DB_PASS}
-      TZ: UTC
-    ports:
-      - "3307:3306"
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+    expose:
+      - "3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
-      - mysql_data:/var/lib/mysql
-    command: --default-authentication-plugin=mysql_native_password
+      - db_data:/var/lib/mysql
+    networks:
+      - sender_network
 
+  # ==========================================
+  # 3. Redis Cache Service
+  # ==========================================
   redis:
-    image: redis:alpine
-    container_name: sender_redis
+    image: redis:7-alpine
+    container_name: sender_bot_redis
     restart: always
-    command: /bin/sh -c "redis-server --requirepass $${REDIS_PASS:-''}"
+    expose:
+      - "6379"
     environment:
-      REDIS_PASS: ${REDIS_PASS}
-    ports:
-      - "6379:6379"
+      - REDIS_PASS=${REDIS_PASS}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASS\""]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASS\" ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - redis_data:/data
+    networks:
+      - sender_network
 
+# ==========================================
+# Volumes & Networks Configuration
+# ==========================================
 volumes:
-  mysql_data:
+  db_data:
+    name: sender_bot_db_data
   redis_data:
+    name: sender_bot_redis_data
+
+networks:
+  sender_network:
+    name: sender_bot_network
+    driver: bridge

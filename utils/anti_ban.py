@@ -45,7 +45,7 @@ async def apply_adaptive_flood_wait(
     elif 20 <= wait_seconds <= 60:
         penalty_hours = 6
     else:
-        stmt = select(GlobalSettings).where(GlobalSettings.id == 1)
+        stmt = select(GlobalSettings).limit(1)
         result = await session.execute(stmt)
         settings = result.scalar_one_or_none()
         
