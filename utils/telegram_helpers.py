@@ -18,6 +18,7 @@ utils/telegram_helpers.py
 """
 
 import logging
+import re
 from typing import Optional
 
 from aiogram.exceptions import TelegramBadRequest
@@ -34,7 +35,9 @@ _MSG_NOT_MODIFIED = "message is not modified"
 _MSG_NOT_FOUND = "message to edit not found"
 _MSG_CANT_EDIT = "message can't be edited"
 _MSG_NO_TEXT = "there is no text in the message to edit"
-_MSG_QUERY_INVALID = "query id invalid"
+_MSG_QUERY_INVALID = "query id is invalid"
+_MSG_QUERY_OLD = "query is too old"
+_MSG_TIMEOUT = "timeout expired"
 
 
 def _err_text(e: TelegramBadRequest) -> str:
@@ -52,12 +55,12 @@ async def safe_edit_message(
     ویرایش امن متن پیام — جایگزین الگوهای ناهماهنگ «مشکل ۶».
 
     رفتار:
-        ✅ ویرایش موفق                       → True
-        🟡 محتوا تغییری نکرده (NotModified)  → False  (خطا نیست؛ مثلاً دوبار
+        ✅ ویرایش موفق                       ← True
+        🟡 محتوا تغییری نکرده (NotModified)  ← False  (خطا نیست؛ مثلاً دوبار
                                                کلیک روی «🔄 بروزرسانی»)
-        🟡 پیام حذف/غیرقابل ویرایش شده      → پیام جدید ارسال می‌شود → True
-        🟡 پیام مدیا (بدون متن)             → کپشن ویرایش می‌شود      → True
-        ❌ هر خطای دیگر                      → مجدداً raise می‌شود
+        🟡 پیام حذف/غیرقابل ویرایش شده      ← پیام جدید ارسال می‌شود ← True
+        🟡 پیام مدیا (بدون متن)             ← کپشن ویرایش می‌شود      ← True
+        ❌ هر خطای دیگر                      ← مجدداً raise می‌شود
 
     kwargs اضافی (مثل disable_web_page_preview) مستقیم به edit_text پاس داده
     می‌شود.
@@ -73,7 +76,7 @@ async def safe_edit_message(
         if _MSG_NOT_MODIFIED in err:
             return False
 
-        # ۲) پیام مدیا است و متن ندارد → کپشن ویرایش می‌شود
+        # ۲) پیام مدیا است و متن ندارد ← کپشن ویرایش می‌شود
         if _MSG_NO_TEXT in err:
             try:
                 await message.edit_caption(caption=text, reply_markup=reply_markup, **kwargs)
@@ -83,7 +86,7 @@ async def safe_edit_message(
                     return False
                 raise
 
-        # ۳) پیام قدیمی حذف شده یا قابل ویرایش نیست → ارسال پیام جدید
+        # ۳) پیام قدیمی حذف شده یا قابل ویرایش نیست ← ارسال پیام جدید
         if _MSG_NOT_FOUND in err or _MSG_CANT_EDIT in err:
             await message.answer(text, reply_markup=reply_markup, **kwargs)
             return True
@@ -98,11 +101,11 @@ async def safe_callback_answer(
     show_alert: bool = False,
 ) -> bool:
     """
-    پاسخ امن به CallbackQuery.
+    پاسخ امن به CallbackQuery با نادیده گرفتن خطای انقضای دکمه.
 
     چرا لازم است؟ در مسیرهای خطای هندلرها — که ممکن است دیرتر از مهلت
     ~۱۵ ثانیه‌ای تلگرام اجرا شوند — فراخوانی callback.answer خطای
-    QUERY_ID_INVALID می‌دهد و «هندلرِ خطا» را خودش کرش می‌کند!
+    QUERY_ID_INVALID یا Timeout می‌دهد و «هندلرِ خطا» را خودش کرش می‌کند!
     این خطا (که خطای واقعی نیست) بی‌صدا نادیده گرفته می‌شود.
 
     Returns:
@@ -110,13 +113,23 @@ async def safe_callback_answer(
         False = مهلت پاسخ گذشته بود / قبلاً پاسخ داده شده بود
     """
     try:
-        await callback.answer(text, show_alert=show_alert)
+        if text:
+            await callback.answer(text=text, show_alert=show_alert)
+        else:
+            await callback.answer()
         return True
     except TelegramBadRequest as e:
-        if _MSG_QUERY_INVALID in _err_text(e):
+        err_msg = _err_text(e)
+        if any(msg in err_msg for msg in [_MSG_QUERY_INVALID, _MSG_QUERY_OLD, _MSG_TIMEOUT]):
             logger.debug("callback.answer skipped (already answered or expired).")
             return False
-        raise
+        
+        # ثبت هشدار برای سایر خطاهای Bad Request
+        logger.warning(f"TelegramBadRequest in safe_callback_answer: {e}")
+        return False
+    except Exception as e:
+        logger.warning(f"Unexpected error in safe_callback_answer: {e}")
+        return False
 
 
 async def send_loading_message(message: Message, text: str = LOADING_TEXT) -> Message:
@@ -135,6 +148,7 @@ async def send_loading_message(message: Message, text: str = LOADING_TEXT) -> Me
     """
     return await message.answer(text)
 
+
 async def answer_callback_error(
     callback: CallbackQuery,
     error_text: str,
@@ -143,14 +157,14 @@ async def answer_callback_error(
     """
     🛡 فاز ۲ — نمایش متن خطا به کاربر از مسیر CallbackQuery.
 
-    اگر callback هنوز پاسخ داده نشده باشد → خطا به صورت alert نمایش داده می‌شود.
-    اگر قبلاً پاسخ داده شده باشد (فراخوانی داخلی هندلرها با skip_answer=True) →
+    اگر callback هنوز پاسخ داده نشده باشد ← خطا به صورت alert نمایش داده می‌شود.
+    اگر قبلاً پاسخ داده شده باشد (فراخوانی داخلی هندلرها با skip_answer=True) ←
     یک پیام جدید با کیبورد fallback ارسال می‌شود تا کاربر بدون بازخورد نماند.
 
     نکته: alert تلگرام محدودیت ~۲۰۰ کاراکتر دارد؛ همهٔ پیام‌های
     utils/error_messages.py کوتاه‌تر از این حد هستند.
     """
-    answered = await safe_callback_answer(callback, error_text, show_alert=True)
+    answered = await safe_callback_answer(callback, text=error_text, show_alert=True)
     if not answered:
         try:
             await callback.message.answer(error_text, reply_markup=fallback_markup)
@@ -159,19 +173,19 @@ async def answer_callback_error(
             logger.error("Failed to deliver error message to user.", exc_info=True)
 
 
-import re as _re
+RE_PUBLIC_LINK = re.compile(r"^(?:https?://)?(?:t|telegram)\.me/[A-Za-z0-9_]{4,64}/?$", re.IGNORECASE)
+RE_INVITE_LINK = re.compile(r"^(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)[A-Za-z0-9_\-]{8,}/?$", re.IGNORECASE)
+RE_USERNAME = re.compile(r"^@?[A-Za-z0-9_]{4,64}$", re.IGNORECASE)
 
-RE_PUBLIC_LINK = _re.compile(r"^(?:https?://)?(?:t|telegram)\.me/[A-Za-z0-9_]{4,64}/?$", _re.IGNORECASE)
-RE_INVITE_LINK = _re.compile(r"^(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)[A-Za-z0-9_\-]{8,}/?$", _re.IGNORECASE)
-RE_USERNAME = _re.compile(r"^@?[A-Za-z0-9_]{4,64}$")
 
 def normalize_target_line(line: str) -> Optional[str]:
-    """@username → لینک t.me؛ خود لینک‌ها بدون تغییر؛ None یعنی خط نامعتبر."""
+    """@username ← لینک t.me؛ خود لینک‌ها بدون تغییر؛ None یعنی خط نامعتبر."""
     if RE_USERNAME.fullmatch(line):
         return f"https://t.me/{line.lstrip('@')}"
     if RE_PUBLIC_LINK.fullmatch(line) or RE_INVITE_LINK.fullmatch(line):
         return line
     return None
+
 
 def parse_target_links(text: str) -> "tuple[list, list]":
     """متن چندخطی → (لینک‌های نرمال‌شدهٔ معتبر، [(شماره خط، متن خام خطوط نامعتبر)])"""

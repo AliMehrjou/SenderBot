@@ -32,7 +32,7 @@ from sqlalchemy import select, func, update
 from sqlalchemy.orm import selectinload
 
 from config import config
-from database.models import Account, Admin, ProfilePhoto, ProfilePhotoPackage
+from database.models import Account, Admin, ProfilePhoto, ProfilePhotoPackage, GlobalSettings
 
 # ⚠️ فقط این یک خط را با مسیر session factory پروژه‌ی خودت هماهنگ کن
 # (هر ماژولی که async_sessionmaker / AsyncSessionLocal را export می‌کند)
@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 router = Router(name="photo_handlers_router")
 
 PHOTO_ROOT = "profile_photos"
-PACKAGE_PHOTO_COUNT = 3
-ACCOUNTS_PAGE_SIZE = 8
+PACKAGE_PHOTO_COUNT = config.PACKAGE_PHOTO_COUNT
+ACCOUNTS_PAGE_SIZE = config.ACCOUNTS_PAGE_SIZE
 
 os.makedirs(PHOTO_ROOT, exist_ok=True)
 
@@ -59,6 +59,8 @@ class PhotoPackageStates(StatesGroup):
     waiting_for_photo_1 = State()
     waiting_for_photo_2 = State()
     waiting_for_photo_3 = State()
+    waiting_for_rename = State()
+    waiting_for_replace_photo = State()
 
 
 # ==========================================
@@ -99,10 +101,10 @@ def get_photo_panel_keyboard() -> types.InlineKeyboardMarkup:
     builder.button(text="📋 لیست پکیج‌ها", callback_data="photo_pkg_list/")
     builder.button(text="🔗 اتصال پکیج به اکانت", callback_data="photo_pkg_assign/")
     builder.button(text="⚡️ تخصیص خودکار", callback_data="photo_pkg_auto/")
-    builder.adjust(2, 2)
+    builder.button(text="🚀 اعمال فوری روی همه", callback_data="photo_pkg_apply_all/")
+    builder.adjust(2, 2, 1)
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
     return builder.as_markup()
-
 
 def get_photo_finish_keyboard() -> types.InlineKeyboardMarkup:
     """کیبورد پایان کار (الگوی فاز ۵ ابزارها): «ساخت پکیج دیگر» هندلر ورود را صدا
@@ -137,12 +139,28 @@ async def _remove_package_folder(package_id: int) -> None:
 @router.callback_query(F.data == "photo_pkg_panel/", IsAdmin())
 async def photo_packages_panel(callback: types.CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    await _drop_incomplete_flow(state)  # پاک‌سازی باقی‌مانده فلوی قبلی (ایمن و idempotent)
+    await _drop_incomplete_flow(state)
+    
+    auto_set_photo = False
+    try:
+        async with async_session_maker() as session:
+            settings = await session.scalar(select(GlobalSettings).limit(1))
+            if settings:
+                auto_set_photo = settings.auto_set_photo
+    except Exception as e:
+        logger.error(f"Error reading settings: {e}")
+        
+    status_indicator = (
+        "✅ <b>Auto Set Photo فعال</b> — پکیج‌ها به‌طور خودکار اعمال می‌شوند." 
+        if auto_set_photo else 
+        "⚠️ <b>توجه: تنظیم Auto Set Photo در تنظیمات خاموش است.</b> پکیج‌ها ساخته می‌شوند اما روی اکانت‌ها اعمال نخواهند شد. برای فعال‌سازی به ⚙️ تنظیمات بروید."
+    )
+
     await safe_edit_or_answer(
         callback.message,
-        "🖼 <b>مدیریت پکیج‌های عکس پروفایل</b>\n\n"
-        "هر پکیج دقیقاً ۳ عکس دارد که (با روشن بودن <b>Auto Set Photo</b> در تنظیمات)\n"
-        "هنگام استارت ورکر، جایگزین عکس‌های قبلی اکانت می‌شوند.",
+        f"🖼 <b>مدیریت پکیج‌های عکس پروفایل</b>\n\n"
+        f"{status_indicator}\n\n"
+        "هر پکیج دقیقاً ۳ عکس دارد که هنگام استارت ورکر، جایگزین عکس‌های قبلی اکانت می‌شوند.",
         reply_markup=get_photo_panel_keyboard(),
     )
 
@@ -211,12 +229,6 @@ async def process_package_name(message: types.Message, state: FSMContext) -> Non
 
 
 
-StateFilter(
-        PhotoPackageStates.waiting_for_photo_1,
-        PhotoPackageStates.waiting_for_photo_2,
-        PhotoPackageStates.waiting_for_photo_3
-    )
-
 @router.message(
     StateFilter(
         PhotoPackageStates.waiting_for_photo_1,
@@ -272,15 +284,6 @@ async def invalid_package_name(message: types.Message, state: FSMContext) -> Non
         reply_markup=get_cancel_keyboard(),
     )
 
-
-@router.message(
-    StateFilter(
-        PhotoPackageStates.waiting_for_photo_1,
-        PhotoPackageStates.waiting_for_photo_2,
-        PhotoPackageStates.waiting_for_photo_3
-    ),
-    F.photo,
-)
 
 @router.message(
     StateFilter(
@@ -382,11 +385,15 @@ async def list_photo_packages(callback: types.CallbackQuery, state: FSMContext) 
         safe_name = html.escape(pkg.name)
         photo_count = len(pkg.photos)
         acc_count = len(pkg.accounts)
-        status = "✅ ۳ عکس" if photo_count == PACKAGE_PHOTO_COUNT else f"⚠️ {photo_count} عکس (ناقص)"
+        status = f"✅ {PACKAGE_PHOTO_COUNT} عکس" if photo_count == PACKAGE_PHOTO_COUNT else f"⚠️ {photo_count} عکس (ناقص)"
         lines.append(f"• <b>#{pkg.id} — «{safe_name}»</b>\n    {status} | 🔗 {acc_count} اکانت")
         builder.row(
             types.InlineKeyboardButton(
-                text=f"🗑 حذف «{safe_name}»",
+                text=f"✏️ ویرایش",
+                callback_data=f"photo_pkg_edit:{pkg.id}",
+            ),
+            types.InlineKeyboardButton(
+                text=f"🗑 حذف",
                 callback_data=f"photo_pkg_del:{pkg.id}",
             )
         )
@@ -779,7 +786,7 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
 # 🏠 باگ ۷ — هندلر دکمه متنی منوی اصلی
 # مسیر: (اضافه شود به بخش PANEL یا انتهای فایل)
 # ==========================================
-@router.message(F.text == "🖼 پکیج پروفایل 🖼")
+@router.message(F.text.in_({"🖼 پکیج پروفایل 🖼", "🖼 پروفایل‌ها"}), IsAdmin())
 async def photo_pkg_text_entry(message: types.Message, state: FSMContext) -> None:
     if await state.get_state() is not None:
         try:
@@ -788,12 +795,198 @@ async def photo_pkg_text_entry(message: types.Message, state: FSMContext) -> Non
             pass
         await state.clear()
         
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🖼 پکیج پروفایل 🖼", callback_data="photo_pkg_panel/")
-    builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-    builder.adjust(1)
+    await _drop_incomplete_flow(state)
     
-    await message.answer(
-        "👇 برای ورود به مدیریت پکیج‌های پروفایل، دکمه زیر را بزنید:",
-        reply_markup=builder.as_markup()
+    auto_set_photo = False
+    try:
+        async with async_session_maker() as session:
+            settings = await session.scalar(select(GlobalSettings).limit(1))
+            if settings:
+                auto_set_photo = settings.auto_set_photo
+    except Exception as e:
+        logger.error(f"Error reading settings: {e}")
+        
+    status_indicator = (
+        "✅ <b>Auto Set Photo فعال</b> — پکیج‌ها به‌طور خودکار اعمال می‌شوند." 
+        if auto_set_photo else 
+        "⚠️ <b>توجه: تنظیم Auto Set Photo در تنظیمات خاموش است.</b> پکیج‌ها ساخته می‌شوند اما روی اکانت‌ها اعمال نخواهند شد. برای فعال‌سازی به ⚙️ تنظیمات بروید."
     )
+
+    await message.answer(
+        f"🖼 <b>مدیریت پکیج‌های عکس پروفایل</b>\n\n"
+        f"{status_indicator}\n\n"
+        "هر پکیج دقیقاً ۳ عکس دارد که هنگام استارت ورکر، جایگزین عکس‌های قبلی اکانت می‌شوند.",
+        reply_markup=get_photo_panel_keyboard(),
+    )
+
+@router.message(F.text.in_({"🖼 پکیج پروفایل 🖼", "🖼 پروفایل‌ها"}))
+async def photo_pkg_text_entry_forbidden(message: types.Message) -> None:
+    await message.answer("⛔️ شما دسترسی ندارید.")
+
+@router.callback_query(F.data == "photo_pkg_apply_all/", IsAdmin())
+async def apply_all_assigned_photos(callback: types.CallbackQuery) -> None:
+    await callback.answer("⏳ در حال اعمال عکس‌ها روی ورکرهای آنلاین...")
+    from workers.session_manager import worker_pool, apply_photo_package_now
+    
+    success, offline, failed = 0, 0, 0
+    for account_id in list(worker_pool.keys()):
+        try:
+            applied = await apply_photo_package_now(account_id)
+            if applied:
+                success += 1
+            else:
+                failed += 1
+        except Exception:
+            offline += 1
+            
+    await safe_edit_or_answer(
+        callback.message,
+        f"🚀 <b>گزارش اعمال فوری عکس‌ها</b>\n\n"
+        f"✅ موفقیت‌آمیز: {success}\n"
+        f"⚠️ ناموفق (بدون پکیج/خطا): {failed}\n"
+        f"💤 ورکرهای آفلاین: {offline}\n\n"
+        f"توجه: این عملیات فقط روی اکانت‌های آنلاین و دارای پکیج متصل اعمال می‌شود.",
+        reply_markup=get_photo_panel_keyboard()
+    )
+
+# ==========================================
+# ✏️ EDIT PACKAGE (Rename & Replace Photo)
+# ==========================================
+@router.callback_query(F.data.startswith("photo_pkg_edit:"), IsAdmin())
+async def edit_package_prompt(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await _drop_incomplete_flow(state)
+    pkg_id = int(callback.data.split(":")[1])
+
+    try:
+        async with async_session_maker() as session:
+            pkg = await session.get(ProfilePhotoPackage, pkg_id)
+    except Exception as e:
+        logger.error(f"DB Error in edit_package_prompt: {e}")
+        return await report_db_error(callback, e)
+
+    if not pkg:
+        return await callback.answer("⚠️ پکیج یافت نشد.", show_alert=True)
+
+    safe_name = html.escape(pkg.name)
+    builder = InlineKeyboardBuilder()
+    
+    for i in range(1, PACKAGE_PHOTO_COUNT + 1):
+        builder.row(types.InlineKeyboardButton(
+            text=f"📷 جایگزینی عکس {i}",
+            callback_data=f"photo_pkg_replace:{pkg_id}:{i}"
+        ))
+        
+    builder.row(types.InlineKeyboardButton(text="✏️ تغییر نام پکیج", callback_data=f"photo_pkg_rename:{pkg_id}"))
+    builder.row(types.InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data="photo_pkg_list/"))
+
+    await safe_edit_or_answer(
+        callback.message,
+        f"✏️ <b>ویرایش پکیج «{safe_name}»</b>\n\nلطفاً عملیات مورد نظر را انتخاب کنید:",
+        reply_markup=builder.as_markup(),
+    )
+
+@router.callback_query(F.data.startswith("photo_pkg_rename:"), IsAdmin())
+async def rename_package_prompt(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    pkg_id = int(callback.data.split(":")[1])
+    await state.set_state(PhotoPackageStates.waiting_for_rename)
+    await state.update_data(edit_pkg_id=pkg_id)
+    await safe_edit_or_answer(
+        callback.message,
+        with_cancel_hint("✏️ <b>تغییر نام پکیج</b>\n\nلطفاً نام جدید پکیج را ارسال کنید:"),
+        reply_markup=get_cancel_keyboard()
+    )
+
+@router.message(PhotoPackageStates.waiting_for_rename, F.text & ~F.text.startswith("/"))
+async def process_rename_package(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    pkg_id = data.get("edit_pkg_id")
+    name = message.text.strip()
+    
+    if not name or len(name) > 100:
+        return await message.answer(
+            with_cancel_hint("⚠️ نام نامعتبر است. دوباره بفرستید:"), 
+            reply_markup=get_cancel_keyboard()
+        )
+        
+    try:
+        async with async_session_maker() as session:
+            duplicate = await session.scalar(
+                select(ProfilePhotoPackage).where(ProfilePhotoPackage.name == name)
+            )
+            if duplicate and duplicate.id != pkg_id:
+                return await message.answer(
+                    with_cancel_hint("⚠️ این نام از قبل وجود دارد. نام دیگری بفرستید:"), 
+                    reply_markup=get_cancel_keyboard()
+                )
+            
+            pkg = await session.get(ProfilePhotoPackage, pkg_id)
+            if pkg:
+                pkg.name = name
+                await session.commit()
+    except Exception as e:
+        return await report_db_error(message, e)
+
+    await state.clear()
+    await message.answer(
+        f"✅ نام پکیج با موفقیت به «{html.escape(name)}» تغییر یافت.", 
+        reply_markup=get_photo_finish_keyboard()
+    )
+
+@router.callback_query(F.data.startswith("photo_pkg_replace:"), IsAdmin())
+async def replace_photo_prompt(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    _, pkg_id_str, pos_str = callback.data.split(":")
+    await state.set_state(PhotoPackageStates.waiting_for_replace_photo)
+    await state.update_data(edit_pkg_id=int(pkg_id_str), edit_photo_pos=int(pos_str))
+    
+    await safe_edit_or_answer(
+        callback.message,
+        with_cancel_hint(f"📷 <b>جایگزینی عکس {pos_str}</b>\n\nلطفاً عکس جدید را ارسال کنید:"),
+        reply_markup=get_cancel_keyboard()
+    )
+
+@router.message(PhotoPackageStates.waiting_for_replace_photo, F.photo)
+async def process_replace_photo(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    pkg_id = data.get("edit_pkg_id")
+    pos = data.get("edit_photo_pos")
+    
+    if not pkg_id or not pos:
+        await state.clear()
+        return await message.answer("⚠️ اطلاعات از دست رفت. لطفاً دوباره تلاش کنید.")
+        
+    final_dir = os.path.join(PHOTO_ROOT, str(pkg_id))
+    os.makedirs(final_dir, exist_ok=True)
+    file_path = os.path.join(final_dir, f"{pos}.jpg")
+    
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except OSError:
+            logger.warning(f"Could not remove old photo: {file_path}")
+            
+    try:
+        await message.bot.download(message.photo[-1], destination=file_path)
+    except Exception as e:
+        logger.error(f"Error downloading replacement photo: {e}")
+        return await message.answer(
+            with_cancel_hint("⚠️ دانلود عکس ناموفق بود. دوباره ارسال کنید:"), 
+            reply_markup=get_cancel_keyboard()
+        )
+        
+    try:
+        async with async_session_maker() as session:
+            photo_rec = await session.scalar(
+                select(ProfilePhoto).where(ProfilePhoto.package_id == pkg_id, ProfilePhoto.position == pos)
+            )
+            if not photo_rec:
+                session.add(ProfilePhoto(package_id=pkg_id, file_path=file_path, position=pos))
+            await session.commit()
+    except Exception as e:
+        return await report_db_error(message, e)
+        
+    await state.clear()
+    await message.answer(f"✅ عکس {pos} با موفقیت جایگزین شد.", reply_markup=get_photo_finish_keyboard())
+    

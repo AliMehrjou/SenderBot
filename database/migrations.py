@@ -48,6 +48,13 @@ _POST_ADD_FIXES: Dict[Tuple[str, str], str] = {
         "  WHERE ol.order_id = orders.id AND ol.status = 'success'"
         ") WHERE order_type = 'extract' AND extracted_count IS NULL"
     ),
+    ("orders", "user_id"): "SELECT 1",
+    ("orders", "speed_mode"): "UPDATE orders SET speed_mode = 'safe' WHERE speed_mode IS NULL",
+    # 🧱 فاز ۳: تبدیل اکانت‌های قبلی به وضعیت‌های استاندارد قرارداد جدید
+    ("accounts", "proxy_status"): (
+        "UPDATE accounts SET proxy_status = IF(proxy_string IS NOT NULL, 'ASSIGNED', 'WAITING_PROXY') "
+        "WHERE proxy_status IS NULL OR proxy_status = ''"
+    ),
 }
 
 
@@ -240,6 +247,40 @@ async def run_startup_migrations() -> None:
             logger.warning("DEP-1: تغییر سایز ستون‌ها ناموفق بود: %s", exc)
             await session.rollback()
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        # +++ فاز اختیاری: استراتژی ورکر ساکن +++
+        try:
+            exists = await session.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() "
+                    "AND table_name = 'global_settings' AND column_name = 'worker_residency'"
+                )
+            )
+            if not exists:
+                await session.execute(text("ALTER TABLE global_settings ADD COLUMN worker_residency VARCHAR(15) NOT NULL DEFAULT 'ephemeral'"))
+                await session.commit()
+                logger.info("Migration: global_settings.worker_residency column added.")
+        except Exception as exc:
+            logger.warning("Migration for worker_residency failed: %s", exc)
+            await session.rollback()
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        
+        # +++ فاز ۳: مهاجرت idempotent برای تنظیمات تهاجمی‌تر +++
+        try:
+            legacy_settings_sql = """
+            UPDATE global_settings
+            SET send_limit_per_run = 80, cooldown_hours = 1, spam_penalty_days = 1
+            WHERE send_limit_per_run = 40 AND cooldown_hours = 24 AND spam_penalty_days = 3;
+            """
+            res = await session.execute(text(legacy_settings_sql))
+            await session.commit()
+            if res.rowcount > 0:
+                logger.info("Phase 3: Migrated legacy GlobalSettings to aggressive speed limits.")
+        except Exception as exc:
+            logger.warning("Phase 3 Settings Migration failed: %s", exc)
+            await session.rollback()
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         idx_ol_check = """
         SELECT COUNT(1) FROM information_schema.STATISTICS
         WHERE TABLE_SCHEMA = DATABASE()
@@ -254,3 +295,138 @@ async def run_startup_migrations() -> None:
             logger.warning("DEP-1: composite index ix_order_logs_order_status created.")
 
     logger.info("DEP-1: بررسی مهاجرت idempotent schema تکمیل شد.")
+
+async def migrate_admins_progress_notify(engine) -> None:
+    """
+    Phase 5 — ensures admins.progress_notify (TINYINT(1) NOT NULL DEFAULT 1).
+
+    Idempotent: safe to run on every startup and concurrently
+    (information_schema existence check + duplicate-column swallow).
+    """
+    from sqlalchemy import text  # local import keeps module-level deps untouched
+    import logging
+    log = logging.getLogger(__name__)
+
+    try:
+        async with engine.connect() as conn:
+            exists = await conn.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() "
+                    "AND table_name = 'admins' AND column_name = 'progress_notify'"
+                )
+            )
+            if exists:
+                return
+            await conn.execute(
+                text(
+                    "ALTER TABLE admins "
+                    "ADD COLUMN progress_notify TINYINT(1) NOT NULL DEFAULT 1"
+                )
+            )
+            await conn.commit()
+            log.info("Migration: admins.progress_notify column ensured.")
+    except Exception as e:
+        if "duplicate column" in str(e).lower():
+            return  # a concurrent migration already added it
+        log.error(f"Migration migrate_admins_progress_notify failed: {e}")
+
+async def migrate_account_limits_columns(engine) -> None:
+    """
+    Phase 12-B — ensures limit and spambot columns exist in accounts table.
+    Idempotent: safe to run on every startup and concurrently.
+    """
+    from sqlalchemy import text
+    import logging
+    log = logging.getLogger(__name__)
+
+    columns = [
+        ("last_limit_type", "VARCHAR(50) NULL"),
+        ("spambot_report", "TEXT NULL"),
+        ("spambot_checked_at", "DATETIME NULL"),
+        ("restricted_until", "DATETIME NULL")
+    ]
+
+    try:
+        async with engine.connect() as conn:
+            for col_name, col_type in columns:
+                exists = await conn.scalar(
+                    text(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() "
+                        "AND table_name = 'accounts' AND column_name = :cname"
+                    ),
+                    {"cname": col_name}
+                )
+                if not exists:
+                    await conn.execute(
+                        text(f"ALTER TABLE accounts ADD COLUMN {col_name} {col_type}")
+                    )
+            await conn.commit()
+            log.info("Migration: accounts limit columns ensured.")
+    except Exception as e:
+        if "duplicate column" in str(e).lower():
+            return
+        log.error(f"Migration migrate_account_limits_columns failed: {e}")
+
+async def migrate_proxy_health_and_settings(engine) -> None:
+    """
+    Phase New — ensures proxy health columns and global sending setting exist.
+    Idempotent: safe to run on every startup and concurrently.
+    """
+    from sqlalchemy import text
+    import logging
+    log = logging.getLogger(__name__)
+
+    proxy_columns = [
+        ("usage_type", "VARCHAR(20) NOT NULL DEFAULT 'both'"),
+        ("is_healthy", "TINYINT(1) NOT NULL DEFAULT 1"),
+        ("health_state", "VARCHAR(20) NOT NULL DEFAULT 'HEALTHY'"),
+        ("consecutive_successes", "INT NOT NULL DEFAULT 0"),
+        ("consecutive_failures", "INT NOT NULL DEFAULT 0"),
+        ("last_state_changed_at", "DATETIME NULL"),
+        ("ping_ms", "INT NULL"),
+        ("last_checked_at", "DATETIME NULL")
+    ]
+
+    try:
+        async with engine.begin() as conn: # استفاده از تراکنش خودکار
+            # 1. Update Global Settings
+            settings_exists = await conn.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() "
+                    "AND table_name = 'global_settings' AND column_name = 'use_proxy_for_sending'"
+                )
+            )
+            if not settings_exists:
+                await conn.execute(
+                    text("ALTER TABLE global_settings ADD COLUMN use_proxy_for_sending TINYINT(1) NOT NULL DEFAULT 1")
+                )
+                
+            
+            # 2. Update Proxies Table
+            for col_name, col_type in proxy_columns:
+                exists = await conn.scalar(
+                    text(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() "
+                        "AND table_name = 'proxies' AND column_name = :cname"
+                    ),
+                    {"cname": col_name}
+                )
+                if not exists:
+                    try:
+                        await conn.execute(
+                            text(f"ALTER TABLE proxies ADD COLUMN {col_name} {col_type}")
+                        )
+                    except Exception as col_err:
+                        # جلوگیری از کرش در صورت تداخل همزمان (Race Condition)
+                        if "duplicate column" not in str(col_err).lower():
+                            raise col_err
+                            
+            log.info("Migration: Proxy health and global settings columns ensured safely.")
+    except Exception as e:
+        log.error(f"Migration migrate_proxy_health_and_settings failed but caught safely: {e}")
+
+    

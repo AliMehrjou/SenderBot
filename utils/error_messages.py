@@ -20,12 +20,6 @@ utils/error_messages.py
     نام «موجودیت» به فارسی — نه جملهٔ کامل عملیات — تا در همه قالب‌ها طبیعی بخواند:
         ✅ «دسته‌بندی»، «API»، «سفارش»، «اکانت»، «ادمین»، «تنظیمات»
         ❌ «افزودن دسته‌بندی» (این یک جمله است، نه موجودیت)
-
-طرح استفاده در هندلرها (از فاز ۲ اعمال می‌شود):
-
-    except Exception as e:
-        await session.rollback()
-        await message.answer(report_db_error("دسته‌بندی", e))
 """
 
 import logging
@@ -94,24 +88,25 @@ def _classify_db_error(error: Exception) -> str:
 
 _DB_ERROR_MESSAGES = {
     "duplicate": (
-        "❌ این {action} قبلاً ثبت شده است.\n"
-        "لطفاً یک مورد دیگر را امتحان کنید."
+        "⚠️ <b>رکورد تکراری!</b>\n"
+        "این {action} پیش از این در سیستم ثبت شده است. لطفاً مقدار دیگری وارد کنید."
     ),
     "foreign_key": (
-        "❌ {action} به داده‌های دیگری وابسته است و این عملیات روی آن انجام نمی‌شود.\n"
-        "لطفاً ابتدا موارد مرتبط (مثل اکانت‌ها یا سفارش‌های متصل) را حذف کنید."
+        "🔗 <b>خطای وابستگی داده‌ها</b>\n"
+        "این {action} به بخش‌های دیگری از سیستم متصل است و قابل حذف/ویرایش نیست.\n"
+        "💡 <i>راهنمایی: لطفاً ابتدا موارد مرتبط (مثل اکانت‌ها یا سفارش‌های متصل به آن) را حذف کنید.</i>"
     ),
     "connection": (
-        "❌ خطای اتصال به دیتابیس.\n"
-        "لطفاً چند لحظه دیگر دوباره تلاش کنید."
+        "🔌 <b>ارتباط با سرور قطع شد</b>\n"
+        "در حال حاضر ارتباط با پایگاه داده برقرار نیست. لطفاً چند لحظه دیگر مجدداً تلاش کنید."
     ),
     "locked": (
-        "❌ دیتابیس در حال حاضر مشغول است.\n"
-        "لطفاً چند لحظه دیگر دوباره تلاش کنید."
+        "⏳ <b>ترافیک بالای سیستم</b>\n"
+        "دیتابیس در حال پردازش دستورات قبلی است. لطفاً چند ثانیه صبر کرده و دوباره امتحان کنید."
     ),
     "unknown": (
-        "❌ عملیات روی {action} با خطا مواجه شد.\n"
-        "لطفاً دوباره تلاش کنید. اگر مشکل ادامه یافت، با پشتیبانی تماس بگیرید."
+        "❌ <b>خطای ناشناخته</b>\n"
+        "عملیات روی {action} با مشکل مواجه شد. لطفاً دوباره تلاش کنید یا کد خطای زیر را به پشتیبانی ارسال نمایید."
     ),
 }
 
@@ -133,19 +128,20 @@ def get_user_friendly_db_error(action: str, error: Exception) -> str:
 
 def report_db_error(action: str, error: Exception, log: Optional[logging.Logger] = None) -> str:
     """
-    ثبت کامل خطای دیتابیس در لاگ (با stack trace) + بازگرداندن پیام کاربرپسند.
-
-    فقط برای حذف تکرارِ این دو خط از همهٔ هندلرهاست:
-
-        logger.error(f"DB error in {action}: {e}", exc_info=True)
-        user_msg = get_user_friendly_db_error(action, e)
+    ثبت کامل خطای دیتابیس در لاگ (با stack trace) + بازگرداندن پیام کاربرپسند با کد رهگیری.
     """
+    import uuid
+    err_code = f"ERR-{uuid.uuid4().hex[:8].upper()}"
+    category = _classify_db_error(error)
+    
     (log or logger).error(
-        "Database error in '%s' [category=%s]: %s",
-        action, _classify_db_error(error), error,
+        "Database error [%s] in '%s' [category=%s]: %s",
+        err_code, action, category, error,
         exc_info=error,
     )
-    return get_user_friendly_db_error(action, error)
+    
+    base_msg = get_user_friendly_db_error(action, error)
+    return f"{base_msg}\n\nکد خطا: <code>{err_code}</code>\nلطفاً این کد را به پشتیبانی گزارش دهید."
 
 
 # ==========================================================
@@ -158,17 +154,18 @@ def get_generic_error_message() -> str:
     برای خطاهایی که علت مشخص و قابل ارائه به کاربر ندارند.
     """
     return (
-        "❌ خطای پیش‌بینی نشده‌ای رخ داد.\n"
-        "لطفاً دوباره تلاش کنید.\n"
-        "اگر مشکل ادامه یافت، /cancel را ارسال کنید."
+        "🛠 <b>بروز خطای سیستمی</b>\n"
+        "متأسفانه خطای پیش‌بینی نشده‌ای رخ داد. سیستم در حال بررسی است.\n\n"
+        "💡 <i>برای خروج از این وضعیت، لطفاً دستور /cancel را ارسال کنید و یا به منوی اصلی برگردید.</i>"
     )
 
 
 def get_telegram_api_error_message() -> str:
     """خطای ارتباط با سرورهای تلگرام (خطاهای RPC در pyrogram)."""
     return (
-        "❌ خطا در ارتباط با سرورهای تلگرام.\n"
-        "لطفاً چند لحظه دیگر دوباره تلاش کنید."
+        "🌐 <b>اختلال در API تلگرام</b>\n"
+        "ارتباط سرور ما با تلگرام موقتاً دچار اختلال شده است (ممکن است به دلیل فیلترینگ یا قطعی خود تلگرام باشد).\n"
+        "لطفاً چند دقیقه دیگر دوباره تلاش کنید."
     )
 
 
@@ -178,47 +175,23 @@ def get_floodwait_message(seconds) -> str:
         seconds = int(seconds)
     except (TypeError, ValueError):
         seconds = "چند"
-    return f"⏳ تلگرام این درخواست را موقتاً محدود کرده است. لطفاً حدود {seconds} ثانیه صبر کنید."
+    return (
+        "⏳ <b>محدودیت موقت تلگرام (FloodWait)</b>\n"
+        f"تلگرام برای جلوگیری از اسپم، ربات/اکانت را موقتاً محدود کرده است. لطفاً حدود <b>{seconds} ثانیه</b> استراحت کنید و سپس مجدداً تلاش نمایید."
+    )
 
 
 def get_download_error_message() -> str:
     """خطای دانلود فایل از سرور تلگرام (رفع مشکل ۴)."""
     return (
-        "❌ خطا در دانلود فایل.\n"
-        "لطفاً دوباره تلاش کنید یا فایل دیگری ارسال کنید."
+        "📥 <b>خطا در دریافت فایل</b>\n"
+        "متأسفانه دانلود فایل از سرور تلگرام با مشکل مواجه شد. لطفاً دوباره تلاش کنید یا فایل دیگری ارسال نمایید."
     )
 
 
 def get_file_too_large_message(limit_mb: int = 20) -> str:
     """حجم فایل بیش از حد مجاز است (رفع مشکل ۴)."""
     return (
-        "⚠️ فایل بیش از حد بزرگ است.\n"
-        f"حداکثر حجم مجاز: {limit_mb} مگابایت."
+        "📦 <b>حجم فایل بیش از حد مجاز</b>\n"
+        f"حجم فایل ارسال شده بیشتر از مقدار مجاز (<b>{limit_mb} مگابایت</b>) است. لطفاً فایل کوچکتری ارسال کنید."
     )
-
-
-# ==========================================================
-# اجرای مستقیم فایل = تست دستی خروجی پیام‌ها (بدون نیاز به ربات):
-#     python -m utils.error_messages
-# ==========================================================
-if __name__ == "__main__":
-    from sqlalchemy.exc import IntegrityError as _IE, OperationalError as _OE
-
-    samples = (
-        ("دسته‌بندی", _IE("INSERT ...", {}, Exception("UNIQUE constraint failed: categories.name"))),
-        ("دسته‌بندی", _IE("DELETE ...", {}, Exception("FOREIGN KEY constraint failed"))),
-        ("اکانت", _OE("SELECT ...", {}, Exception("connection refused"))),
-        ("سفارش", _OE("UPDATE ...", {}, Exception("database is locked"))),
-        ("سفارش", RuntimeError("some weird internal failure")),
-    )
-    for action, err in samples:
-        print(f"--- {type(err).__name__} (action={action}) ---")
-        print(get_user_friendly_db_error(action, err))
-        print()
-
-    print("--- پیام‌های عمومی ---")
-    print(get_generic_error_message())
-    print()
-    print(get_floodwait_message(30))
-    print()
-    print(get_file_too_large_message(20))

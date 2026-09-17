@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from database.models import Admin
-from bot.states.admin_fsm import AdminManageStates
+from bot.states.admin_fsm import AdminManageStates, AdminMessageStates
 from bot.states.confirm_fsm import ConfirmStates
 from config import config
 
@@ -145,6 +145,7 @@ async def process_admin_id(message: types.Message, state: FSMContext, session: A
 # LIST & DELETE ADMINS FLOW
 # (📄 فاز ۱: صفحه‌بندی استاندارد ۱۰ ادمین در هر صفحه + 🔄 بروزرسانی)
 # ==========================================
+# REWRITTEN
 async def render_admins_list(
     callback: types.CallbackQuery,
     session: AsyncSession,
@@ -153,25 +154,11 @@ async def render_admins_list(
 ) -> None:
     """
     📄 فاز ۱: رندر لیست ادمین‌های فرعی با صفحه‌بندی استاندارد.
-
-    - ۱۰ ادمین در هر صفحه (PAGINATION_SIZE) با کوئری‌های efficient:
-      یک COUNT برای کل تعداد + یک OFFSET/LIMIT برای صفحهٔ فعلی
-      (قبلاً همهٔ ادمین‌ها یک‌جا واکشی می‌شدند و با ۱۰۰+ ادمین،
-      پیام از سقف ۴۰۹۶ کاراکتر عبور می‌کرد و کرش می‌کرد)
-    - دکمه حذف برای هر ادمین (فرمت callback قدیمی del_admin_{id}/
-      حفظ شده تا فلوی تأیید دو مرحله‌ای بدون تغییر کار کند)
-    - ردیف ناوبری صفحات + 🔄 بروزرسانی + 🏛 منوی اصلی
-
-    نکته: این تابع خودش callback را answer نمی‌کند؛ همهٔ فراخوانی‌کننده‌ها
-    باید قبل از فراخوانی، callback را پاسخ داده باشند (الگوی فاز ۵).
     """
-    # 🛡 فاز ۵ (مشکل ۱): این تابع از چند هندلر مختلف صدا زده می‌شود،
-    # پس حفاظ دیتابیس داخل خودش انجام می‌شود
     try:
         total_count = await session.scalar(select(func.count(Admin.id))) or 0
         total_pages = calculate_total_pages(total_count)
 
-        # اصلاح هوشمند شماره صفحه (مثلاً بعد از حذف آخرین ادمینِ صفحهٔ آخر)
         page = clamp_page(page, total_pages)
         offset = get_page_offset(page)
 
@@ -189,13 +176,11 @@ async def render_admins_list(
             callback, report_db_error("ادمین‌ها", e), get_main_menu_button()
         )
 
-    # 📄 فاز ۱: ثبت صفحهٔ فعلی در FSM برای بازگشت درست بعد از حذف/انصراف
     if state is not None:
         await state.update_data(admins_list_page=page)
 
     builder = InlineKeyboardBuilder()
 
-    # ── لیست خالی ──
     if total_count == 0:
         builder.button(text="🔙 بازگشت", callback_data="menu_add_admin/")
         builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
@@ -206,35 +191,32 @@ async def render_admins_list(
             reply_markup=builder.as_markup()
         )
 
-    # ── متن لیست (حداکثر ۱۰ خط → دیگر خطر عبور از سقف ۴۰۹۶ کاراکتر وجود ندارد) ──
     text = (
         "👥 <b>لیست ادمین‌های فرعی سیستم</b>\n"
         f"🔢 مجموع: <b>{total_count}</b> ادمین\n"
         f"📄 صفحهٔ <b>{page}</b> از <b>{total_pages}</b>\n\n"
     )
 
+    # دکمه ارسال پیام در بالا قرار می‌گیرد
+    builder.button(text="📨 پیام به ادمین‌ها", callback_data="menu_admin_message/")
+
     for idx, adm in enumerate(admins, start=offset + 1):
         text += f"{idx}. 🆔 <code>{adm.telegram_id}</code>\n"
 
-        # برچسب دکمه حذف: آیدی تلگرام (کوتاه‌سازی برای چیدمان دو ستونی)
         id_label = str(adm.telegram_id)
         if len(id_label) > 12:
             id_label = id_label[:11] + "…"
         builder.button(text=f"🗑 حذف {id_label}", callback_data=f"del_admin_{adm.id}/")
 
-    builder.adjust(2)
+    # تنظیم چیدمان: ردیف اول 1 دکمه (پیام)، ردیف‌های بعد 2 دکمه (حذف)
+    builder.adjust(1, 2)
 
     text += "\n👇 برای حذف هر ادمین، روی دکمهٔ مربوطه کلیک کنید:"
 
-    # ── ردیف ناوبری صفحات (فقط وقتی بیش از یک صفحه باشد) ──
     add_pagination_nav_row(builder, page, total_pages, callback_prefix="list_admins_")
-
-    # ── دکمه‌های پایانی: 🔄 بروزرسانی (رفرش همان صفحه) + 🏛 منوی اصلی ──
     add_list_footer(builder, refresh_callback=f"list_admins_page_{page}/")
 
-    # 🛡 فاز ۵: ویرایش امن
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
-
 
 @router.callback_query(F.data == "menu_list_admins/")
 async def list_admins_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
@@ -444,3 +426,317 @@ async def cancel_delete_admin_confirmation(callback: types.CallbackQuery, state:
     await safe_callback_answer(callback, "🚫 عملیات حذف ادمین لغو شد.")
 
     return await render_admins_list(callback, session, state=state, page=return_page)
+
+
+# NEW
+# ==========================================
+# SEND MESSAGE TO ADMINS FLOW
+# ==========================================
+
+@router.callback_query(F.data == "menu_admin_message/")
+async def admin_message_menu(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    await safe_callback_answer(callback)
+    await state.set_state(AdminMessageStates.waiting_for_recipient_selection)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📢 پیام به همه ادمین‌ها", callback_data="msg_admin_all/")
+    builder.button(text="👤 پیام به یک ادمین خاص", callback_data="msg_admin_specific/")
+    builder.button(text="🔙 بازگشت", callback_data="menu_list_admins/")
+    builder.adjust(1)
+    
+    await safe_edit_or_answer(
+        callback.message,
+        "📨 <b>پنل ارسال پیام به ادمین‌ها</b>\n\nلطفاً گیرنده پیام را انتخاب کنید:",
+        reply_markup=builder.as_markup()
+    )
+
+@router.callback_query(AdminMessageStates.waiting_for_recipient_selection, F.data == "msg_admin_all/")
+async def admin_message_all(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    await safe_callback_answer(callback)
+    await state.update_data(recipient="all")
+    await state.set_state(AdminMessageStates.waiting_for_message_content)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ انصراف", callback_data="menu_list_admins/")
+    
+    await safe_edit_or_answer(
+        callback.message,
+        "📢 <b>ارسال پیام به همه ادمین‌ها</b>\n\nلطفاً متن پیام خود را ارسال کنید (امکان استفاده از تگ‌های HTML وجود دارد):",
+        reply_markup=builder.as_markup()
+    )
+
+async def render_message_admins_list(callback: types.CallbackQuery, session: AsyncSession, page: int = 1) -> None:
+    """تابع کمکی برای رندر کردن لیست ادمین‌ها جهت انتخاب گیرنده پیام"""
+    try:
+        total_count = await session.scalar(select(func.count(Admin.id))) or 0
+        total_pages = calculate_total_pages(total_count)
+
+        page = clamp_page(page, total_pages)
+        offset = get_page_offset(page)
+
+        admins = (
+            await session.scalars(
+                select(Admin)
+                .order_by(Admin.id.asc())
+                .offset(offset)
+                .limit(PAGINATION_SIZE)
+            )
+        ).all()
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(
+            callback, report_db_error("ادمین‌ها", e), get_main_menu_button()
+        )
+
+    builder = InlineKeyboardBuilder()
+
+    if total_count == 0:
+        builder.button(text="🔙 بازگشت", callback_data="menu_admin_message/")
+        return await safe_edit_or_answer(
+            callback.message,
+            "⚠️ هیچ ادمین فرعی برای دریافت پیام وجود ندارد.",
+            reply_markup=builder.as_markup()
+        )
+
+    text = (
+        "👤 <b>انتخاب ادمین برای ارسال پیام</b>\n"
+        f"📄 صفحهٔ <b>{page}</b> از <b>{total_pages}</b>\n\n"
+    )
+
+    for idx, adm in enumerate(admins, start=offset + 1):
+        text += f"{idx}. 🆔 <code>{adm.telegram_id}</code>\n"
+        id_label = str(adm.telegram_id)
+        if len(id_label) > 12:
+            id_label = id_label[:11] + "…"
+        builder.button(text=f"📨 پیام {id_label}", callback_data=f"msg_admin_{adm.id}/")
+
+    builder.adjust(2)
+    text += "\n👇 برای ارسال پیام، روی دکمهٔ ادمین مورد نظر کلیک کنید:"
+
+    add_pagination_nav_row(builder, page, total_pages, callback_prefix="msg_list_admins_page_")
+    builder.row(types.InlineKeyboardButton(text="🔙 بازگشت", callback_data="menu_admin_message/"))
+
+    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
+@router.callback_query(AdminMessageStates.waiting_for_recipient_selection, F.data == "msg_admin_specific/")
+async def admin_message_specific(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    await safe_callback_answer(callback)
+    await render_message_admins_list(callback, session, page=1)
+
+@router.callback_query(AdminMessageStates.waiting_for_recipient_selection, F.data.startswith("msg_list_admins_page_"))
+async def msg_list_admins_paginated(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    await safe_callback_answer(callback)
+    page = parse_page_from_callback(callback.data)
+    await render_message_admins_list(callback, session, page=page)
+
+@router.callback_query(AdminMessageStates.waiting_for_recipient_selection, F.data.startswith("msg_admin_") & F.data.endswith("/"))
+async def select_specific_admin_for_msg(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    if callback.data in ("msg_admin_all/", "msg_admin_specific/"):
+        return
+        
+    admin_id_str = callback.data.replace("msg_admin_", "").replace("/", "")
+    if not admin_id_str.isdigit():
+        return await safe_callback_answer(callback, "⚠️ آیدی نامعتبر.", show_alert=True)
+        
+    admin_db_id = int(admin_id_str)
+    try:
+        admin_obj = await session.scalar(select(Admin).where(Admin.id == admin_db_id))
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("ادمین", e), get_main_menu_button())
+        
+    if not admin_obj:
+        return await safe_callback_answer(callback, "⚠️ ادمین یافت نشد.", show_alert=True)
+        
+    await safe_callback_answer(callback)
+    await state.update_data(recipient=admin_db_id, recipient_tg_id=admin_obj.telegram_id)
+    await state.set_state(AdminMessageStates.waiting_for_message_content)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ انصراف", callback_data="menu_list_admins/")
+    
+    await safe_edit_or_answer(
+        callback.message,
+        f"👤 <b>ارسال پیام به ادمین <code>{admin_obj.telegram_id}</code></b>\n\nلطفاً متن پیام خود را ارسال کنید (امکان استفاده از تگ‌های HTML وجود دارد):",
+        reply_markup=builder.as_markup()
+    )
+
+@router.message(AdminMessageStates.waiting_for_message_content, F.text)
+async def msg_content_received(message: types.Message, state: FSMContext) -> None:
+    if message.from_user.id != config.ADMIN_ID:
+        return
+        
+    text = message.text
+    await state.update_data(message_text=text)
+    
+    fsm_data = await state.get_data()
+    recipient = fsm_data.get("recipient")
+    
+    if recipient == "all":
+        target_str = "همه ادمین‌ها"
+    else:
+        target_str = f"ادمین <code>{fsm_data.get('recipient_tg_id')}</code>"
+        
+    preview = (
+        "📋 <b>پیش‌نمایش پیام:</b>\n\n"
+        f"{text}\n\n"
+        f"📨 <b>گیرنده:</b> {target_str}\n\n"
+        "آیا از ارسال این پیام اطمینان دارید؟"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ بله، ارسال کن", callback_data="confirm_send_msg/")
+    builder.button(text="❌ انصراف", callback_data="menu_list_admins/")
+    builder.button(text="✏️ ویرایش متن", callback_data="edit_msg_text/")
+    builder.adjust(1, 2)
+    
+    await message.answer(preview, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await state.set_state(AdminMessageStates.waiting_for_send_confirmation)
+
+@router.callback_query(AdminMessageStates.waiting_for_send_confirmation, F.data == "edit_msg_text/")
+async def edit_msg_text(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    await safe_callback_answer(callback)
+    await state.set_state(AdminMessageStates.waiting_for_message_content)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ انصراف", callback_data="menu_list_admins/")
+    
+    await safe_edit_or_answer(
+        callback.message,
+        "✏️ لطفاً متن جدید پیام را ارسال کنید:",
+        reply_markup=builder.as_markup()
+    )
+
+@router.callback_query(AdminMessageStates.waiting_for_send_confirmation, F.data == "confirm_send_msg/")
+async def execute_send_msg(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    await safe_callback_answer(callback, "⏳ در حال ارسال...")
+    
+    fsm_data = await state.get_data()
+    recipient = fsm_data.get("recipient")
+    text = fsm_data.get("message_text", "")
+    
+    # هدر مخصوص سیستم
+    final_text = f"📨 پیام از ادمین اصلی:\n\n{text}"
+    
+    success = 0
+    failed_ids = []
+    
+    if recipient == "all":
+        admins = (await session.scalars(select(Admin.telegram_id))).all()
+        targets = admins
+    else:
+        targets = [fsm_data.get("recipient_tg_id")]
+        
+    for tg_id in targets:
+        try:
+            await callback.bot.send_message(chat_id=tg_id, text=final_text, parse_mode="HTML")
+            success += 1
+        except Exception as e:
+            logger.error(f"Failed to send admin message to {tg_id}: {e}")
+            failed_ids.append(str(tg_id))
+            
+    report = f"✅ پیام به <b>{success}</b> از <b>{len(targets)}</b> ادمین ارسال شد.\n"
+    if failed_ids:
+        report += f"\n❌ <b>{len(failed_ids)}</b> مورد ناموفق (احتمالاً ربات را بلاک کرده‌اند):\n<code>{', '.join(failed_ids)}</code>"
+        
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 بازگشت به لیست ادمین‌ها", callback_data="menu_list_admins/")
+    builder.adjust(1)
+    
+    await safe_edit_or_answer(callback.message, report, reply_markup=builder.as_markup())
+    await state.clear()
+
+from database.models import Account, AccountStatus
+
+@router.callback_query(F.data == "menu_account_health/")
+async def account_health_panel(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    """🩺 فاز ۱۰: نمایش وضعیت اکانت‌های در استراحت یا مسدود شده"""
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    await safe_callback_answer(callback)
+    
+    # واکشی اکانت‌هایی که در حالت Active نیستند (Blocked یا Cooldown)
+    stmt = select(Account).where(Account.status.in_([AccountStatus.blocked, AccountStatus.cooldown]))
+    problem_accounts = (await session.scalars(stmt)).all()
+    
+    builder = InlineKeyboardBuilder()
+    
+    if not problem_accounts:
+        text = "🟢 <b>وضعیت سلامت سیستم</b>\n\nهیچ اکانتی در وضعیت Blocked یا Cooldown وجود ندارد. تمام اکانت‌ها در سلامت کامل هستند!"
+    else:
+        text = "🔴 <b>اکانت‌های نیازمند توجه</b>\n\n"
+        for acc in problem_accounts:
+            status_emoji = "⏳" if acc.status == AccountStatus.cooldown else "🚫"
+            
+            # تبدیل زمان بازگشت به تایم‌زون محلی (تهران) برای نمایش به ادمین
+            return_str = "دستی (نیازمند بررسی)"
+            if acc.expected_return_time:
+                from zoneinfo import ZoneInfo
+                tehran_tz = ZoneInfo("Asia/Tehran")
+                local_time = acc.expected_return_time.astimezone(tehran_tz)
+                return_str = local_time.strftime("%H:%M")
+                
+            status_val = acc.status.value if hasattr(acc.status, 'value') else str(acc.status)
+            text += (
+                f"{status_emoji} <b>آیدی {acc.id}</b> | وضعیت: {status_val}\n"
+                f"▫️ دلیل: <i>{acc.status_reason or 'نامشخص'}</i>\n"
+                f"▫️ زمان بازگشت: <code>{return_str}</code>\n\n"
+            )
+            
+            # فقط اکانت‌های Blocked نیاز به دکمه رفع بلاک دستی دارند (Cooldownها خودکار برمی‌گردند)
+            if acc.status == AccountStatus.blocked:
+                builder.button(text=f"✅ رفع محدودیت آیدی {acc.id}", callback_data=f"unblock_acc_{acc.id}/")
+
+    builder.button(text="🔄 بروزرسانی", callback_data="menu_account_health/")
+    builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
+    builder.adjust(1)
+    
+    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("unblock_acc_") & F.data.endswith("/"))
+async def unblock_account_handler(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    """🩺 فاز ۱۰: بازگردانی دستی اکانت از حالت مسدود به اکتیو"""
+    if callback.from_user.id != config.ADMIN_ID:
+        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
+        
+    acc_id = int(callback.data.replace("unblock_acc_", "").replace("/", ""))
+    
+    # استفاده از تابع استاندارد change_account_status برای تغییر اتمیک و ثبت لاگ
+    try:
+        from workers.sender import change_account_status
+        await change_account_status(
+            session=session, 
+            account_id=acc_id, 
+            new_status=AccountStatus.active, 
+            reason="Manual Unblock by Admin"
+        )
+        await safe_callback_answer(callback, f"✅ اکانت {acc_id} با موفقیت به چرخه Active بازگشت.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Failed to unblock account {acc_id}: {e}")
+        await safe_callback_answer(callback, "❌ خطا در بازگردانی اکانت. لاگ سرور را بررسی کنید.", show_alert=True)
+        
+    # رفرش پنل وضعیت
+    await account_health_panel(callback, session)

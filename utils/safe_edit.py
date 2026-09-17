@@ -32,36 +32,43 @@ async def safe_edit_or_answer(
     """
     try:
         await message.edit_text(text, reply_markup=reply_markup, **kwargs)
-    except TelegramBadRequest as e:
-        err_msg = str(e).lower()
-        # ۱. محتوای تکراری — نیازی به تغییر یا فال‌بک نیست
-        if "message is not modified" in err_msg:
+    except Exception as e:
+        if is_not_modified_error(e):
+            # خطا کاملاً بی‌خطر است، نادیده گرفتن قطعی بدون اکسپشن
             return
             
-        # ۲. پیام مدیا است و متن ندارد — باید کپشن ویرایش شود
+        err_msg = str(e).lower()
         if "there is no text in the message to edit" in err_msg:
             try:
                 await message.edit_caption(caption=text, reply_markup=reply_markup, **kwargs)
                 return
-            except TelegramBadRequest as e2:
-                if "message is not modified" in str(e2).lower():
+            except Exception as e2:
+                if is_not_modified_error(e2):
                     return
-                # هر خطای دیگری حین ویرایش کپشن رخ داد، لاگ و فال‌بک می‌شود
                 logger.warning(f"safe_edit_or_answer: edit_caption failed ({e2}); falling back to answer.")
                 
-        # ۳. پیام حذف شده یا قدیمی (غیرقابل ویرایش) — فال‌بک به answer
-        elif "message to edit not found" in err_msg or "message can't be edited" in err_msg:
-            # اینجا فقط لاگِ دیباگ یا info می‌زنیم تا هشدار لاگ بیش از حد پر نشود
+        elif is_message_gone_error(e):
             logger.debug(f"safe_edit_or_answer: message not editable ({e}); falling back to answer.")
             
         else:
-            # سایر خطاهای BadRequest
-            logger.warning(f"safe_edit_or_answer: TelegramBadRequest ({e}); falling back to answer.")
+            logger.warning(f"safe_edit_or_answer: Unexpected error ({e}); falling back to answer.")
             
         with suppress(Exception):
             await message.answer(text, reply_markup=reply_markup, **kwargs)
-            
-    except Exception as edit_error:
-        logger.warning(f"safe_edit_or_answer: Unexpected error ({edit_error}); falling back to answer.")
-        with suppress(Exception):
-            await message.answer(text, reply_markup=reply_markup, **kwargs)
+
+
+def is_not_modified_error(exc: Exception) -> bool:
+    """
+    True when an edit attempt was a no-op (identical content) — safe to swallow.
+    Shared with utils/progress_reporter.py so both use one classification.
+    """
+    return "message is not modified" in str(exc).lower()
+
+
+def is_message_gone_error(exc: Exception) -> bool:
+    """
+    True when the target message is deleted or too old to be edited.
+    Shared with utils/progress_reporter.py so both use one classification.
+    """
+    msg = str(exc).lower()
+    return "message to edit not found" in msg or "message can't be edited" in msg

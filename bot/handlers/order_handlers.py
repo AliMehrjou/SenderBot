@@ -11,7 +11,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import aiofiles
 from aiogram import Router, types, F, Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -33,6 +33,10 @@ from pyrogram.errors import (
     UsernameInvalid,
     UsernameNotOccupied,
 )
+import json
+import redis.asyncio as aioredis
+from typing import Optional
+
 import redis.asyncio as aioredis
 from config import config
 from sqlalchemy import select, func
@@ -41,9 +45,11 @@ from bot.handlers.login_handlers import release_login_reservations
 from bot.states.confirm_fsm import ConfirmStates
 from bot.states.order_fsm import CreateOrderStates
 from database.models import Category, Order, OrderLog, OrderStatus, Account, APIKey
-from workers.session_manager import worker_pool
+from workers.session_manager import worker_pool, parse_proxy_string
 from database.engine import async_session
 from bot.keyboards.cancel import get_cancel_keyboard, with_cancel_hint
+from workers.task_queue import DistributedFinalizeLock
+from workers.sender import _get_redis
 from bot.keyboards.main_menu import (
     get_main_menu_button,
     get_main_menu_keyboard,
@@ -97,6 +103,47 @@ LINK_TARGET_EXAMPLE = (
 )
 
 MAX_SOURCE_MESSAGES = 10
+
+
+# ==========================================
+# 🟢 فاز ۶: کلاینت Redis تنبل — به‌جای ساخت connection در هر فراخوانی
+# ==========================================
+_source_check_redis: Optional[aioredis.Redis] = None
+
+def _get_source_check_redis() -> aioredis.Redis:
+    """کلاینت Redis تنبل برای بررسی کانال مبدا — یک‌بار ساخته و حفظ می‌شود."""
+    global _source_check_redis
+    if _source_check_redis is None:
+        redis_url = getattr(config, "REDIS_URL", None)
+        if redis_url:
+            _source_check_redis = aioredis.from_url(
+                redis_url, decode_responses=True, socket_timeout=2
+            )
+        else:
+            _source_check_redis = aioredis.Redis(
+                host=os.getenv("REDIS_HOST", "127.0.0.1"),
+                port=int(os.getenv("REDIS_PORT", 6379)),
+                password=os.getenv("REDIS_PASS") or None,
+                decode_responses=True,
+                socket_timeout=2,
+            )
+    return _source_check_redis
+
+
+async def invalidate_source_channel_cache(channel_input: str) -> None:
+    """
+    🟢 فاز ۶: پاک‌سازی فعال cache برای یک کانال مبدا.
+    
+    باید صدا زده شود وقتی:
+      - کاربر دوباره همان کانال را وارد می‌کند (احتمال تغییر دسترسی)
+      - یک سفارش با خطای source_failed تمام می‌شود (شاید دسترسی عوض شده)
+      - admin دسترسی workerها را تغییر می‌دهد
+    """
+    try:
+        redis = _get_source_check_redis()
+        await redis.delete(f"srccheck:{channel_input}")
+    except Exception as e:
+        logger.warning(f"Failed to invalidate source-check cache for {channel_input}: {e}")
 
 
 # ==========================================
@@ -236,6 +283,62 @@ async def _start_create_order_flow(
     await cleanup_fsm_temp_files(state)
     await state.clear()
 
+    # 🟢 گارد امنیتی: بررسی وجود حداقل یک ورکر متصل، سالم و بدون استراحت
+    from workers.session_manager import worker_pool
+    from database.models import Account, AccountStatus
+    from sqlalchemy import or_, select
+    from datetime import datetime, timezone
+    from contextlib import suppress
+    from aiogram.exceptions import TelegramBadRequest
+    
+    connected_ids = [acc_id for acc_id, c in worker_pool.items() if getattr(c, "is_connected", False)]
+    available_workers = 0
+    
+    if connected_ids:
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        # 🟢 تغییر: دریافت آی‌دی اکانت‌های معتبر به جای شمارش کلی
+        stmt = select(Account.id).where(
+            Account.id.in_(connected_ids),
+            Account.is_banned == False,
+            Account.status == AccountStatus.active,
+            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
+            or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
+        )
+        valid_account_ids = (await session.scalars(stmt)).all()
+        
+        if valid_account_ids:
+            try:
+                # 🟢 بررسی ردیس برای کسر اکانت‌هایی که در استراحت (Cooldown) هستند
+                from workers.sender import _get_redis
+                redis_client = _get_redis()
+                pipe = redis_client.pipeline()
+                for aid in valid_account_ids:
+                    pipe.exists(f"chunk_cooldown:{aid}")
+                cooldown_results = await pipe.execute()
+                
+                # تعداد نهایی: کل اکانت‌های سالم منهای آن‌هایی که در استراحتند
+                available_workers = len(valid_account_ids) - sum(1 for res in cooldown_results if res)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"Redis check failed in order preflight: {e}")
+                available_workers = len(valid_account_ids) # Fallback
+        
+    if available_workers <= 0:
+        err_text = (
+            "❌ <b>امکان ثبت سفارش وجود ندارد</b>\n\n"
+            "در حال حاضر هیچ اکانتِ آماده ارسالی در سیستم یافت نشد.\n"
+            "(تمام ورکرها ممکن است در حال استراحت دوره‌ای باشند، یا مسدود و دارای محدودیت تلگرامی باشند)\n\n"
+            "<i>لطفاً اکانت جدیدی اضافه کنید یا منتظر پایان استراحت اکانت‌های فعلی بمانید.</i>"
+        )
+        if callback is not None:
+            with suppress(TelegramBadRequest):
+                await callback.message.edit_reply_markup(reply_markup=None)
+            return await safe_edit_or_answer(message, err_text, reply_markup=get_main_menu_keyboard())
+            
+        from bot.keyboards.main_menu import get_main_menu_reply_keyboard
+        return await message.answer(err_text, reply_markup=get_main_menu_reply_keyboard())
+    # -----------------------------------------------------------------
+
     try:
         cats_count = await session.scalar(select(func.count(Category.id))) or 0
     except Exception as e:
@@ -282,13 +385,13 @@ async def enter_create_order_flow(callback: types.CallbackQuery, state: FSMConte
     await _start_create_order_flow(callback.message, state, session, callback=callback)
 
 
-@router.message(F.text == "🛍 ثبت سفارش 🛍")
+@router.message(F.text == "🛍 ثبت سفارش")
 async def create_order_text_entry(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
     """⌨️ ورودی دکمه‌ای منوی اصلی — ثبت سفارش"""
     await _start_create_order_flow(message, state, session)
 
 
-@router.message(F.text == "💾 لیست سفارشات 💾")
+@router.message(F.text == "📋 لیست سفارشات")
 async def active_orders_text_entry(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
     """⌨️ ورودی دکمه‌ای منوی اصلی — Kill Switch (خودِ لیست شیشه‌ای می‌ماند)"""
     if await state.get_state() is not None:
@@ -359,114 +462,53 @@ async def _route_to_inline(
         reply_markup=_single_route_button(button_text, callback_data),
     )
 
-@router.message(F.text == "📱 افزودن اکانت 📱")
+@router.message(F.text == "📱 افزودن اکانت")
 async def add_account_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_add_account/ (login_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="📱 افزودن اکانت 📱",
-        callback_data="menu_add_account/",
-    )
+    await _route_to_inline(message, state, button_text="📱 افزودن اکانت", callback_data="menu_add_account/")
 
-
-@router.message(F.text == "📥 افزودن Api 📥")
-async def add_api_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_add_api/ (api_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="📥 افزودن Api 📥",
-        callback_data="menu_add_api/",
-    )
-
-
-@router.message(F.text == "📄 افزودن دسته‌بندی 📄")
-async def add_category_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای settings_add_cat/ (settings_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="📄 افزودن دسته‌بندی 📄",
-        callback_data="settings_add_cat/",
-    )
-
-
-@router.message(F.text == "📲 لیست اکانت‌ها 📲")
+@router.message(F.text == "📲 لیست اکانت‌ها")
 async def list_accounts_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_list_accounts/ (stats_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="📲 لیست اکانت‌ها 📲",
-        callback_data="menu_list_accounts/",
-    )
+    await _route_to_inline(message, state, button_text="📲 لیست اکانت‌ها", callback_data="menu_list_accounts/")
 
+@router.message(F.text == "📥 افزودن API")
+async def add_api_text_entry(message: types.Message, state: FSMContext) -> None:
+    await _route_to_inline(message, state, button_text="📥 افزودن API", callback_data="menu_add_api/")
 
-@router.message(F.text == "📤 لیست Api 📤")
+@router.message(F.text == "📤 لیست API")
 async def list_api_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_list_api/ (api_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="📤 لیست Api 📤",
-        callback_data="menu_list_api/",
-    )
+    await _route_to_inline(message, state, button_text="📤 لیست API", callback_data="menu_list_api/")
 
-
-@router.message(F.text == "🗂 لیست دسته‌بندی‌ها 🗂")
-async def list_categories_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_list_categories/ (settings_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="🗂 لیست دسته‌بندی‌ها 🗂",
-        callback_data="menu_list_categories/",
-    )
-
-
-@router.message(F.text == "🌐 آنالیز 🌐")
+@router.message(F.text == "🌐 آنالیز")
 async def analysis_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_analysis/ (extractor_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="🌐 آنالیز 🌐",
-        callback_data="menu_analysis/",
-    )
+    await _route_to_inline(message, state, button_text="🌐 آنالیز", callback_data="menu_analysis/")
 
-
-@router.message(F.text == "⚙️ تنظیمات ⚙️")
-async def settings_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_settings/ (settings_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="⚙️ تنظیمات ⚙️",
-        callback_data="menu_settings/",
-    )
-
-
-@router.message(F.text == "📚 راهنما 📚")
-async def help_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_help/ (general_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="📚 راهنما 📚",
-        callback_data="menu_help/",
-    )
-
-
-@router.message(F.text == "📊 آمار 📊")
+@router.message(F.text == "📊 آمار")
 async def stats_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_stats/ (stats_handlers)"""
-    await _route_to_inline(
-        message, state,
-        button_text="📊 آمار 📊",
-        callback_data="menu_stats/",
-    )
+    await _route_to_inline(message, state, button_text="📊 آمار", callback_data="menu_stats/")
 
+@router.message(F.text == "🖼 پروفایل‌ها")
+async def photo_pkg_text_entry(message: types.Message, state: FSMContext) -> None:
+    await _route_to_inline(message, state, button_text="🖼 پروفایل‌ها", callback_data="photo_pkg_panel/")
 
-@router.message(F.text == "👨‍💻 افزودن ادمین 👨‍💻")
+@router.message(F.text == "🧹 پاکسازی")
+async def cleanup_tools_text_entry(message: types.Message, state: FSMContext) -> None:
+    await _route_to_inline(message, state, button_text="🧹 پاکسازی", callback_data="menu_cleanup_tools/")
+
+@router.message(F.text == "⚙️ تنظیمات")
+async def settings_text_entry(message: types.Message, state: FSMContext) -> None:
+    await _route_to_inline(message, state, button_text="⚙️ تنظیمات", callback_data="menu_settings/")
+
+@router.message(F.text == "📂 دسته‌بندی‌ها")
+async def list_categories_text_entry(message: types.Message, state: FSMContext) -> None:
+    await _route_to_inline(message, state, button_text="📂 دسته‌بندی‌ها", callback_data="menu_list_categories/")
+
+@router.message(F.text == "👨‍💻 ادمین‌ها")
 async def add_admin_text_entry(message: types.Message, state: FSMContext) -> None:
-    """⌨️ دکمه‌ی پایین چت → مسیر شیشه‌ای menu_add_admin/ (admin_manage)"""
-    await _route_to_inline(
-        message, state,
-        button_text="👨‍💻 افزودن ادمین 👨‍💻",
-        callback_data="menu_add_admin/",
-    )
+    await _route_to_inline(message, state, button_text="👨‍💻 ادمین‌ها", callback_data="menu_add_admin/")
+
+@router.message(F.text == "📚 راهنما")
+async def help_text_entry(message: types.Message, state: FSMContext) -> None:
+    await _route_to_inline(message, state, button_text="📚 راهنما", callback_data="menu_help/")
 
 
 
@@ -744,12 +786,48 @@ async def process_target_data(message: types.Message, state: FSMContext, bot: Bo
                 with_cancel_hint(get_download_error_message()),
                 reply_markup=get_flow_nav_keyboard(),
             )
-        target_count = 0
+        
+        # --- رفتن به مرحله پرسیدن تعداد برای فایل اعضا ---
+        await state.update_data(target_data=target_data)
+        await state.update_data(order_messages=[])
+        await state.set_state(CreateOrderStates.waiting_for_list_target_count)
+        return await message.answer(
+            with_cancel_hint(
+                "🔢 <b>تعداد ارسال را مشخص کنید:</b>\n\n"
+                "لطفاً تعداد ارسال را وارد کنید (مثلاً <code>100</code>).\n"
+                "برای ارسال به <b>تمامی افراد</b> موجود در فایل، عدد <code>0</code> را بفرستید."
+            ),
+            reply_markup=get_flow_nav_keyboard(),
+        )
 
+    # --- این بخش فقط برای سفارش با لینک اجرا می‌شود ---
     await state.update_data(target_data=target_data, target_count=target_count)
     await state.update_data(order_messages=[])
 
     await ask_send_method_question(message, state)
+
+
+@router.message(CreateOrderStates.waiting_for_list_target_count)
+async def process_list_target_count(message: types.Message, state: FSMContext) -> None:
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer(
+            with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
+            reply_markup=get_flow_nav_keyboard(),
+        )
+    
+    count = int(message.text.strip())
+    if count > 100000:
+        return await message.answer(
+            with_cancel_hint("⚠️ حداکثر تعداد ارسال مجاز ۱۰۰٬۰۰۰ است."),
+            reply_markup=get_flow_nav_keyboard(),
+        )
+        
+    await state.update_data(target_count=count)
+    
+    # رفتن به مرحله بعدی (روش ارسال)
+    await ask_send_method_question(message, state)
+
+
 # ==========================================
 # 📋 ⌨️ STATE: روش ارسال (دکمه‌ای: متن مستقیم / کپی از کانال مبدا)
 # ==========================================
@@ -961,7 +1039,7 @@ async def _check_channel_with_worker_sessions(
             api_id=api_key.api_id,
             api_hash=api_key.api_hash,
             session_string=decrypted_session,
-            proxy=_parse_proxy_string(account.proxy_string),
+            proxy=parse_proxy_string(account.proxy_string),
             in_memory=True,
             no_updates=True,
         )
@@ -999,31 +1077,120 @@ async def _check_channel_with_worker_sessions(
     )
 
 
+class _MockCachedChat:
+    """
+    Lightweight stand-in for a Pyrogram Chat object, populated from Redis cache.
+    
+    🟢 فاز ۶: فیلدهای اضافه شده برای پوشش دادن مواردی که ممکن است در آینده
+    توسط کد خوانده شوند. اگر فیلدی در cache نباشد، مقدار پیش‌فرض برمی‌گردد.
+    """
+    def __init__(self, d: dict):
+        self.id = d.get('id')
+        self.title = d.get('title')
+        self.username = d.get('username')
+        self.type = d.get('type')
+        self.has_protected_content = d.get('has_protected_content', False)
+       
+        self.first_name = d.get('first_name')
+        self.last_name = d.get('last_name')
+        self.members_count = d.get('members_count', 0)
+        self.description = d.get('description')
+        self.is_creator = d.get('is_creator', False)
+        self.is_restricted = d.get('is_restricted', False)
+        self.restrictions = d.get('restrictions', [])
+
+
 async def check_source_channel_access(
     channel_input: str,
     session: AsyncSession,
     category_ids: Optional[list[int]] = None,
 ):
-    """فاز ۱) کلاینت‌های متصل worker_pool (حداکثر ۵) — فاز ۲) کلاینت موقت از دیتابیس"""
-    live_clients = _get_connected_worker_clients()[:5]
+    """فاز ۴/۶: بررسی دسترسی به کانال مبدا با کش Redis و Workers استخر"""
+    redis_client = _get_source_check_redis()
+    cache_key = f"srccheck:{channel_input}"
+    
+    # 1. Consult Redis cache
+    try:
+        cached_val = await redis_client.get(cache_key)
+        if cached_val:
+            if cached_val.startswith("denied:") or cached_val.startswith("error:"):
+                return None, cached_val.split(":", 1)[1]
+            try:
+                chat_data = json.loads(cached_val)
+                return _validate_source_chat(_MockCachedChat(chat_data))
+            except Exception as e:
+                logger.warning(f"Failed to parse cached chat data: {e}")
+    except Exception as e:
+        logger.warning(f"Redis cache read failed for {cache_key}: {e}")
 
-    for live_client in live_clients:
-        try:
-            chat = await asyncio.wait_for(live_client.get_chat(channel_input), timeout=30)
-        except (UsernameInvalid, UsernameNotOccupied):
-            return None, _SOURCE_CHANNEL_USERNAME_INVALID_TEXT
-        except (ChannelInvalid, ChannelPrivate, PeerIdInvalid):
-            continue
-        except Exception as e:
-            logger.warning(f"Source-channel check: live worker get_chat failed: {e}")
-            continue
-        return _validate_source_chat(chat)
+    chat = None
+    error_msg = None
 
-    chat, error = await _check_channel_with_worker_sessions(channel_input, session, category_ids)
+    # 2. & 3. بررسی تمام ورکرهای متصل به جای توقف روی اولین ورکر
+    connected_workers = [client for client in worker_pool.values() if client.is_connected]
+    
+    if connected_workers:
+        for client in connected_workers:
+            try:
+                chat = await asyncio.wait_for(client.get_chat(channel_input), timeout=30)
+                error_msg = None # کانال با موفقیت پیدا شد
+                break # نیازی به بررسی بقیه ورکرها نیست
+            except (UsernameInvalid, UsernameNotOccupied):
+                error_msg = _SOURCE_CHANNEL_USERNAME_INVALID_TEXT
+                break # یوزرنیم کلاً نامعتبر است، هیچ ورکری نمی‌تواند آن را پیدا کند
+            except (ChannelInvalid, ChannelPrivate, PeerIdInvalid):
+                error_msg = _SOURCE_CHANNEL_NOT_ACCESSIBLE_TEXT
+                continue # این ورکر دسترسی نداشت، برو سراغ ورکر بعدی
+            except FloodWait as e:
+                logger.warning(f"Source-channel check: worker hit FloodWait of {e.value} seconds. Skipping to next worker...")
+                continue # عبور امن از اکانت محدود شده
+            except asyncio.TimeoutError:
+                error_msg = "⚠️ ارتباط با سرور تلگرام برای بررسی کانال بیش از حد طول کشید."
+                continue
+            except Exception as e:
+                logger.warning(f"Source-channel check: live worker get_chat failed: {e}")
+                error_msg = f"⚠️ خطای غیرمنتظره هنگام بررسی کانال مبدا: {e}"
+                continue
+    else:
+        # 4. Fallback to temp client if no connected worker is available
+        chat, error_msg = await _check_channel_with_worker_sessions(channel_input, session, category_ids)
+
+    # 5. Cache the result for 300s
+    try:
+        if chat:
+            # 🟢 جلوگیری از کرش ChatPreview
+            chat_id = getattr(chat, "id", None)
+            
+            if chat_id is not None:
+                chat_payload = json.dumps({
+                    "id": chat_id,
+                    "title": getattr(chat, "title", None),
+                    "username": getattr(chat, "username", None),
+                    "type": str(getattr(chat, "type", "")),
+                    "has_protected_content": getattr(chat, "has_protected_content", False),
+                    "first_name": getattr(chat, "first_name", None),
+                    "last_name": getattr(chat, "last_name", None),
+                    "members_count": getattr(chat, "members_count", 0),
+                    "description": getattr(chat, "description", None),
+                    "is_creator": getattr(chat, "is_creator", False),
+                    "is_restricted": getattr(chat, "is_restricted", False),
+                    "restrictions": [str(r) for r in getattr(chat, "restrictions", []) or []],
+                })
+                await redis_client.set(cache_key, chat_payload, ex=300)
+            else:
+                chat = None
+                error_msg = _SOURCE_CHANNEL_NOT_ACCESSIBLE_TEXT
+
+        if not chat and error_msg:
+            await redis_client.set(cache_key, f"denied:{error_msg}", ex=60)
+            
+    except Exception as e:
+        logger.warning(f"Redis cache write failed for {cache_key}: {e}")
+
     if chat is None:
-        return None, error
-    return _validate_source_chat(chat)
+        return None, error_msg
 
+    return _validate_source_chat(chat)
 
 # ==========================================
 # 📋 STATE: دریافت شناسه/یوزرنیم کانال مبدا
@@ -1055,6 +1222,10 @@ async def process_source_channel(message: types.Message, state: FSMContext, sess
     fsm_data = await state.get_data()
     category_ids = fsm_data.get("selected_categories", [])
 
+    # 🟢 فاز ۶: قبل از بررسی، cache مربوط به این ورودی را invalidate می‌کنیم
+    # تا اگر دسترسی از آخرین بررسی تغییر کرده، متوجه شویم.
+    await invalidate_source_channel_cache(channel_input)
+
     chat, error_text = await check_source_channel_access(channel_input, session, category_ids)
 
     with suppress(TelegramBadRequest):
@@ -1080,6 +1251,7 @@ async def process_source_channel(message: types.Message, state: FSMContext, sess
     await state.update_data(
         source_channel_id=chat.id,
         source_channel_title=channel_title,
+        source_channel_username=chat.username,
         source_message_ids=[],
     )
     await state.set_state(CreateOrderStates.waiting_for_source_messages)
@@ -1294,9 +1466,15 @@ async def _render_active_orders(
         await state.update_data(active_orders_page=page)
 
     if total_orders == 0:
-        return await message.answer(
-            "✅ <b>هیچ سفارش فعالی وجود ندارد.</b>\n\nتمامی کمپین‌ها به اتمام رسیده‌اند.",
-            reply_markup=get_main_menu_reply_keyboard(),
+        builder = InlineKeyboardBuilder()
+        builder.row(types.InlineKeyboardButton(text="🗂 همه سفارشات", callback_data="menu_list_orders/"))
+        builder.row(types.InlineKeyboardButton(text="🏛 منوی اصلی", callback_data="menu_home/"))
+        return await safe_edit_or_answer(
+            message,
+            "✅ <b>هیچ سفارش فعالی در صف وجود ندارد.</b>\n\n"
+            "تمامی کمپین‌ها به اتمام رسیده‌اند.\n\n"
+            "👇 <i>برای مشاهده تاریخچه و لیست کامل تمامی سفارشات، روی دکمه زیر کلیک کنید:</i>",
+            reply_markup=builder.as_markup(),
         )
 
     builder = InlineKeyboardBuilder()
@@ -1409,27 +1587,159 @@ async def cancel_order_handler(callback: types.CallbackQuery, state: FSMContext,
 
     await safe_edit_message(
         callback.message,
-        f"⚠️ <b>تأیید لغو سفارش</b>\n\n"
-        f"آیا از لغو سفارش <b>#{order_id}</b> مطمئن هستید؟\n\n"
-        f"🆔 شناسه سفارش: <code>{order.id}</code>\n"
-        f"🎟 کد رهگیری: <code>{display_code}</code>\n"
+        f"⚠️ <b>تأیید لغو (توقف) سفارش</b>\n\n"
+        f"آیا از توقف سفارش <b>#{order_id}</b> مطمئن هستید؟\n\n"
+        f"🎟 شناسه و کد رهگیری: <code>{order.id}</code> | <code>{display_code}</code>\n"
         f"📦 نوع سفارش: {order_type_display}\n"
-        f"📤 روش ارسال: {send_method_display}\n"
-        f"🎯 هدف ارسال: {target_display}\n"
-        f"👤 تعداد درخواستی: {order.target_count}\n"
-        f"📎 فایل‌های مدیا: {media_files_count} عدد\n"
-        f"📍 وضعیت فعلی: {status_display}\n"
-        f"📊 داشبورد زنده: <code>/gtg_{order.id}</code>\n"
-        f"📅 تاریخ ثبت: {created_date}\n\n"
-        f"⚠️ <b>توجه: این عمل قابل بازگشت نیست و فایل‌های مدیا پاک می‌شوند.</b>",
+        f"📍 وضعیت فعلی: {status_display}\n\n"
+        f"⚠️ <b>توجه: با تایید شما عملیات متوقف می‌شود، اما داده‌ها و گزارش کار تا این لحظه حفظ خواهند شد.</b>\n"
+        f"ℹ️ برای مشاهده جزئیات کامل سفارش، می‌توانید <code>/gtg_{order.id}</code> را ارسال کنید.",
         reply_markup=builder.as_markup(),
         # --- FIX M13 ---
         link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+    ) 
+
+
+@router.callback_query(F.data.startswith("pause_order_") & F.data.endswith("/"))
+async def pause_order_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    order_id_str = callback.data.replace("pause_order_", "").replace("/", "")
+
+    if not order_id_str.isdigit():
+        return await callback.answer("⚠️ شناسه نامعتبر است.")
+
+    order_id = int(order_id_str)
+    
+    # رفع باگ FSM: ثبت درست استیت تاییدیه برای توقف موقت
+    fsm_data = await state.get_data()
+    await cleanup_fsm_temp_files(state)
+    await state.update_data(
+        confirm_action="pause_order",
+        target_id=order_id,
+        return_page=fsm_data.get("active_orders_page", 1),
+    )
+    await state.set_state(ConfirmStates.waiting_for_confirmation)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ بله، متوقف کن", callback_data=f"confirm_pause_order_{order_id}/")
+    builder.button(text="❌ انصراف", callback_data="cancel_confirm_cancel_order/")
+    builder.adjust(2)
+
+    await safe_edit_message(
+        callback.message,
+        f"⚠️ <b>تأیید توقف موقت سفارش</b>\n\n"
+        f"آیا از توقف موقت سفارش <b>#{order_id}</b> مطمئن هستید؟\n\n"
+        f"این عمل سیستم را بلافاصله متوقف کرده و سفارش را حفظ می‌کند تا بعداً بتوانید آن را ادامه دهید.",
+        reply_markup=builder.as_markup(),
+        link_preview_options=types.LinkPreviewOptions(is_disabled=True),
     )
 
+@router.callback_query(F.data.startswith("confirm_pause_order_") & F.data.endswith("/"))
+async def confirm_pause_order_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    current_state = await state.get_state()
+    fsm_data = await state.get_data()
+
+    if current_state != ConfirmStates.waiting_for_confirmation or fsm_data.get("confirm_action") != "pause_order":
+        return await callback.answer("⚠️ این درخواست تأیید منقضی شده است. لطفاً از ابتدا اقدام کنید.", show_alert=True)
+
+    order_id = int(callback.data.replace("confirm_pause_order_", "").replace("/", ""))
+
+    if fsm_data.get("target_id") != order_id:
+        return await callback.answer("⚠️ این درخواست تأیید نامعتبر است.", show_alert=True)
+
+    await safe_callback_answer(callback, "⏳ در حال توقف موقت...")
+
+    # 🟢 استفاده از قفل توزیع‌شده برای جلوگیری از تداخل با دیسپچر
+    async with DistributedFinalizeLock(order_id):
+        try:
+            order = await session.scalar(select(Order).where(Order.id == order_id))
+            if not order or order.status not in [OrderStatus.pending, OrderStatus.running]:
+                await state.clear()
+                return await callback.message.answer("⚠️ این سفارش در وضعیتی نیست که بتوان آن را متوقف کرد.")
+
+            order.status = OrderStatus.error
+            order.reject_reason = "paused"
+
+            # بازیابی امن تارگت‌های در حال پردازش
+            if order.inflight_data:
+                try:
+                    import json
+                    inflight_targets = json.loads(order.inflight_data)
+                    stmt_logs = select(OrderLog.target).where(
+                        OrderLog.order_id == order.id,
+                        OrderLog.target.in_(inflight_targets)
+                    )
+                    processed_targets_result = await session.execute(stmt_logs)
+                    processed_targets = set(processed_targets_result.scalars().all())
+
+                    unprocessed_targets = [t for t in inflight_targets if t not in processed_targets]
+
+                    if unprocessed_targets:
+                        unprocessed_str = "\n".join(unprocessed_targets)
+                        if order.target_data:
+                            order.target_data = f"{unprocessed_str}\n{order.target_data}"
+                        else:
+                            order.target_data = unprocessed_str
+                except Exception as e:
+                    logger.error(f"Error merging inflight data on pause: {e}")
+                order.inflight_data = None # 🟢 به جای رشته خالی از None استفاده می‌شود
+
+            await session.commit()
+            
+            # ثبت فلگ Kill Switch در ردیس با کلاینت بهینه
+            try:
+                redis = _get_redis()
+                await redis.set(f"kill_order:{order_id}", "1", ex=3600 * 24)
+            except Exception as e:
+                logger.warning(f"Failed to set kill switch: {e}")
+
+        except Exception as e:
+            await session.rollback()
+            return await answer_callback_error(callback, report_db_error("توقف سفارش", e), get_main_menu_button())
+
+    await state.clear()
+    text, markup = await generate_dashboard_data(order_id, session)
+    await safe_edit_message(callback.message, text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("resume_order_") & F.data.endswith("/"))
+async def resume_order_handler(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    order_id = int(callback.data.replace("resume_order_", "").replace("/", ""))
+    
+    try:
+        order = await session.scalar(select(Order).where(Order.id == order_id))
+        if not order:
+            return await callback.answer("⚠️ سفارش مورد نظر یافت نشد.", show_alert=True)
+            
+        if order.status != OrderStatus.error or not order.target_data or len(order.target_data.strip()) == 0:
+            return await callback.answer("⚠️ این سفارش پایان یافته یا قابل ادامه دادن نیست.", show_alert=True)
+            
+        # بازگرداندن به صف پردازش
+        order.status = OrderStatus.pending
+        order.scheduled_for = None
+        order.fail_streak = 0
+        order.reject_reason = None  # پاک کردن نشانه توقف
+        
+        await session.commit()
+        
+        # پاک کردن Kill Switch تا ورکرها بتوانند کار کنند
+        try:
+            redis = _get_redis()
+            await redis.delete(f"kill_order:{order_id}")
+        except Exception:
+            pass
+            
+        await safe_callback_answer(callback, "◀️ سفارش با موفقیت به صف ارسال بازگشت.")
+        
+        text, markup = await generate_dashboard_data(order_id, session)
+        await safe_edit_message(callback.message, text, reply_markup=markup)
+        
+    except Exception as e:
+        await session.rollback()
+        await callback.answer("❌ خطا در برقراری ارتباط با دیتابیس.", show_alert=True)
 # ==========================================
 # 🔵 CANCEL ORDER: مرحله ۲ (اجرای واقعی — بدون تغییر)
 # ==========================================
+# REWRITTEN
 @router.callback_query(F.data.startswith("confirm_cancel_order_") & F.data.endswith("/"))
 async def confirm_cancel_order_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     current_state = await state.get_state()
@@ -1456,48 +1766,64 @@ async def confirm_cancel_order_handler(callback: types.CallbackQuery, state: FSM
 
     await safe_callback_answer(callback, "⏳ در حال پردازش...")
 
-    try:
-        stmt = select(Order).where(Order.id == order_id)
-        result = await session.execute(stmt)
-        order = result.scalar_one_or_none()
-    except Exception as e:
-        await session.rollback()
-        return await answer_callback_error(
-            callback, report_db_error("سفارش", e), get_main_menu_button()
-        )
+    # 🟢 استفاده از قفل برای جلوگیری از تداخل با دیسپچر در زمان لغو
+    async with DistributedFinalizeLock(order_id):
+        try:
+            stmt = select(Order).where(Order.id == order_id)
+            result = await session.execute(stmt)
+            order = result.scalar_one_or_none()
 
-    if not order or order.status not in [OrderStatus.pending, OrderStatus.running]:
-        return_page = fsm_data.get("return_page", 1)
-        await state.clear()
-        await callback.message.answer("⚠️ این سفارش قبلاً لغو شده یا وجود ندارد.")
-        return await list_active_orders(
-            callback, session, state=state, skip_answer=True, page=return_page
-        )
+            if not order or order.status not in [OrderStatus.pending, OrderStatus.running]:
+                return_page = fsm_data.get("return_page", 1)
+                await state.clear()
+                await callback.message.answer("⚠️ این سفارش قبلاً لغو شده یا وجود ندارد.")
+                return await list_active_orders(callback, session, state=state, skip_answer=True, page=return_page)
 
-    media_paths = [order.media_path, order.media_2_path, order.media_3_path]
+            if order.order_type == "extract":
+                media_paths = []
+            else:
+                media_paths = [order.media_path, order.media_2_path, order.media_3_path]
+                order.media_path = None
+                order.media_2_path = None
+                order.media_3_path = None
 
-    order.status = OrderStatus.error
-    order.target_data = ""
-    order.media_path = None
-    order.media_2_path = None
-    order.media_3_path = None
+            order.status = OrderStatus.error
+            order.reject_reason = "cancelled"
+            
+            if order.inflight_data:
+                try:
+                    import json
+                    inflight_targets = json.loads(order.inflight_data)
+                    stmt_logs = select(OrderLog.target).where(
+                        OrderLog.order_id == order.id,
+                        OrderLog.target.in_(inflight_targets)
+                    )
+                    processed_targets_result = await session.execute(stmt_logs)
+                    processed_targets = set(processed_targets_result.scalars().all())
 
-    try:
-        await session.commit()
-    except Exception as e:
-        await session.rollback()
-        return await answer_callback_error(
-            callback, report_db_error("سفارش", e), get_main_menu_button()
-        )
+                    unprocessed_targets = [t for t in inflight_targets if t not in processed_targets]
 
-    # --- FIX M1: Write the Kill Switch flag to Redis for fast-path cancellation ---
-    try:
-        r = aioredis.from_url(config.REDIS_URL, decode_responses=True)
-        await r.set(f"kill_order:{order_id}", "1", ex=3600 * 24)
-        await r.aclose()
-    except Exception as e:
-        logger.warning(f"Failed to set Redis kill flag for order {order_id}: {e}")
-    # ------------------------------------------------------------------------------
+                    if unprocessed_targets:
+                        unprocessed_str = "\n".join(unprocessed_targets)
+                        if order.target_data:
+                            order.target_data = f"{unprocessed_str}\n{order.target_data}"
+                        else:
+                            order.target_data = unprocessed_str
+                except Exception as e:
+                    logger.error(f"Error merging inflight data on cancel: {e}")
+                order.inflight_data = None
+
+            await session.commit()
+            
+            try:
+                redis = _get_redis()
+                await redis.set(f"kill_order:{order_id}", "1", ex=3600 * 24)
+            except Exception as e:
+                logger.warning(f"Failed to set kill switch: {e}")
+
+        except Exception as e:
+            await session.rollback()
+            return await answer_callback_error(callback, report_db_error("سفارش", e), get_main_menu_button())
 
     for path in media_paths:
         if path and os.path.exists(path):
@@ -1510,8 +1836,9 @@ async def confirm_cancel_order_handler(callback: types.CallbackQuery, state: FSM
     return_page = fsm_data.get("return_page", 1)
     await state.clear()
 
+    # پیام به‌روزرسانی شد تا به حفظ دیتا اشاره کند
     await callback.message.answer(
-        f"✅ سفارش <b>#{order_id}</b> با موفقیت متوقف شد و فایل‌های آن پاکسازی گردید."
+        f"✅ سفارش <b>#{order_id}</b> با موفقیت متوقف شد و داده‌های باقی‌مانده حفظ شدند."
     )
 
     return await list_active_orders(
@@ -1525,14 +1852,17 @@ async def confirm_cancel_order_handler(callback: types.CallbackQuery, state: FSM
 async def cancel_order_confirmation_declined(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     fsm_data = await state.get_data()
     return_page = fsm_data.get("return_page", 1)
-    if fsm_data.get("confirm_action") == "cancel_order":
+    
+    # اینجا pause_order هم اضافه شد تا استیت درست پاک شود
+    if fsm_data.get("confirm_action") in ["cancel_order", "pause_order"]:
         await state.clear()
 
-    await callback.answer("🚫 عملیات لغو سفارش متوقف شد.")
+    await callback.answer("🚫 عملیات لغو/توقف متوقف شد.")
 
     return await list_active_orders(
         callback, session, state=state, skip_answer=True, page=return_page
     )
+
 
 
 # ==========================================
@@ -1760,7 +2090,6 @@ async def list_orders_filter_handler(callback: types.CallbackQuery, state: FSMCo
         page=int(match.group(2)),
     )
 
-
 @router.callback_query(F.data.startswith("view_order_") & F.data.endswith("/"))
 async def view_order_dashboard_handler(callback: types.CallbackQuery, session: AsyncSession) -> None:
     order_id_str = callback.data.replace("view_order_", "").replace("/", "")
@@ -1771,7 +2100,8 @@ async def view_order_dashboard_handler(callback: types.CallbackQuery, session: A
     await safe_callback_answer(callback)
 
     try:
-        text, markup = await generate_dashboard_data(
+        # 🔴 اصلاح: استفاده از متد یکپارچه مسیردهی داشبورد
+        text, markup = await build_order_dashboard_by_type(
             order_id, session, back_callback="orders_back_to_list/"
         )
     except Exception as e:
@@ -1956,17 +2286,6 @@ async def banner_pool_no_handler(message: types.Message, state: FSMContext) -> N
 
 
 
-@router.message(CreateOrderStates.waiting_for_banner_pool, F.text == BANNER_POOL_YES_TEXT)
-async def banner_pool_yes_handler(message: types.Message, state: FSMContext) -> None:
-    await state.update_data(use_banner_pool=True)
-    await ask_smart_flow_question(message, state)
-
-
-@router.message(CreateOrderStates.waiting_for_banner_pool, F.text == BANNER_POOL_NO_TEXT)
-async def banner_pool_no_handler(message: types.Message, state: FSMContext) -> None:
-    await state.update_data(use_banner_pool=False)
-    await ask_smart_flow_question(message, state)
-
 
 @router.message(CreateOrderStates.waiting_for_banner_pool)
 async def banner_pool_text_fallback(message: types.Message, state: FSMContext) -> None:
@@ -1980,54 +2299,39 @@ async def banner_pool_text_fallback(message: types.Message, state: FSMContext) -
 # 🧠 ⌨️ SMART FLOW: سوال فعال‌سازی جریان هوشمند (دکمه‌ای)
 # ==========================================
 async def ask_smart_flow_question(message: types.Message, state: FSMContext) -> None:
-    fsm_data = await state.get_data()
-    msg_count = len(fsm_data.get("order_messages", []))
-
+    """
+    🔗 Phase 6 (T2): the Smart-Flow question, wired at the messages-collected →
+    confirmation transition. (Previously reachable only from the dead duplicate
+    banner-pool pair deleted in T1, which never executed.)
+    """
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ بله، هوشمند", callback_data="smart_flow_yes"),
+                InlineKeyboardButton(text="❌ خیر، عادی", callback_data="smart_flow_no"),
+            ]
+        ]
+    )
+    await message.answer(
+        "🧠 <b>ارسال هوشمند (Smart-Flow)</b>\n\n"
+        "در حالت هوشمند، پیام‌های شما با فاصله‌گذاری طبیعی و مرحله‌ای ارسال می‌شوند "
+        "تا ریسک محدود شدن اکانت‌ها به حداقل برسد.\n\n"
+        "آیا می‌خواهید این سفارش با ارسال هوشمند انجام شود؟",
+        reply_markup=keyboard,
+    )
     await state.set_state(CreateOrderStates.waiting_for_smart_flow)
 
-    banner_hint = ""
-    if msg_count < 2:
-        banner_hint = (
-            "\n⚠️ <b>توجه:</b> این سفارش هنوز پیام دوم (بنر) ندارد؛ "
-            "در صورت فعال‌سازی، هشدار و تأیید مجدد دریافت خواهید کرد."
-        )
-
-    await message.answer(
-        with_cancel_hint(
-            "🧠 <b>جریان هوشمند (Smart Flow)</b>\n\n"
-            "جریان هوشمند برای این سفارش فعال شود؟\n\n"
-            f"📩 پیام‌های ثبت‌شده: <b>{msg_count}</b>\n"
-            "🔁 روند ارسال برای هر تارگت:\n"
-            "۱️⃣ ارسال پیام اول (یخ‌شکن)\n"
-            "۲️⃣ انتظار برای «سین» تارگت (حداکثر ۲ تا ۷ دقیقه)\n"
-            "۳️⃣ تاخیر انسانی ۳۰ تا ۱۸۰ ثانیه\n"
-            "۴️⃣ ارسال بنر اصلی (پیام دوم)\n"
-            f"{banner_hint}\n\n"
-            "⚠️ این حالت سرعت ارسال را به‌شدت کاهش می‌دهد و برای کمپین‌های حجیم مناسب نیست."
-        ),
-        reply_markup=get_smart_flow_keyboard(),
-    )
-
-
-@router.message(CreateOrderStates.waiting_for_smart_flow, F.text == SMART_FLOW_YES_TEXT)
-async def smart_flow_yes_handler(message: types.Message, state: FSMContext, bot: Bot) -> None:
-    fsm_data = await state.get_data()
-    order_messages = fsm_data.get("order_messages", [])
-
-    # سفارش تک‌پیامی → هشدار + تأیید مجدد (کیبورد تأیید دکمه‌ای)
-    if len(order_messages) < 2:
-        return await message.answer(
-            with_cancel_hint(
-                "⚠️ <b>هشدار: بنر (پیام دوم) خالی است!</b>\n\n"
-                "این سفارش فقط <b>۱ پیام</b> دارد. با جریان هوشمندِ فعال و بدون بنر، "
-                "تارگت‌ها فقط پیام اول را دریافت می‌کنند و مرحله‌ی بنر اجرا نخواهد شد.\n\n"
-                "برای ادامه با این شرایط، تأیید مجدد لازم است:"
-            ),
-            reply_markup=get_smart_flow_confirm_keyboard(),
-        )
-
+@router.callback_query(CreateOrderStates.waiting_for_smart_flow, F.data == "smart_flow_yes")
+async def smart_flow_yes_handler(callback: types.CallbackQuery, state: FSMContext, bot: Bot):
+    # 🔗 Phase 6 (T2): Replace and advance to filter selection (your actual next step)
     await state.update_data(smart_flow=True)
-    await proceed_to_filter_selection(message, state, bot)
+    await safe_callback_answer(callback, "🧠 ارسال هوشمند برای این سفارش فعال شد.")
+    if callback.message is not None:
+        await safe_edit_message(callback.message, "🧠 حالت ارسال: <b>هوشمند (Smart-Flow)</b>")
+    
+    # پرش به استیت بعدی در معماری شما
+    await proceed_to_filter_selection(callback.message, state, bot)
+
 
 
 @router.message(CreateOrderStates.waiting_for_smart_flow, F.text == SMART_FLOW_CONFIRM_TEXT)
@@ -2037,11 +2341,16 @@ async def smart_flow_yes_confirm_handler(message: types.Message, state: FSMConte
     await proceed_to_filter_selection(message, state, bot)
 
 
-@router.message(CreateOrderStates.waiting_for_smart_flow, F.text.in_([SMART_FLOW_NO_TEXT, SMART_FLOW_NO_CONFIRM_TEXT]))
-async def smart_flow_no_handler(message: types.Message, state: FSMContext, bot: Bot) -> None:
+@router.callback_query(CreateOrderStates.waiting_for_smart_flow, F.data == "smart_flow_no")
+async def smart_flow_no_handler(callback: types.CallbackQuery, state: FSMContext, bot: Bot):
+    # 🔗 Phase 6 (T2): Replace and advance to filter selection
     await state.update_data(smart_flow=False)
-    await proceed_to_filter_selection(message, state, bot)
-
+    await safe_callback_answer(callback, "ارسال عادی برای این سفارش انتخاب شد.")
+    if callback.message is not None:
+        await safe_edit_message(callback.message, "📨 حالت ارسال: <b>عادی</b>")
+    
+    # پرش به استیت بعدی در معماری شما
+    await proceed_to_filter_selection(callback.message, state, bot)
 
 @router.message(CreateOrderStates.waiting_for_smart_flow)
 async def smart_flow_text_fallback(message: types.Message, state: FSMContext) -> None:
@@ -2071,17 +2380,11 @@ async def proceed_to_filter_selection(message: types.Message, state: FSMContext,
         await message.answer(text, reply_markup=get_main_menu_reply_keyboard())
 
     if order_type == "extract":
+        from bot.handlers.extractor_handlers import EXTRACTION_STRATEGY_TEXT
         with suppress(TelegramBadRequest):
             await wait_msg.delete()
         return await message.answer(
-            with_cancel_hint(
-                "⚙️ <b>سفارش استخراج — استراتژی را انتخاب کنید:</b>\n\n"
-                "👥 <b>همه اعضا:</b> لیست اعضای گروه (سقف ۱۰,۰۰۰)\n"
-                "💬 <b>فرستندگان پیام:</b> کاربران فعال در تاریخچه اخیر\n"
-                "🥇 <b>طلایی:</b> تقاطع اعضا و فعالیت واقعی در پیام‌ها\n"
-                "🟢 <b>فقط آنلاین:</b> فقط اعضای آنلاین/اخیراً فعال\n"
-                "<i>(UserStatus.ONLINE / RECENTLY)</i>"
-            ),
+            with_cancel_hint(EXTRACTION_STRATEGY_TEXT),
             reply_markup=get_extract_strategy_keyboard(),
         )
 
@@ -2207,12 +2510,16 @@ async def proceed_to_filter_selection(message: types.Message, state: FSMContext,
     with suppress(TelegramBadRequest):
         await wait_msg.delete()
 
+    final_text = (
+        "📊 <b>نوع کاربران را انتخاب کنید:</b>\n\n"
+        + stats_body +
+        f"⏰ زمان بررسی: {elapsed_time} ثانیه"
+    )
+    if order_type == "link":
+        final_text += "\n\n💡 <b>نکته:</b> فیلتر «شماره‌دار» و «فیک» ممکن است نتیجه کمی برگردانند، چون اکثر این کاربران username ندارند و ربات فقط می‌تواند به usernameها پیام بفرستد. اگر نتیجه خالی بود، «همه کاربران» را امتحان کنید."
+
     await message.answer(
-        with_cancel_hint(
-            "📊 <b>نوع کاربران را انتخاب کنید:</b>\n\n"
-            + stats_body +
-            f"⏰ زمان بررسی: {elapsed_time} ثانیه"
-        ),
+        with_cancel_hint(final_text),
         reply_markup=get_filter_keyboard(),
     )
 
@@ -2231,14 +2538,33 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
     active_accounts_count = 0
     if cat_ids:
         try:
-            stmt_acc = select(func.count(Account.id)).where(
+            from database.models import AccountStatus
+            from sqlalchemy import or_, select
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            
+            stmt_acc = select(Account.id).where(
                 Account.category_id.in_(cat_ids),
                 Account.is_banned == False,
-                Account.session_string.is_not(None)
+                Account.status == AccountStatus.active,
+                Account.session_string.is_not(None),
+                or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
+                or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
             )
-            active_accounts_count = await session.scalar(stmt_acc) or 0
+            valid_account_ids = (await session.scalars(stmt_acc)).all()
+            
+            if valid_account_ids:
+                from workers.sender import _get_redis
+                redis_client = _get_redis()
+                pipe = redis_client.pipeline()
+                for aid in valid_account_ids:
+                    pipe.exists(f"chunk_cooldown:{aid}")
+                cooldown_results = await pipe.execute()
+                
+                # کسر اکانت‌های در حال استراحت از کل اکانت‌های سالم
+                active_accounts_count = len(valid_account_ids) - sum(1 for res in cooldown_results if res)
         except Exception as e:
-            logger.warning(f"Failed to check active accounts count: {e}")
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to check active accounts count in preview: {e}")
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     
     list_source_path: Optional[str] = None
@@ -2246,7 +2572,18 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
         list_source_path = target_data
         try:
             with open(target_data, "r", encoding="utf-8") as f:
-                file_targets = [line.strip() for line in f if line.strip()]
+                file_targets = []
+                for line in f:
+                    t = line.strip()
+                    if not t: continue
+                    # 🟢 پاکسازی لینک‌ها به آیدی برای جلوگیری از خطای فرمت در Pyrogram
+                    if t.startswith("https://t.me/"):
+                        t = "@" + t.replace("https://t.me/", "").strip("/")
+                    elif t.startswith("http://t.me/"):
+                        t = "@" + t.replace("http://t.me/", "").strip("/")
+                    elif t.startswith("t.me/"):
+                        t = "@" + t.replace("t.me/", "").strip("/")
+                    file_targets.append(t)
         except Exception as e:
             logger.error(f"Error reading target list file {target_data}: {e}", exc_info=True)
             await cleanup_fsm_temp_files(state)
@@ -2264,8 +2601,16 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
                 "لطفاً فایلی حاوی شناسه‌ها (هر خط یک شناسه) ارسال کنید و دوباره شروع کنید.",
                 reply_markup=get_main_menu_reply_keyboard(),
             )
-        target_data = "\n".join(file_targets)
-        target_count = len(file_targets)
+        
+        # --- ۱. ابتدا منطق تعداد را اعمال می‌کنیم ---
+        if target_count == 0:
+            target_count = len(file_targets)
+        else:
+            target_count = min(target_count, len(file_targets))
+            
+        # --- ۲. سپس لیست را دقیقاً به همان تعداد بُرش می‌دهیم و ذخیره می‌کنیم ---
+        target_data = "\n".join(file_targets[:target_count])
+            
         filter_type = None
         
     messages = fsm_data.get("order_messages", [])
@@ -2276,10 +2621,13 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
     source_message_ids_list = fsm_data.get("source_message_ids") or []
     forward_style = fsm_data.get("forward_style", "copy") 
     
+    source_channel_username = fsm_data.get("source_channel_username")
     source_message_ids_str = None
     if source_message_ids_list:
         joined_ids = ",".join(str(mid) for mid in source_message_ids_list)
         source_message_ids_str = f"{joined_ids}|{forward_style}"
+        if source_channel_username:
+            source_message_ids_str += f"|@{source_channel_username}"
 
     if not messages and not source_message_ids_list and not use_banner_pool:
         await cleanup_fsm_temp_files(state)
@@ -2388,7 +2736,8 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
         f"🎟 کد رهگیری: <code>{new_order.tracking_code}</code>\n"
         f"{banner_pool_note}"
         f"{copy_source_note}{warning_user}\n\n"
-        f"♻️ مشاهده داشبورد زنده: {tracking_cmd}",
+        f"♻️ مشاهده داشبورد زنده: {tracking_cmd}\n"
+        f"⌨️ کیبورد به منوی اصلی بازگشت.",
         reply_markup=get_main_menu_reply_keyboard(),
     )
 
@@ -2421,12 +2770,140 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
         logger.error(f"Failed to send approval request to admin for order {new_order.id}: {e}")
 
 
+async def _show_preview_and_estimation(message: types.Message, state: FSMContext, session: AsyncSession, filter_type: Optional[str]) -> None:
+    await state.update_data(filter_type=filter_type)
+    fsm_data = await state.get_data()
+    
+    order_type = fsm_data.get("order_type")
+    target_count = fsm_data.get("target_count", 0)
+    cat_ids = fsm_data.get("selected_categories", [])
+    
+    if order_type == "list":
+        target_data = fsm_data.get("target_data")
+        if target_data and os.path.exists(target_data):
+            with open(target_data, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if target_count == 0:
+                target_count = len(lines)
+            else:
+                target_count = min(target_count, len(lines))
+    elif target_count == 0:
+        target_count = fsm_data.get("stats_total", 1)
+
+    await message.answer("👁 <b>پیش‌نمایش پیام ارسالی شما:</b>", reply_markup=types.ReplyKeyboardRemove())
+    
+    messages = fsm_data.get("order_messages", [])
+    use_banner_pool = fsm_data.get("use_banner_pool", False)
+    source_message_ids_list = fsm_data.get("source_message_ids") or []
+    source_channel_id = fsm_data.get("source_channel_id")
+    
+    if source_message_ids_list:
+        await message.answer(f"📋 <i>[این کمپین کپی/فوروارد {len(source_message_ids_list)} پیام از کانال <code>{source_channel_id}</code> را ارسال خواهد کرد]</i>")
+    else:
+        for idx, msg_data in enumerate(messages):
+            if use_banner_pool and idx == 1:
+                await message.answer("🎨 <i>[در این جایگاه یک بنر از مخزن سیستم ارسال خواهد شد]</i>")
+                continue
+            
+            text = msg_data.get("text", "")
+            media = msg_data.get("media_path")
+            m_type = msg_data.get("media_type")
+            
+            if media and os.path.exists(media):
+                file = FSInputFile(media)
+                if m_type == "video":
+                    await message.answer_video(video=file, caption=text)
+                elif m_type == "photo":
+                    await message.answer_photo(photo=file, caption=text)
+                else:
+                    await message.answer_document(document=file, caption=text)
+            elif text:
+                await message.answer(text, disable_web_page_preview=True)
+
+    active_accounts_count = 0
+    if cat_ids:
+        try:
+            from database.models import AccountStatus
+            from sqlalchemy import or_, select
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            
+            stmt_acc = select(Account.id).where(
+                Account.category_id.in_(cat_ids),
+                Account.is_banned == False,
+                Account.status == AccountStatus.active,
+                Account.session_string.is_not(None),
+                or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
+                or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
+            )
+            valid_account_ids = (await session.scalars(stmt_acc)).all()
+            
+            if valid_account_ids:
+                from workers.sender import _get_redis
+                redis_client = _get_redis()
+                pipe = redis_client.pipeline()
+                for aid in valid_account_ids:
+                    pipe.exists(f"chunk_cooldown:{aid}")
+                cooldown_results = await pipe.execute()
+                
+                # کسر اکانت‌های در حال استراحت (Cooldown) از اکانت‌های سالم
+                active_accounts_count = len(valid_account_ids) - sum(1 for res in cooldown_results if res)
+        except Exception as e:
+            logger.warning(f"Failed to check active accounts count: {e}")
+            
+    delay_avg = 90 if fsm_data.get("smart_flow") else 45
+    total_time_seconds = (target_count * delay_avg) / max(active_accounts_count, 1)
+    eta_minutes = int(total_time_seconds / 60)
+    
+    risk_ratio = target_count / max(active_accounts_count, 1)
+    if risk_ratio < 20:
+        risk_label = "🟢 ایمن"
+    elif risk_ratio <= 45:
+        risk_label = "🟡 متوسط"
+    else:
+        risk_label = "🔴 خطر بن اکانت (بالا)"
+        
+    estimator_text = (
+        "📊 <b>کارت تخمین زمان و تحلیل ریسک کمپین</b>\n\n"
+        f"🔹 تعداد کل ارسال درخواستی: <b>{target_count}</b>\n"
+        f"🔹 تعداد اکانت‌های سالم و آماده: <b>{active_accounts_count}</b>\n"
+        f"🔹 تاخیر میانگین بین هر پیام: <b>~{delay_avg} ثانیه</b>\n"
+        f"🔹 زمان تخمینی اتمام (ETA): <b>~{eta_minutes} دقیقه</b>\n"
+        f"🔹 شاخص سطح ریسک: <b>{risk_label}</b>"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ تایید و مرحله بعد", callback_data="preview_confirm/")
+    builder.button(text="✏️ ویرایش محتوا", callback_data="preview_edit/")
+    builder.adjust(2)
+    
+    await state.set_state(CreateOrderStates.waiting_for_preview)
+    await message.answer(estimator_text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(CreateOrderStates.waiting_for_preview, F.data == "preview_confirm/")
+async def confirm_preview_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
+    await callback.answer("✅ در حال ثبت سفارش...", show_alert=False)
+    fsm_data = await state.get_data()
+    filter_type = fsm_data.get("filter_type")
+    await _finalize_order(callback.message, state, session, filter_type)
+
+
+@router.callback_query(CreateOrderStates.waiting_for_preview, F.data == "preview_edit/")
+async def edit_preview_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
+    await callback.answer("✏️ بازگشت به مرحله ویرایش محتوا", show_alert=False)
+    await state.update_data(order_messages=[], source_message_ids=[])
+    await state.set_state(CreateOrderStates.waiting_for_send_method)
+    await callback.message.answer(
+        with_cancel_hint("📤 <b>لطفا مجدداً روش ارسال را انتخاب کنید:</b>"),
+        reply_markup=get_send_method_keyboard()
+    )
+
+
 @router.message(CreateOrderStates.waiting_for_filter, F.text.in_(FILTER_BY_TEXT))
 async def finalize_order_creation_text(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
     """⌨️ انتخاب فیلتر/استراتژی با دکمه‌ی دکمه‌ای"""
     filter_type = FILTER_BY_TEXT[message.text.strip()]
-    await _finalize_order(message, state, session, filter_type)
-
+    await _show_preview_and_estimation(message, state, session, filter_type)
 
 @router.message(CreateOrderStates.waiting_for_filter)
 async def filter_text_fallback(message: types.Message, state: FSMContext) -> None:
@@ -2435,13 +2912,12 @@ async def filter_text_fallback(message: types.Message, state: FSMContext) -> Non
         reply_markup=get_filter_keyboard(),
     )
 
-
 @router.callback_query(CreateOrderStates.waiting_for_filter, F.data.startswith("filter_"))
 async def finalize_order_creation(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     """🔄 سازگاری: callback شیشه‌ای filter_ حفظ شد (ممکن است extractor_handlers هم بفرستد)"""
     await callback.answer()
     filter_type = callback.data.replace("filter_", "").replace("/", "")
-    await _finalize_order(callback.message, state, session, filter_type)
+    await _show_preview_and_estimation(callback.message, state, session, filter_type)
 
 
 # ==========================================
@@ -2483,7 +2959,11 @@ async def generate_dashboard_data(
         if max_date is None or (r_max and r_max > max_date):
             max_date = r_max
 
-    sent_count = status_counts.get("success", 0)
+    if order.order_type == "extract":
+        sent_count = order.extracted_count or 0
+    else:
+        sent_count = status_counts.get("success", 0)
+        
     error_count = status_counts.get("error", 0) + status_counts.get("spam", 0) # سازگاری با وضعیت قدیمی
     flood_count = status_counts.get("flood", 0)
     restricted_count = status_counts.get("restricted", 0)
@@ -2502,6 +2982,11 @@ async def generate_dashboard_data(
     progress_percent = 0
     if order.target_count and order.target_count > 0:
         progress_percent = round((sent_count / order.target_count) * 100, 1)
+        
+    bar_length = 10
+    filled = int(progress_percent / 10)
+    bar = "█" * filled + "░" * (bar_length - filled)
+    progress_bar = f"[{bar}] {progress_percent}%"
 
     # ۴. عملکرد اکانت‌ها (تجمیع شده، بدون N+1)
     acc_stmt = (
@@ -2587,8 +3072,12 @@ async def generate_dashboard_data(
     elif order.status == OrderStatus.error:
         if not order.is_approved and order.reject_reason:
             status_text = f"❌ رد شده\n💬 علت: <i>{html.escape(order.reject_reason)}</i>"
+        elif order.reject_reason == "paused":
+            status_text = "⏸ متوقف شده (موقت)"
+        elif order.reject_reason == "cancelled":
+            status_text = "⏹ لغو شده (کامل)"
         else:
-            status_text = "🛑 متوقف / لغو شده"
+            status_text = "🛑 متوقف / خطا"
     else:
         if order.is_approved:
             status_text = "🕒 در صف انتظار دیسپچ"
@@ -2619,11 +3108,12 @@ async def generate_dashboard_data(
         sec1.append(send_method_line.strip())
 
     # --- بخش ۲ ---
+    progress_label = "👤 استخراج شده/تخمینی" if order.order_type == "extract" else "👤 موفق/کل درخواستی"
     sec2 = [
-        "📈 <b>بخش ۲ — پیشرفت و سرعت</b>",
-        f"👤 ارسال شده/درخواستی: {sent_count} / {order.target_count or 0} ({progress_percent}%)",
-        f"🔍 بررسی شده کل: {checked_count}",
-        f"🚀 سرعت ارسال: {int(speed_per_minute)} در دقیقه"
+        "📈 <b>بخش ۲ — داشبورد پیشرفت</b>",
+        f"نوار پیشرفت: {progress_bar}",
+        f"{progress_label}: <b>{sent_count}</b> / {order.target_count or 0}",
+        f"🔍 بررسی شده کل: {checked_count} | 🚀 سرعت ارسال: {int(speed_per_minute)} در دقیقه"
     ]
     if order.status == OrderStatus.running and speed_per_minute > 0 and order.target_count:
         remaining_targets = max(0, order.target_count - sent_count)
@@ -2632,7 +3122,17 @@ async def generate_dashboard_data(
 
     st_str = min_date.strftime("%H:%M:%S") if min_date else "نامشخص"
     la_str = max_date.strftime("%Y/%m/%d %H:%M:%S") if max_date else "نامشخص"
-    sec2.append(f"⌚️ شروع: {st_str} | ⏳ مدت اجرا: {int(duration_minutes)} دقیقه")
+    
+    # 🟢 تبدیل هوشمندانه زمان برای نمایش ثانیه و دقیقه
+    total_secs = int(duration_minutes * 60)
+    if total_secs < 60:
+        time_display = f"{total_secs} ثانیه"
+    else:
+        mins = total_secs // 60
+        secs = total_secs % 60
+        time_display = f"{mins} دقیقه و {secs} ثانیه" if secs > 0 else f"{mins} دقیقه"
+
+    sec2.append(f"⌚️ شروع: {st_str} | ⏳ مدت اجرا: {time_display}")
     sec2.append(f"🔄 آخرین بروزرسانی: {la_str}")
 
     # --- بخش ۳ ---
@@ -2648,7 +3148,20 @@ async def generate_dashboard_data(
     sec3_base.append("")
     sec3_base.append(f"📱 عملکرد اکانت‌ها (کل: {total_accounts}):")
 
-    core_text = "\n".join(sec1) + "\n\n" + "\n".join(sec2) + "\n\n" + "\n".join(sec3_base)
+    if order.status in [OrderStatus.completed, OrderStatus.error]:
+        report_lines = [
+            "📋 <b>گزارش ساختاریافته پایانی</b>",
+            f"🎯 آمار تحویل نهایی: {sent_count} از {order.target_count or 0}",
+            f"📈 نرخ موفقیت: {progress_percent}%",
+            f"❌ تعداد پیام‌های ناموفق: {error_count}",
+        ]
+        if error_count > 0:
+            report_lines.append(f"⚠️ عمده علت خطاها: فلاد ({flood_count}) | محدودیت اسپم ({restricted_count})")
+        
+        core_text = "\n".join(sec1) + "\n\n" + "\n".join(sec2) + "\n\n" + "\n".join(sec3_base) + "\n\n" + "\n".join(report_lines)
+    else:
+        core_text = "\n".join(sec1) + "\n\n" + "\n".join(sec2) + "\n\n" + "\n".join(sec3_base)
+
     acc_text = "\n".join(accounts_lines) if accounts_lines else "موردی یافت نشد."
     err_text = ("\n\n🚨 آخرین خطاها:\n" + "\n".join(error_lines)) if error_lines else ""
 
@@ -2669,38 +3182,123 @@ async def generate_dashboard_data(
         builder.button(text="✅ تایید و شروع", callback_data=f"approve_order_{order.id}/")
         builder.button(text="❌ رد سفارش", callback_data=f"reject_order_{order.id}/")
 
-    builder.button(text="🔄 بروزرسانی", callback_data=f"update_order_{order.id}/")
+    if order.status in [OrderStatus.pending, OrderStatus.running]:
+        # توقف موقت برای استخراج بی‌معنی است (قابلیت از سرگیری ندارد)
+        if order.order_type != "extract":
+            builder.button(text="⏸ توقف موقت", callback_data=f"pause_order_{order.id}/")
+        builder.button(text="⏹ لغو کامل", callback_data=f"cancel_order_{order.id}/")
+        
+    builder.button(text="🔄 بروزرسانی دستی", callback_data=f"update_order_{order.id}/")
     
-    # دکمه خروجی برای سفارش استخراج فقط اگر تکمیل شده باشد اضافه می‌شود
+    # 🟢 افزودن دکمه ادامه ارسال صرفاً برای سفارشات «ارسال انبوه» که «موقتاً متوقف» شده‌اند
+    if order.order_type != "extract" and order.status == OrderStatus.error and order.target_data and len(order.target_data.strip()) > 0:
+        if order.reject_reason == "paused":
+            builder.button(text="◀️ ادامه ارسال / از سرگیری", callback_data=f"resume_order_{order.id}/")
+    
+    # 🟢 درخواست کارفرما: فعال‌شدن دکمه خروجی حتی در صورت توقف دستی (status = error)
     has_export_btn = False
-    if order.order_type != "extract" or order.status == OrderStatus.completed:
+    if order.order_type != "extract" or order.status in [OrderStatus.completed, OrderStatus.error]:
         builder.button(text="📥 خروجی", callback_data=f"export_order_{order.id}/")
         has_export_btn = True
         
     if back_callback:
         builder.button(text="🔙 بازگشت به لیست سفارشات", callback_data=back_callback)
-    builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
 
-    # چیدمان داینامیک بر اساس وجود یا عدم وجود دکمه خروجی
-    if order.status == OrderStatus.pending and not order.is_approved:
-        if has_export_btn:
-            builder.adjust(2, 2, 1, 1) if back_callback else builder.adjust(2, 2, 1)
-        else:
-            builder.adjust(2, 1, 1, 1) if back_callback else builder.adjust(2, 1, 1)
-    else:
-        if has_export_btn:
-            builder.adjust(2, 1, 1) if back_callback else builder.adjust(2, 1)
-        else:
-            builder.adjust(1, 1, 1) if back_callback else builder.adjust(1, 1)
+    # 🟢 تنظیم چیدمان منعطف و ساده به صورت ستونی برای جلوگیری از به‌هم‌ریختگی
+    builder.adjust(1)
 
     return dashboard_text, builder.as_markup()
+
+async def build_order_dashboard_by_type(order_id: int, session: AsyncSession, back_callback: Optional[str] = None):
+    """متد مشترک برای مسیردهی صحیح به داشبورد بر اساس نوع سفارش"""
+    stmt = select(Order.order_type, Order.tracking_code).where(Order.id == order_id)
+    res = (await session.execute(stmt)).first()
+    
+    if not res:
+        return None, None
+        
+    o_type, tracking_code = res
+    
+    if o_type == "extract" and tracking_code:
+        from bot.handlers.extractor_handlers import build_extraction_dashboard_view
+        return await build_extraction_dashboard_view(session, tracking_code, back_page=1)
+    else:
+        return await generate_dashboard_data(order_id, session, back_callback=back_callback)
+
+
+_active_refresh_tasks = {}
+
+async def _auto_refresh_dashboard_task(message: types.Message, order_id: int, bot: Bot):
+    message_id = message.message_id
+    chat_id = message.chat.id
+    task_key = f"{chat_id}_{message_id}"
+    
+    max_iterations = 40 # 10 minutes limit (15s intervals)
+    
+    for i in range(max_iterations):
+        await asyncio.sleep(15)
+        
+        from database.engine import async_session
+        async with async_session() as session:
+            try:
+                order = await session.scalar(select(Order).where(Order.id == order_id))
+                if not order:
+                    break
+                    
+                is_running = order.status in [OrderStatus.pending, OrderStatus.running]
+                text, markup = await build_order_dashboard_by_type(order_id, session)
+                
+                if not text:
+                    break
+                
+                indicator = "\n\n🟢 <b>لایو</b> (به‌روزرسانی خودکار فعال)" if is_running else "\n\n⏸ <b>متوقف</b> (به‌روزرسانی پایان یافت)"
+                text += indicator
+                
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=markup,
+                    link_preview_options=types.LinkPreviewOptions(is_disabled=True)
+                )
+                
+                if not is_running:
+                    break
+                    
+            except TelegramBadRequest as e:
+                if "message is not modified" not in str(e).lower():
+                    break # Message deleted or user moved away
+            except Exception as e:
+                logger.error(f"Auto-refresh task error (Order {order_id}): {e}")
+                break
+                
+    # Final cleanup mark if time expired but still running
+    if i == max_iterations - 1:
+        from database.engine import async_session
+        async with async_session() as session:
+            try:
+                text, markup = await build_order_dashboard_by_type(order_id, session)
+                if text:
+                    text += "\n\n⏸ <b>متوقف</b> (پایان زمان ۱۰ دقیقه‌ای لایو)"
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        reply_markup=markup,
+                        link_preview_options=types.LinkPreviewOptions(is_disabled=True)
+                    )
+            except Exception:
+                pass
+                
+    _active_refresh_tasks.pop(task_key, None)
 
 @router.message(F.text.regexp(r"^/gtg_(\d+)$"))
 async def show_order_dashboard(message: types.Message, session: AsyncSession) -> None:
     order_id = int(message.text.split("_")[1])
 
     try:
-        text, markup = await generate_dashboard_data(order_id, session)
+        text, markup = await build_order_dashboard_by_type(order_id, session)
+        order = await session.scalar(select(Order).where(Order.id == order_id))
     except Exception as e:
         await session.rollback()
         return await message.answer(
@@ -2708,14 +3306,22 @@ async def show_order_dashboard(message: types.Message, session: AsyncSession) ->
             reply_markup=get_main_menu_keyboard(),
         )
 
-    if not text:
+    if not text or not order:
         return await message.answer(
             "⚠️ سفارش مورد نظر یافت نشد.",
             reply_markup=get_main_menu_keyboard(),
         )
 
+    is_active = order.status in [OrderStatus.pending, OrderStatus.running]
+    indicator = "\n\n🟢 <b>لایو</b> (به‌روزرسانی خودکار فعال)" if is_active else ""
+    
     # --- FIX M13 ---
-    await message.answer(text, reply_markup=markup, link_preview_options=types.LinkPreviewOptions(is_disabled=True))
+    sent_message = await message.answer(text + indicator, reply_markup=markup, link_preview_options=types.LinkPreviewOptions(is_disabled=True))
+    
+    if is_active:
+        task_key = f"{sent_message.chat.id}_{sent_message.message_id}"
+        _active_refresh_tasks[task_key] = asyncio.create_task(_auto_refresh_dashboard_task(sent_message, order.id, message.bot))
+
 
 # ========== اضافه کردن هندلر جدید پس از show_order_dashboard ==========
 
@@ -2732,13 +3338,19 @@ async def track_by_tracking_code(message: types.Message, session: AsyncSession) 
         if not order:
             return await message.answer(f"❌ سفارشی با کد رهگیری <code>{html.escape(code)}</code> یافت نشد.")
         
+        is_active = order.status in [OrderStatus.pending, OrderStatus.running]
+        indicator = "\n\n🟢 <b>لایو</b> (به‌روزرسانی خودکار فعال)" if is_active else ""
+
         if code.startswith("ORD-"):
             text, markup = await generate_dashboard_data(order.id, session)
             if not text:
                 return await message.answer(f"❌ سفارشی با کد رهگیری <code>{html.escape(code)}</code> یافت نشد.")
             
-            await message.answer(text, reply_markup=markup, disable_web_page_preview=True)
-            
+            sent_message = await message.answer(text + indicator, reply_markup=markup, link_preview_options=types.LinkPreviewOptions(is_disabled=True))
+            if is_active:
+                task_key = f"{sent_message.chat.id}_{sent_message.message_id}"
+                _active_refresh_tasks[task_key] = asyncio.create_task(_auto_refresh_dashboard_task(sent_message, order.id, message.bot))
+                
         elif code.startswith("EXT-"):
             from bot.handlers.extractor_handlers import build_extraction_dashboard_view
             
@@ -2746,7 +3358,10 @@ async def track_by_tracking_code(message: types.Message, session: AsyncSession) 
             if not text:
                 return await message.answer(f"❌ سفارشی با کد رهگیری <code>{html.escape(code)}</code> یافت نشد.")
             
-            await message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+            sent_message = await message.answer(text + indicator, reply_markup=markup, link_preview_options=types.LinkPreviewOptions(is_disabled=True))
+            if is_active:
+                task_key = f"{sent_message.chat.id}_{sent_message.message_id}"
+                _active_refresh_tasks[task_key] = asyncio.create_task(_auto_refresh_dashboard_task(sent_message, order.id, message.bot))
             
     except Exception as e:
         await session.rollback()
@@ -2754,25 +3369,20 @@ async def track_by_tracking_code(message: types.Message, session: AsyncSession) 
             report_db_error("رهگیری سفارش", e),
             reply_markup=get_main_menu_keyboard()
         )
-
-
 @router.callback_query(F.data.startswith("update_order_"))
 async def refresh_order_dashboard(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    # 🛡 فاز ۳: گارد parse (قبلاً int() بدون بررسی)
     order_id_str = callback.data.replace("update_order_", "").replace("/", "")
     if not order_id_str.isdigit():
         return await callback.answer("⚠️ شناسه نامعتبر است.", show_alert=True)
 
     order_id = int(order_id_str)
 
-    # 🛡 فاز ۳: خطای DB جدا از «سفارش یافت نشد» هندل می‌شود
     try:
-        # 📄 فاز ۳: اگر داشبورد از داخل لیست سفارشات باز شده باشد، دکمهٔ
-        # «بازگشت به لیست» بعد از بروزرسانی هم حفظ می‌شود
         fsm_data = await state.get_data()
         back_callback = "orders_back_to_list/" if "orders_list_filter" in fsm_data else None
 
-        text, markup = await generate_dashboard_data(order_id, session, back_callback=back_callback)
+        text, markup = await build_order_dashboard_by_type(order_id, session, back_callback=back_callback)
+            
     except Exception as e:
         await session.rollback()
         return await answer_callback_error(
@@ -2785,13 +3395,13 @@ async def refresh_order_dashboard(callback: types.CallbackQuery, state: FSMConte
     edited = await safe_edit_message(
         callback.message, text,
         reply_markup=markup,
-        # --- FIX M13 ---
         link_preview_options=types.LinkPreviewOptions(is_disabled=True)
     )
     if edited:
         await safe_callback_answer(callback, "✅ آمار با موفقیت بروزرسانی شد.")
     else:
         await safe_callback_answer(callback, "🔄 آمار تغییری نکرده است.")
+
 
 
 @router.callback_query(F.data == "status_btn_ignore/")
@@ -2819,13 +3429,12 @@ async def export_order_results(callback: types.CallbackQuery, session: AsyncSess
         order = await session.scalar(stmt)
         
         if order and order.order_type == "extract":
-            # گارد منطقی: اگر سفارش استخراج هنوز تکمیل نشده است
-            if order.status != OrderStatus.completed:
+            # 🟢 درخواست کارفرما: اجازه دانلود فایل هم برای تکمیل‌شده و هم برای توقفِ دستی (error)
+            if order.status not in [OrderStatus.completed, OrderStatus.error]:
                 return await safe_edit_message(
                     wait_msg,
                     "⚠️ <b>فایل استخراج هنوز آماده نیست.</b>\n"
-                    "لطفاً تا تکمیل شدن سفارش منتظر بمانید."
-
+                    "لطفاً تا پایان یا توقف سفارش منتظر بمانید."
                 )
             
             # ارسال فایل استخراج شده
@@ -2945,8 +3554,12 @@ async def action_approve_order(callback: types.CallbackQuery, session: AsyncSess
         # بررسی Idempotent: اطمینان از وضعیت در دیتابیس
         if order.is_approved or order.status != OrderStatus.pending:
             await callback.answer("ℹ️ این سفارش قبلاً تعیین تکلیف شده است.", show_alert=True)
-            # بروزرسانی داشبورد برای حذف دکمه‌های تایید
-            text, markup = await generate_dashboard_data(order_id, session)
+            # 🟢 لود کردن داشبورد صحیح
+            if order.order_type == "extract" and order.tracking_code:
+                from bot.handlers.extractor_handlers import build_extraction_dashboard_view
+                text, markup = await build_extraction_dashboard_view(session, order.tracking_code, back_page=1)
+            else:
+                text, markup = await generate_dashboard_data(order_id, session)
             return await safe_edit_or_answer(callback.message, text, reply_markup=markup, disable_web_page_preview=True)
             
         order.is_approved = True
@@ -2954,7 +3567,13 @@ async def action_approve_order(callback: types.CallbackQuery, session: AsyncSess
         
         await callback.answer("✅ سفارش با موفقیت تایید و به صف دیسپچ اضافه شد.", show_alert=True)
         
-        text, markup = await generate_dashboard_data(order_id, session)
+        # 🟢 لود کردن داشبورد صحیح بعد از تایید
+        if order.order_type == "extract" and order.tracking_code:
+            from bot.handlers.extractor_handlers import build_extraction_dashboard_view
+            text, markup = await build_extraction_dashboard_view(session, order.tracking_code, back_page=1)
+        else:
+            text, markup = await generate_dashboard_data(order_id, session)
+            
         await safe_edit_or_answer(
             callback.message, 
             text, 
@@ -2981,7 +3600,12 @@ async def action_reject_order(callback: types.CallbackQuery, session: AsyncSessi
         # بررسی Idempotent
         if order.is_approved or order.status != OrderStatus.pending:
             await callback.answer("ℹ️ این سفارش قبلاً تعیین تکلیف شده است.", show_alert=True)
-            text, markup = await generate_dashboard_data(order_id, session)
+            # 🟢 لود کردن داشبورد صحیح
+            if order.order_type == "extract" and order.tracking_code:
+                from bot.handlers.extractor_handlers import build_extraction_dashboard_view
+                text, markup = await build_extraction_dashboard_view(session, order.tracking_code, back_page=1)
+            else:
+                text, markup = await generate_dashboard_data(order_id, session)
             return await safe_edit_or_answer(callback.message, text, reply_markup=markup, disable_web_page_preview=True)
             
         # تنظیم وضعیت نهایی به Error و درج دلیل رد
@@ -3004,7 +3628,13 @@ async def action_reject_order(callback: types.CallbackQuery, session: AsyncSessi
         
         await callback.answer("❌ سفارش رد و لغو شد.", show_alert=True)
         
-        text, markup = await generate_dashboard_data(order_id, session)
+        # 🟢 لود کردن داشبورد صحیح بعد از رد شدن
+        if order.order_type == "extract" and order.tracking_code:
+            from bot.handlers.extractor_handlers import build_extraction_dashboard_view
+            text, markup = await build_extraction_dashboard_view(session, order.tracking_code, back_page=1)
+        else:
+            text, markup = await generate_dashboard_data(order_id, session)
+            
         await safe_edit_or_answer(
             callback.message, 
             text, 
@@ -3016,3 +3646,75 @@ async def action_reject_order(callback: types.CallbackQuery, session: AsyncSessi
         await session.rollback()
         await answer_callback_error(callback, report_db_error("رد سفارش", e), get_main_menu_button())
 
+
+from utils.telegram_helpers import safe_edit_message, safe_callback_answer, answer_callback_error
+from utils.error_messages import report_db_error
+from bot.keyboards.main_menu import get_main_menu_button
+
+@router.callback_query(F.data.startswith("hold_continue_ip_") & F.data.endswith("/"))
+async def hold_continue_ip_handler(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    order_id_str = callback.data.split("_")[3].replace("/", "")
+    
+    if not order_id_str.isdigit():
+        return await callback.answer("⚠️ شناسه نامعتبر است.", show_alert=True)
+        
+    order_id = int(order_id_str)
+    
+    try:
+        order = await session.scalar(select(Order).where(Order.id == order_id))
+        
+        if not order or order.status != OrderStatus.on_hold_proxy:
+            return await callback.answer("⚠️ سفارش در وضعیت هولد نیست.", show_alert=True)
+            
+        if not getattr(config, "FALLBACK_TO_DIRECT_IP", True):
+            return await callback.answer("⚠️ ارسال با IP سرور (IP Leak Guard) در تنظیمات سیستم مسدود است.", show_alert=True)
+            
+        if not await direct_budget_ok(session):
+            return await callback.answer("⚠️ بودجه ارسال با IP سرور (MAX_DIRECT_ACCOUNTS) تکمیل است. لطفاً منتظر پروکسی بمانید.", show_alert=True)
+            
+        order.server_ip_consent = True
+        order.status = OrderStatus.pending
+        order.hold_reason = None
+        await session.commit()
+        
+        await safe_callback_answer(callback, "✅ سفارش با IP سرور مجاز شد و به صف ارسال بازگشت.", show_alert=True)
+        
+        # استفاده از متد امن برای آپدیت متن و حذف کیبورد شیشه‌ای
+        await safe_edit_message(
+            callback.message,
+            callback.message.html_text + "\n\n✅ <b>انتخاب شما:</b> ادامه باقی سفارش با IP سرور (بدون پروکسی)",
+            reply_markup=None
+        )
+        
+    except Exception as e:
+        await session.rollback()
+        await answer_callback_error(callback, report_db_error("هولد سفارش", e), get_main_menu_button())
+
+
+@router.callback_query(F.data.startswith("hold_wait_proxy_") & F.data.endswith("/"))
+async def hold_wait_proxy_handler(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    order_id_str = callback.data.split("_")[3].replace("/", "")
+    
+    if not order_id_str.isdigit():
+        return await callback.answer("⚠️ شناسه نامعتبر است.", show_alert=True)
+        
+    order_id = int(order_id_str)
+    
+    try:
+        order = await session.scalar(select(Order).where(Order.id == order_id))
+        
+        if not order or order.status != OrderStatus.on_hold_proxy:
+            return await callback.answer("⚠️ سفارش در وضعیت هولد نیست.", show_alert=True)
+            
+        await safe_callback_answer(callback, "⏳ سفارش در وضعیت هولد باقی می‌ماند تا پروکسی جدید متصل شود.", show_alert=True)
+        
+        # استفاده از متد امن برای آپدیت متن و حذف کیبورد شیشه‌ای
+        await safe_edit_message(
+            callback.message,
+            callback.message.html_text + "\n\n⏳ <b>انتخاب شما:</b> منتظر پروکسی جدید می‌مانم",
+            reply_markup=None
+        )
+        
+    except Exception as e:
+        await session.rollback()
+        await answer_callback_error(callback, report_db_error("هولد سفارش", e), get_main_menu_button())

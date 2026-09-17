@@ -12,9 +12,10 @@ redis==5.0.1
 greenlet==3.0.3
 
 # --- Proxy (SOCKS) ---
-PySocks==1.7.1       
-python-socks==2.4.4  
+python-socks[asyncio]==2.4.4  
 
 # --- Security & Utils ---
 python-dotenv==1.0.1
 cryptography==41.0.3
+
+async-timeout

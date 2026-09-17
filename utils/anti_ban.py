@@ -29,7 +29,6 @@ def parse_spintax(text: str) -> str:
         text = text[:match.start()] + choice + text[match.end():]
         
     return text
-
 async def apply_adaptive_flood_wait(
     session: AsyncSession, 
     account_id: int, 
@@ -37,22 +36,23 @@ async def apply_adaptive_flood_wait(
 ) -> None:
     """
     محاسبه و اعمال جریمه زمانی تطبیقی.
-    اصلاح شده: حذف session.commit() برای جلوگیری از نشت تراکنش و 
-    بهم ریختن Batch Commit در ورکر اصلی.
+    اصلاح شده: محاسبه جریمه‌ها بر حسب ثانیه برای حداکثر شدن توان خروجی.
     """
-    if wait_seconds < 20:
-        penalty_hours = 1
-    elif 20 <= wait_seconds <= 60:
-        penalty_hours = 6
-    else:
-        stmt = select(GlobalSettings).limit(1)
-        result = await session.execute(stmt)
-        settings = result.scalar_one_or_none()
-        
-        penalty_days = settings.spam_penalty_days if settings else 1
-        penalty_hours = penalty_days * 24
+    # 🛡 اصلاح ساختاری: تفکیک جریمه‌های استاندارد FloodWait از جریمه‌های سنگین (اسپم/PeerFlood)
+    MIN_PEERFLOOD_PENALTY = 3600      # حداقل ۱ ساعت برای خطاهای شدید
+    MAX_PENALTY_SECONDS = 30 * 86400  # سقف منطقی ۳۰ روز
 
-    penalty_time = datetime.now(timezone.utc) + timedelta(hours=penalty_hours)
+    if wait_seconds > 1800:
+        # اگر ورودی بیش از ۳۰ دقیقه است، یعنی یک جریمه قطعی اسپم/محدودیت است (نه FloodWait ساده)
+        penalty_seconds = min(max(wait_seconds, MIN_PEERFLOOD_PENALTY), MAX_PENALTY_SECONDS)
+    elif wait_seconds < 20:
+        penalty_seconds = max(wait_seconds + 30, 120)      
+    elif wait_seconds <= 60:
+        penalty_seconds = max(wait_seconds * 2, 300)       
+    else:
+        penalty_seconds = min(wait_seconds * 3, 1800)
+
+    penalty_time = datetime.now(timezone.utc) + timedelta(seconds=penalty_seconds)
     
     try:
         update_stmt = (
@@ -65,7 +65,7 @@ async def apply_adaptive_flood_wait(
         
         logger.warning(
             f"Account user_{account_id}/ hit FloodWait ({wait_seconds}s). "
-            f"Locked for {penalty_hours} hours until {penalty_time}."
+            f"Locked for {penalty_seconds} seconds until {penalty_time}."
         )
     except Exception as e:
         logger.error(f"Failed to apply flood wait penalty for user_{account_id}/: {e}")

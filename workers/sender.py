@@ -3,38 +3,55 @@ import html
 import logging
 import os
 import random
+import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from zoneinfo import ZoneInfo
-
 import redis.asyncio as aioredis
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
 from pyrogram import Client
 from pyrogram.errors import (
-    FloodWait, 
-    UserIsBlocked, 
-    PeerIdInvalid, 
-    UsernameInvalid,
-    UsernameNotOccupied,
-    UserIsBot,
-    UserRestricted,
-    # 📋 ارسال با کپی از کانال مبدا: خطاهای مخصوص کانال مبدا
+    AuthKeyUnregistered,
     ChannelInvalid,
     ChatForwardsRestricted,
+    FloodWait,
+    PeerFlood,
+    PeerIdInvalid,
+    Unauthorized,
+    UserDeactivated,
+    UserIsBlocked,
+    UserIsBot,
+    UserRestricted,
+    UsernameInvalid,
+    UsernameNotOccupied,
 )
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import config
 from database.engine import async_session
-from database.models import OrderLog, Order, OrderStatus, Admin, Account
+from database.models import (
+    Account,
+    AccountStatus,
+    Admin,
+    GlobalSettings,
+    Order,
+    OrderLog,
+    OrderStatus,
+    WorkerEvent,
+)
+from utils.advanced_anti_ban import check_spambot_status
 from utils.anti_ban import parse_spintax, apply_adaptive_flood_wait
-from utils.advanced_anti_ban import appeal_to_spambot
-from utils.seen_watcher import (  # 🧠 جریان هوشمند: رصد «سین» تارگت
-    arm_seen_event,      # 🛡 فاز ۷ (BUG-18): مسلح‌کردن رویداد قبل از send
-    dismiss_seen_event,  # 🛡 فاز ۷ (BUG-18): جمع‌کردن رویداد در مسیرهای شکست مرحله ۱
+from utils.seen_watcher import (
+    arm_seen_event,
+    dismiss_seen_event,
     wait_for_seen,
 )
 
+try:
+    import python_socks
+except ImportError:
+    python_socks = None
 
 logger = logging.getLogger(__name__)
 
@@ -335,13 +352,11 @@ async def is_global_slowdown() -> bool:
 
 
 async def _humanized_send_delay() -> float:
-    """
-    تاخیر انسانی بین ارسال‌ها؛ 🛡 R8: در پنجره‌ی کاهش بار سراسری، ضریب تصادفی
-    ×۲–۳ روی تاخیر اعمال می‌شود (کاهش نرخ ارسال کل سیستم، نه فقط یک اکانت).
-    """
-    delay = random.uniform(5, 12)
+    """Env-tunable humanized delay; global slowdown now multiplies by
+    GLOBAL_SLOWDOWN_FACTOR_MIN..MAX (default 1.5-2.0 instead of 2-3)."""
+    delay = random.uniform(config.SEND_DELAY_MIN, config.SEND_DELAY_MAX)
     if await is_global_slowdown():
-        delay *= random.uniform(2.0, 3.0)
+        delay *= random.uniform(config.GLOBAL_SLOWDOWN_FACTOR_MIN, config.GLOBAL_SLOWDOWN_FACTOR_MAX)
     return delay
 
 # ==========================================
@@ -430,6 +445,208 @@ def mutate_text(text: str, send_index: int) -> str:
     return text
 
 
+async def _send_via_fallback(
+    client: Client,
+    target: str,
+    order: Order,
+    chosen_msg_id: int,
+    from_chat,
+) -> Optional[object]:
+    """
+    🟢 فاز ۵: fallback برای کانال‌های دارای has_protected_content.
+    
+    پیام مبدا را با get_messages می‌گیرد و محتوایش را به‌صورت مستقیم به تارگت
+    می‌فرستد (بدون header فوروارد). اگر پیام مدیا داشته باشد، آن را download
+    کرده و دوباره upload می‌کند.
+    """
+    try:
+        messages = await client.get_messages(chat_id=from_chat, message_ids=chosen_msg_id)
+        if not messages:
+            return None
+        src_msg = messages[0] if isinstance(messages, list) else messages
+    except Exception as e:
+        logger.warning(
+            f"Fallback get_messages failed for Order #{order.id} "
+            f"(msg_id={chosen_msg_id}): {e.__class__.__name__}"
+        )
+        return None
+    
+    real_target = int(target) if target.lstrip("-").isdigit() else target
+    markup = None
+    if order.button_text and order.button_url:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(text=str(order.button_text), url=str(order.button_url))]]
+        )
+    
+    try:
+        # اگر پیام مدیا دارد
+        media = getattr(src_msg, "media", None)
+        caption = getattr(src_msg, "caption", None) or getattr(src_msg, "text", None) or ""
+        
+        if media is not None:
+            # download و re-upload
+            try:
+                media_path = await client.download_media(src_msg, in_memory=True)
+                if media_path is None:
+                    # download ناموفق → fallback به متن
+                    text = getattr(src_msg, "text", "") or getattr(src_msg, "caption", "") or ""
+                    return await client.send_message(
+                        chat_id=real_target,
+                        text=text or "(محتوای پیام قابل‌دسترسی نبود)",
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                
+                # تشخیص نوع مدیا
+                from pyrogram.enums import MessageMediaType
+                media_type = getattr(src_msg, "media", None)
+                
+                if media_type == MessageMediaType.PHOTO:
+                    return await client.send_photo(
+                        chat_id=real_target,
+                        photo=media_path,
+                        caption=caption,
+                        reply_markup=markup,
+                    )
+                elif media_type == MessageMediaType.VIDEO:
+                    return await client.send_video(
+                        chat_id=real_target,
+                        video=media_path,
+                        caption=caption,
+                        reply_markup=markup,
+                    )
+                else:
+                    # سایر مدیاها (سند، صوت، ...) ← send_document
+                    return await client.send_document(
+                        chat_id=real_target,
+                        document=media_path,
+                        caption=caption,
+                        reply_markup=markup,
+                    )
+            except Exception as media_err:
+                logger.warning(
+                    f"Fallback media re-upload failed for Order #{order.id}: {media_err}"
+                )
+                # fallback نهایی: فقط متن
+                text = getattr(src_msg, "text", "") or getattr(src_msg, "caption", "") or ""
+                if text:
+                    return await client.send_message(
+                        chat_id=real_target,
+                        text=text,
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                return None
+        else:
+            # پیام متنی ساده
+            text = getattr(src_msg, "text", "") or ""
+            if not text:
+                return None
+            return await client.send_message(
+                chat_id=real_target,
+                text=text,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+    except Exception as e:
+        logger.error(
+            f"Fallback send failed for Order #{order.id} target={target}: {e.__class__.__name__}: {e}"
+        )
+        return None
+
+async def _order_needs_fallback(order_id: int) -> bool:
+    """بررسی اینکه آیا این سفارش قبلاً به fallback سوییچ کرده یا نه."""
+    try:
+        redis = _get_redis()
+        return bool(await redis.get(f"fwd_fallback:{order_id}"))
+    except Exception:
+        return False
+
+async def _mark_order_fallback(order_id: int) -> None:
+    """ثبت اینکه این سفارش به fallback سوییچ کرده (برای ارسال‌های بعدی)."""
+    try:
+        redis = _get_redis()
+        await redis.set(f"fwd_fallback:{order_id}", "1", ex=86400)  # 24 ساعت
+    except Exception as e:
+        logger.debug(f"Could not mark order {order_id} for fallback: {e}")
+
+
+async def _ensure_source_channel_access(
+    client: Client,
+    order: Order,
+) -> tuple[bool, Optional[int], str]:
+    """
+    🟢 فاز ۳: قبل از شروع ارسال، بررسی می‌کند که آیا ورکر به کانال مبدا دسترسی دارد.
+    
+    برمی‌گرداند:
+      (accessible, resolved_chat_id, status_message)
+    
+    حالت‌ها:
+      - accessible=True  → ورکر عضو است یا کانال پابلیک است؛ آماده‌ی ارسال.
+      - accessible=False → ورکر دسترسی ندارد؛ chunk باید به‌طور کامل به unsent برگردد.
+    
+    نکته: این تابع سعی نمی‌کند به کانال مبدا join بزند (join کردن کانال مبدا
+    معمولاً مطلوب admin نیست و می‌تواند باعث ban اکانت شود). فقط resolve و
+    access-check می‌کند.
+    """
+    if not order.source_channel_id and not getattr(order, "source_message_ids", None):
+        # سفارش فوروارد نیست — چیزی برای بررسی نیست
+        return True, None, "no_source_channel"
+    
+    # تجزیه‌ی source_message_ids برای گرفتن source_username (قطب سوم)
+    source_username = None
+    if order.source_message_ids:
+        parts = order.source_message_ids.split("|")
+        if len(parts) > 2 and parts[2]:
+            source_username = parts[2]  # مثلاً "@channelname"
+    
+    # اولویت ۱: اگر یوزرنیم داریم (کانال پابلیک)، resolve می‌کنیم
+    if source_username:
+        try:
+            chat = await asyncio.wait_for(client.get_chat(source_username), timeout=15)
+            return True, chat.id, "resolved_via_username"
+        except FloodWait as e:
+            # اگر FloodWait خوردیم، به‌معنای درست بودن کانال است ولی محدودیت داریم
+            return False, None, f"limit:flood_wait:{int(e.value)}"
+        except Exception as e:
+            logger.warning(
+                f"Preflight source-check via username '{source_username}' failed "
+                f"for worker {client.name}: {e.__class__.__name__}"
+            )
+            # به مسیر chat_id ادامه می‌دهیم
+    
+    # اولویت ۲: استفاده از source_channel_id عددی
+    if order.source_channel_id:
+        try:
+            # get_chat_member با "me" سریع‌تر از get_chat است و فقط عضویت را چک می‌کند
+            from pyrogram.enums import ChatMemberStatus
+            member = await asyncio.wait_for(
+                client.get_chat_member(order.source_channel_id, "me"),
+                timeout=15,
+            )
+            if member.status in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+            ):
+                return True, order.source_channel_id, "member"
+            return False, None, "not_member"
+        except Exception as e:
+            err_name = e.__class__.__name__
+            logger.warning(
+                f"Preflight source-check via chat_id {order.source_channel_id} failed "
+                f"for worker {client.name}: {err_name}"
+            )
+            if err_name in ("ChannelPrivate", "ChannelInvalid", "PeerIdInvalid"):
+                return False, None, "no_access"
+            if err_name == "UserNotParticipant":
+                return False, None, "not_member"
+            return False, None, f"error:{err_name}"
+    
+    # هیچ منبعی برای resolve نداریم
+    return False, None, "no_source_identifier"
+
+
 async def _notify_admins_on_source_failure(
     session: AsyncSession, order_id: int, error_name: str
 ) -> None:
@@ -513,590 +730,757 @@ async def _notify_admins_on_source_failure(
     except Exception as e:
         logger.warning(f"Source-failure notification (HTTP session) failed for Order #{order_id}: {e}")
 
-# مسیر فایل: workers/sender.py
-async def execute_bulk_send(
-    client: Client, 
-    account_db_id: int, 
-    order: Order, 
-    targets: List[str], 
-    session: AsyncSession
-) -> List[str]:
 
-    logger.info(f"Worker user_{account_db_id}/ starting chunk for Order #{order.id}.")
-    
-    success_count = 0
-    unsent_targets = []
-    
-    # 📋 حالت کپی/فوروارد از کانال مبدا
-    copy_source_ids: List[int] = []
-    forward_style = "copy"
-    
-    if order.source_channel_id and order.source_message_ids:
-        parts = order.source_message_ids.split("|")
-        id_parts = parts[0]
-        if len(parts) > 1:
-            forward_style = parts[1]
-            
-        copy_source_ids = [
-            int(part.strip())
-            for part in id_parts.split(",")
-            if part.strip().isdigit()
-        ]
-        
-    copy_mode = bool(copy_source_ids and forward_style == "copy")
-    forward_mode = bool(copy_source_ids and forward_style == "forward")
-    is_source_mode = copy_mode or forward_mode  # هر نوع ارسالی از کانال مبدا
+MAX_CONSECUTIVE_ERRORS = int(getattr(config, "MAX_CONSECUTIVE_ERRORS", 3))
+COOLDOWN_MINUTES_ON_ERROR = int(getattr(config, "COOLDOWN_MINUTES_ON_ERROR", 30))
+HOURLY_SEND_LIMIT_PER_ACCOUNT = int(getattr(config, "HOURLY_SEND_LIMIT_PER_ACCOUNT", 15))
+
+def _hourly_key(account_db_id: int) -> str:
+    return f"hourly_send:{account_db_id}:{datetime.now(TEHRAN_TZ).strftime('%Y%m%d%H')}"
+
+async def get_hourly_sent_count(account_db_id: int) -> int:
     try:
-        account_created_at = await session.scalar(
-            select(Account.created_at).where(Account.id == account_db_id)
-        )
-        daily_limit = effective_daily_limit(account_created_at)
-    except Exception as e:
-        logger.warning(
-            f"Could not load created_at for worker user_{account_db_id}/ "
-            f"({e.__class__.__name__}: {e}); using strict (new-account) daily limit."
-        )
-        daily_limit = effective_daily_limit(None)
+        val = await _get_redis().get(_hourly_key(account_db_id))
+        return int(val) if val else 0
+    except Exception: return 0
 
-    # 📋 شمارنده‌های خطای کانال مبدا
-    copy_attempts = 0
-    source_error_count = 0
-    last_source_error: Optional[str] = None
+async def incr_hourly_sent_count(account_db_id: int) -> int:
+    key = _hourly_key(account_db_id)
+    try:
+        pipe = _get_redis().pipeline()
+        pipe.incr(key)
+        pipe.expire(key, 3600)  # انقضا بعد از یک ساعت
+        value, _ = await pipe.execute()
+        return int(value)
+    except Exception: return 1
 
-    raw_message = ""
-    safe_message = ""
-    safe_message_2 = ""
-    smart_flow_active = False
-    send_message_2 = False
-
-    if not copy_mode:
-        raw_message = order.message_text or ""
+async def change_account_status(
+    session: AsyncSession, account_id: int, new_status: AccountStatus, 
+    reason: str, error_details: str = None, return_time: datetime = None
+) -> None:
+    """تغییر اتمیک وضعیت اکانت و ثبت لاگ در WorkerEvent"""
+    account = await session.get(Account, account_id)
+    if not account or account.status == new_status: return
+    
+    old_status = account.status.value if hasattr(account.status, 'value') else str(account.status)
+    account.status = new_status
+    account.status_reason = reason
+    account.expected_return_time = return_time
+    if new_status == AccountStatus.active:
+        account.consecutive_errors = 0
         
-        if order.button_text and order.button_url:
-            raw_message += f"\n\n🔗 <a href='{order.button_url}'>{order.button_text}</a>"
+    event = WorkerEvent(
+        account_id=account_id,
+        old_status=old_status,
+        new_status=new_status.value if hasattr(new_status, 'value') else str(new_status),
+        reason=reason,
+        error_details=error_details
+    )
+    session.add(event)
+    await session.commit()
 
-        safe_message = raw_message.replace("{first_name}", "[[FIRST_NAME]]").replace("{username}", "[[USERNAME]]")
 
-        # 🧠 بررسی وجود پیام دوم (چه بنر باشد چه پیام عادی)
-        send_message_2 = bool(order.message_2_text) or bool(order.media_2_path and order.media_2_type)
-        raw_message_2 = order.message_2_text or ""
-        safe_message_2 = raw_message_2.replace("{first_name}", "[[FIRST_NAME]]").replace("{username}", "[[USERNAME]]")
-        
-        # جریان هوشمند فقط زمانی فعال می‌شود که هم فلگ روشن باشد و هم پیام دومی وجود داشته باشد
-        smart_flow_active = bool(order.smart_flow and send_message_2)
+async def execute_bulk_send(
+    client: Client,
+    account_db_id: int,
+    order: Order,
+    targets: List[str],
+    session: AsyncSession,
+    progress_reporter=None,
+) -> tuple[List[str], Optional[str]]:
+    """
+    Isolated bulk-send execution for one chunk of targets.
+    
+    Phase 1/2 Observability Update:
+    - Added structured JSON logging for every send attempt (StructuredLog).
+    - Status values in OrderLog strictly mapped to: success, error, flood, restricted, partial.
+    - Added duration (ms) and exact stage number of failure to both app logs and DB.
+    """
+    import json
+    import time
+    from datetime import datetime, timezone
+    
+    logger.info(
+        f"Order #{order.id}: chunk started for worker user_{account_db_id}/ "
+        f"({len(targets)} targets)."
+    )
 
-        if smart_flow_active:
-            logger.info(f"Worker user_{account_db_id}/ SmartFlow ENABLED for Order #{order.id} (icebreaker → seen-wait → banner).")
-        elif send_message_2:
-            logger.info(f"Worker user_{account_db_id}/ Normal Flow: message 2 ENABLED for Order #{order.id}.")
+    async def _report(**fields) -> None:
+        if progress_reporter is None:
+            return
+        try:
+            await progress_reporter.update(**fields)
+        except Exception as report_err:
+            logger.debug(f"Progress report suppressed: {report_err}")
 
-        raw_message_3 = order.message_3_text or ""
-        safe_message_3 = raw_message_3.replace("{first_name}", "[[FIRST_NAME]]").replace("{username}", "[[USERNAME]]")
-        send_message_3 = bool(order.message_3_text) or bool(order.media_3_path and order.media_3_type)
-        if send_message_3:
-            logger.info(
-                f"Worker user_{account_db_id}/ Order #{order.id}: message 3 enabled "
-                f"(text={bool(order.message_3_text)}, media={bool(order.media_3_path)})."
-            )
+    account_tag = f"user_{account_db_id}/"
 
-        needs_user_data = (
-            "[[FIRST_NAME]]" in safe_message
-            or "[[USERNAME]]" in safe_message
-            or (
-                send_message_2
-                and ("[[FIRST_NAME]]" in safe_message_2 or "[[USERNAME]]" in safe_message_2)
-            )
-            or (
-                send_message_3
-                and ("[[FIRST_NAME]]" in safe_message_3 or "[[USERNAME]]" in safe_message_3)
-            )
-        )
-        user_data_cache: dict = {}
-    else:
-        logger.info(
-            f"Worker user_{account_db_id}/ COPY MODE for Order #{order.id}: "
-            f"{len(copy_source_ids)} source message(s) from channel {order.source_channel_id}."
-        )
+    # ==========================================
+    # 🛑 فاز جدید: پیش‌پرواز سلامت اکانت (Preflight Check) + فاز ۱۰ (Account Status)
+    # ==========================================
+    now_utc = datetime.now(timezone.utc)
+    try:
+        from database.models import AccountStatus
+        account_row = await session.get(Account, account_db_id)
+        if account_row:
+            if account_row.status != AccountStatus.active:
+                await _report(status=f"اکانت فعال نیست (وضعیت: {account_row.status.value}) — بازگشت تارگت‌ها…", account=account_tag)
+                return targets
 
-    for i, target in enumerate(targets):
-        if await daily_cap_reached(account_db_id, daily_limit):
-            logger.warning(
-                f"Worker user_{account_db_id}/ reached DAILY_SEND_LIMIT_PER_ACCOUNT={daily_limit}; "
-                f"aborting chunk for Order #{order.id} ({len(targets) - i} target(s) re-queued)."
-            )
-            unsent_targets.extend(targets[i:])
-            break
-
-        target = target.strip()
-        if not target:
-            continue
-
-        if i % 10 == 0:
-            try:
-                await session.commit()
-            except Exception as db_err:
-                await session.rollback()
-                logger.error(
-                    f"Worker user_{account_db_id}/ incremental commit failed for Order #{order.id} "
-                    f"({db_err.__class__.__name__}: {db_err}); aborting chunk to bound the ambiguity window."
-                )
-                unsent_targets.extend(targets[i:])
-                break
-
-            if await is_order_killed(order.id):
-                logger.warning(f"Kill Switch activated! Worker user_{account_db_id}/ aborting chunk.")
-                unsent_targets.extend(targets[i:])
-                break 
-
-        if is_source_mode:
-            msg_id = random.choice(copy_source_ids)
-            log_entry = OrderLog(order_id=order.id, account_id=account_db_id, target=target)
-            copy_attempts += 1
-
-            await incr_daily_sent_count(account_db_id)
-
-            try:
-                if copy_mode:
-                    copied_msg = await client.copy_message(
-                        chat_id=target,
-                        from_chat_id=order.source_channel_id,
-                        message_id=msg_id,
-                    )
-                else:
-                    copied_msg = await client.forward_messages(
-                        chat_id=target,
-                        from_chat_id=order.source_channel_id,
-                        message_ids=msg_id,
-                    )
-                    
-                if getattr(copied_msg, "chat", None) is not None:
-                    _spawn_crm_mark(copied_msg.chat.id)
-
-            except FloodWait as e:
-                wait_seconds = e.value
-                logger.warning(f"Worker user_{account_db_id}/ triggered FloodWait ({wait_seconds}s) in copy mode.")
-
-                log_entry.status = LOG_STATUS_FLOOD
-                log_entry.error_message = f"FloodWait: {wait_seconds}s"
-                session.add(log_entry)
-
-                await apply_adaptive_flood_wait(session=session, account_id=account_db_id, wait_seconds=wait_seconds)
-                await mark_global_slowdown(wait_seconds)
-                unsent_targets.extend(targets[i:])
-                break
-
-            except UserRestricted as e:
-                logger.warning(f"Worker user_{account_db_id}/ is RESTRICTED (Spam limit). Triggering SpamBot appeal.")
-                log_entry.status = LOG_STATUS_RESTRICTED
-                log_entry.error_message = "UserRestricted"
-                session.add(log_entry)
-                asyncio.create_task(appeal_to_spambot(client, account_db_id))
-                unsent_targets.extend(targets[i:])
-                break
-
-            except (UserIsBlocked, PeerIdInvalid, UsernameInvalid, UsernameNotOccupied, UserIsBot) as e:
-                logger.info(f"Worker user_{account_db_id}/ skipped {target} (copy): {e.__class__.__name__}")
-                log_entry.status = LOG_STATUS_ERROR
-                log_entry.error_message = e.__class__.__name__
-                session.add(log_entry)
-                continue
-
-            except (ChannelInvalid, ChatForwardsRestricted) as e:
-                error_name = e.__class__.__name__
-                logger.error(f"Worker user_{account_db_id}/ copy source error on {target}: {error_name}")
-                log_entry.status = LOG_STATUS_ERROR
-                log_entry.error_message = f"SourceChannel: {error_name}"
-                session.add(log_entry)
-                source_error_count += 1
-                last_source_error = error_name
-                continue
-
-            except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-                logger.warning(
-                    f"Worker user_{account_db_id}/ transient connection error on {target} "
-                    f"({e.__class__.__name__}: {e}); aborting chunk for Order #{order.id}, "
-                    f"{len(targets) - i} target(s) re-queued."
-                )
-                log_entry.status = LOG_STATUS_ERROR
-                log_entry.error_message = f"TransientConnection: {e.__class__.__name__}: {e}"
-                session.add(log_entry)
-                unsent_targets.extend(targets[i:])
-                break
-
-            except Exception as e:
-                logger.error(f"Worker user_{account_db_id}/ unexpected error on {target} (copy): {e}")
-                log_entry.status = LOG_STATUS_ERROR
-                log_entry.error_message = str(e)
-                session.add(log_entry)
-                continue
-
-            log_entry.status = LOG_STATUS_SUCCESS
-            session.add(log_entry)
-            success_count += 1
-
-            await asyncio.sleep(await _humanized_send_delay())
-            continue
-
-        spintaxed_text = parse_spintax(safe_message)
-        final_text = spintaxed_text
-        
-        smart_flow_peer_id = None
-        target_first_name = "دوست عزیز"
-        target_username = str(target)
-
-        if needs_user_data:
-            user_info = user_data_cache.get(target)
-            if user_info is None:
-                try:
-                    user_info = await client.get_users(target)
-                    user_data_cache[target] = user_info
-                except Exception:
-                    user_info = None
-                    final_text = spintaxed_text.replace("[[FIRST_NAME]]", "دوست عزیز").replace("[[USERNAME]]", str(target))
-            if user_info is not None:
-                smart_flow_peer_id = user_info.id
-                target_first_name = user_info.first_name or "دوست عزیز"
-                target_username = f"@{user_info.username}" if user_info.username else str(target)
-                final_text = spintaxed_text.replace("[[FIRST_NAME]]", target_first_name).replace("[[USERNAME]]", target_username)
-
-        if smart_flow_active and smart_flow_peer_id is None and target.isdigit():
-            smart_flow_peer_id = int(target)
+            if account_row.is_banned:
+                await _report(status="اکانت مسدود است — بازگشت تارگت‌ها به صف…", account=account_tag)
+                return targets
+                
+            flooded = account_row.flood_wait_until and account_row.flood_wait_until.replace(tzinfo=timezone.utc) > now_utc
+            restricted = account_row.restricted_until and account_row.restricted_until.replace(tzinfo=timezone.utc) > now_utc
             
-        if TEXT_MUTATION_INVISIBLE_CHARS_ENABLED:
-            send_index = await _next_send_index(account_db_id)
-            final_text = mutate_text(final_text, send_index)
+            if flooded or restricted:
+                await _report(status="اکانت دارای محدودیت زمانی است — بازگشت تارگت‌ها به صف…", account=account_tag)
+                return targets
 
-        log_entry = OrderLog(order_id=order.id, account_id=account_db_id, target=target)
+            spambot_enabled = getattr(config, "PREFLIGHT_SPAMBOT_CHECK_ENABLED", True)
+            cache_hours = getattr(config, "PREFLIGHT_SPAMBOT_CACHE_HOURS", 4)
+            
+            last_check = account_row.spambot_checked_at
+            if last_check and last_check.tzinfo is None:
+                last_check = last_check.replace(tzinfo=timezone.utc)
+                
+            if spambot_enabled and (not last_check or (now_utc - last_check).total_seconds() > cache_hours * 3600):
+                await _report(status="🔍 بررسی پیشگیرانه وضعیت Shadow-ban با @SpamBot...", account=account_tag)
+                
+                from utils.advanced_anti_ban import check_spambot_status
+                status = await check_spambot_status(client, account_db_id)
+                
+                if status:
+                    account_row.spambot_checked_at = now_utc
+                    account_row.spambot_report = status["text"]
+                    
+                    if status["restricted"] and status["until"]:
+                        account_row.restricted_until = status["until"]
+                        await session.commit()
+                        await _report(status="⚠️ اکانت Shadow-ban (محدود) است — بازگشت تارگت‌ها...", account=account_tag)
+                        return targets
+                    elif status["restricted"]:
+                        account_row.is_banned = True
+                        await session.commit()
+                        from workers.sender import change_account_status
+                        await change_account_status(session, account_db_id, AccountStatus.blocked, "SpamBot Restriction", status["text"])
+                        await _report(status="⛔️ اکانت بن دائم است — بازگشت تارگت‌ها...", account=account_tag)
+                        return targets
+                        
+                    await session.commit()
+    except Exception as e:
+        logger.warning(f"Preflight check failed for user_{account_db_id}/: {e}")
+    # ==========================================
+
+    # 🟢 فاز ۳: اگر سفارش از نوع فوروارد از کانال است، قبل از شروع ارسال
+    # بررسی می‌کنیم که ورکر به کانال مبدا دسترسی دارد. اگر نه، کل chunk
+    # را به‌عنوان unsent برمی‌گردانیم تا دیسپچر ورکر بعدی را امتحان کند.
+    if order.source_channel_id or getattr(order, "source_message_ids", None):
+        try:
+            accessible, src_chat_id, src_status = await _ensure_source_channel_access(client, order)
+        except Exception as pre_err:
+            logger.warning(
+                f"Preflight source-access crashed for Order #{order.id} "
+                f"worker user_{account_db_id}/: {pre_err}"
+            )
+            accessible, src_chat_id, src_status = False, None, "preflight_crashed"
+        
+        if not accessible:
+            await _report(
+                status=(
+                    f"⛔️ این ورکر به کانال مبدا دسترسی ندارد ({src_status}). "
+                    f"تارگت‌ها به صف برمی‌گردند تا با ورکر بعدی ارسال شوند…"
+                ),
+                account=account_tag,
+            )
+            return targets
+        
+        if src_chat_id and src_chat_id != order.source_channel_id:
+            try:
+                order.source_channel_id = src_chat_id
+            except Exception:
+                pass
+
+    unsent: List[str] = []
+    sent_in_chunk = 0
+    chunk_started_ts = time.monotonic()
+    stage_label = "در حال ارسال پیام اول"
+
+    chunk_limit = 80
+    try:
+        settings_row = await session.scalar(select(GlobalSettings).limit(1))
+        if settings_row is not None and settings_row.send_limit_per_run:
+            chunk_limit = int(settings_row.send_limit_per_run)
+    except Exception as e:
+        logger.warning(f"Could not load send_limit_per_run ({e}); using default {chunk_limit}.")
+
+    daily_limit = int(config.DAILY_SEND_LIMIT_PER_ACCOUNT)
+    try:
+        if account_row is not None and account_row.created_at is not None:
+            created = account_row.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - created).total_seconds() / 86400.0
+            if age_days < float(config.NEW_ACCOUNT_DAYS):
+                daily_limit = int(config.NEW_ACCOUNT_DAILY_SEND_LIMIT)
+    except Exception as e:
+        logger.warning(f"Could not resolve daily cap for {account_tag}: {e}")
+
+    hourly_limit = int(getattr(config, "HOURLY_SEND_LIMIT_PER_ACCOUNT", 15))
+    from workers.sender import get_hourly_sent_count, incr_hourly_sent_count
+    from workers.sender import get_daily_sent_count, incr_daily_sent_count, _humanized_send_delay, is_order_killed
+
+    async def _daily_sent() -> int:
+        return await get_daily_sent_count(account_db_id)
+
+    async def _bump_daily() -> None:
         await incr_daily_sent_count(account_db_id)
 
-        if smart_flow_active and smart_flow_peer_id is not None:
-            arm_seen_event(client, smart_flow_peer_id)
+    async def _pacing_delay() -> float:
+        return await _humanized_send_delay()
 
-        # ─── مرحله ۱: ارسال پیام اول (یخ‌شکن) ───
-        sent_message = None
-        try:
-            if order.media_path and order.media_type:
-                if order.media_type == "photo":
-                    sent_message = await client.send_photo(chat_id=target, photo=order.media_path, caption=final_text)
-                elif order.media_type == "video":
-                    sent_message = await client.send_video(chat_id=target, video=order.media_path, caption=final_text)
-                elif order.media_type == "document":
-                    sent_message = await client.send_document(chat_id=target, document=order.media_path, caption=final_text)
+    def _reply_markup(button_text, button_url):
+        if button_text and button_url:
+            return InlineKeyboardMarkup([[InlineKeyboardButton(text=str(button_text), url=str(button_url))]])
+        return None
+
+    async def _send_stage_message(target: str, text: Optional[str], media_path: Optional[str], media_type: Optional[str], button_text: Optional[str], button_url: Optional[str]):
+        real_target = int(target) if target.lstrip("-").isdigit() else target
+        markup = _reply_markup(button_text, button_url)
+        if media_path and os.path.exists(media_path):
+            if str(media_type or "").lower() == "video":
+                return await client.send_video(chat_id=real_target, video=str(media_path), caption=text or "", reply_markup=markup)
+            return await client.send_photo(chat_id=real_target, photo=str(media_path), caption=text or "", reply_markup=markup)
+        return await client.send_message(chat_id=real_target, text=text or "", reply_markup=markup, disable_web_page_preview=True)
+
+    stop_reason: Optional[str] = None
+
+    for position, target in enumerate(targets):
+        if not target or target.strip() in ["@None", "None", "@"]:
+            continue
+            
+        target_start_ts = time.monotonic()
+        current_stage = 0
+        
+        def _log_attempt(status_str: str, err_type: str = None, extra_msg: str = "") -> str:
+            duration_ms = int((time.monotonic() - target_start_ts) * 1000)
+            struct_log = {
+                "event": "send_attempt",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "account_id": account_db_id,
+                "target": target,
+                "order_id": order.id,
+                "stage": current_stage,
+                "result": status_str,
+                "error_type": err_type,
+                "duration_ms": duration_ms
+            }
+            if status_str == "success":
+                logger.info(f"StructuredLog: {json.dumps(struct_log)}")
             else:
-                sent_message = await client.send_message(chat_id=target, text=final_text)
+                logger.warning(f"StructuredLog: {json.dumps(struct_log)}")
+                
+            base_msg = f"Dur: {duration_ms}ms | Stage: {current_stage}"
+            if err_type:
+                base_msg += f" | Err: {err_type}"
+            if extra_msg:
+                base_msg += f" | {extra_msg}"
+            return base_msg
 
-            if (smart_flow_active and smart_flow_peer_id is None
-                    and sent_message is not None
-                    and getattr(sent_message, "chat", None) is not None):
-                smart_flow_peer_id = sent_message.chat.id
-                arm_seen_event(client, smart_flow_peer_id)
+        if stop_reason is None:
+            if await is_order_killed(order.id):
+                stop_reason = "killed"
+                await _report(status="🛑 توقف اضطراری (Kill Switch) دریافت شد — خروج ورکر...", account=account_tag)
+    
+        if stop_reason is None:
+            if sent_in_chunk >= chunk_limit:
+                stop_reason = "chunk_limit"
+                await _report(status=f"سقف ظرفیت این دورِ ارسال ({chunk_limit} پیام) پر شد — ادامه با اکانت بعدی…", account=account_tag)
+            elif await _daily_sent() >= daily_limit:
+                stop_reason = "daily_cap"
+                await _report(status=f"سقف روزانه اکانت ({daily_limit} پیام) پر شد — ارسال متوقف شد…", account=account_tag)
+            elif await get_hourly_sent_count(account_db_id) >= hourly_limit:
+                stop_reason = "hourly_cap"
+                await _report(status=f"سقف ساعتی اکانت ({hourly_limit} پیام) پر شد — ادامه با اکانت بعدی…", account=account_tag)
+            
+        if stop_reason is not None:
+            unsent.extend(targets[position:])
+            break
+
+        stage_label = "در حال ارسال پیام اول"
+        peer_id = None
+        stage_1_delivered = False 
+        
+        try:
+            real_target = int(target) if target.lstrip("-").isdigit() else target
+            
+            if order.smart_flow:
+                try:
+                    peer = await client.resolve_peer(real_target)
+                    from pyrogram.raw.types import InputPeerUser, InputPeerChat, InputPeerChannel
+                    if isinstance(peer, InputPeerUser): peer_id = peer.user_id
+                    elif isinstance(peer, InputPeerChat): peer_id = peer.chat_id
+                    elif isinstance(peer, InputPeerChannel): peer_id = peer.channel_id
+                    if peer_id:
+                        arm_seen_event(client, peer_id)
+                except Exception as e:
+                    logger.debug(f"SmartFlow: Could not pre-resolve peer {target}: {e}")
+
+            # ---- stage 1 ----
+            current_stage = 1
+            msg1 = None
+            if order.source_channel_id and order.source_message_ids:
+                parts = order.source_message_ids.split("|")
+                src_msg_ids = [int(m.strip()) for m in parts[0].split(",") if m.strip().isdigit()]
+                forward_style = parts[1] if len(parts) > 1 else "copy"
+                source_username = parts[2] if len(parts) > 2 else None
+                from_chat = source_username if source_username else order.source_channel_id
+                
+                if src_msg_ids:
+                    chosen_msg_id = random.choice(src_msg_ids)
+                    
+                    try:
+                        needs_fallback = await _order_needs_fallback(order.id)
+                        
+                        if not needs_fallback:
+                            try:
+                                if forward_style == "copy":
+                                    msg1 = await client.copy_message(
+                                        chat_id=real_target,
+                                        from_chat_id=from_chat,
+                                        message_id=chosen_msg_id,
+                                        reply_markup=_reply_markup(order.button_text, order.button_url) if order.button_text else None,
+                                    )
+                                else:
+                                    msg1 = await client.forward_messages(
+                                        chat_id=real_target,
+                                        from_chat_id=from_chat,
+                                        message_ids=chosen_msg_id,
+                                    )
+                            except ChatForwardsRestricted as fwd_restricted:
+                                logger.warning(
+                                    f"Order #{order.id}: ChatForwardsRestricted on source channel — "
+                                    f"switching to direct-send fallback for this order."
+                                )
+                                await _mark_order_fallback(order.id)
+                                msg1 = await _send_via_fallback(
+                                    client, target, order, chosen_msg_id, from_chat
+                                )
+                                if msg1 is None:
+                                    raise fwd_restricted
+                            except ChannelInvalid as src_err:
+                                raise
+                        else:
+                            msg1 = await _send_via_fallback(
+                                client, target, order, chosen_msg_id, from_chat
+                            )
+                            if msg1 is None:
+                                raise ChatForwardsRestricted()
+
+                    except ChannelInvalid as src_err:
+                        err_type = src_err.__class__.__name__
+                        log_msg = _log_attempt("error", err_type, "Source Channel Error")
+
+                        session.add(OrderLog(
+                            order_id=order.id, account_id=account_db_id, target=target,
+                            status="error", error_message=log_msg
+                        ))
+                        await session.commit()
+
+                        fail_count = 1
+                        try:
+                            redis = _get_redis()
+                            fail_key = f"source_fail:{order.id}"
+                            fail_count = await redis.incr(fail_key)
+                            if fail_count == 1:
+                                await redis.expire(fail_key, 3600)
+                        except Exception as rc_err:
+                            logger.warning(f"Could not increment source_fail counter for Order #{order.id}: {rc_err}")
+
+                        max_source_fails = int(getattr(config, "SOURCE_FAIL_MAX_WORKERS", 3))
+                        if fail_count >= max_source_fails:
+                            await _notify_admins_on_source_failure(session, order.id, err_type)
+                            from sqlalchemy import update
+                            from database.models import OrderStatus
+                            await session.execute(
+                                update(Order).where(Order.id == order.id).values(status=OrderStatus.error)
+                            )
+                            await session.commit()
+                            try:
+                                await _get_redis().delete(f"source_fail:{order.id}")
+                            except Exception:
+                                pass
+                            stop_reason = "source_failed"
+                            unsent.extend(targets[position:])
+                        else:
+                            await _report(
+                                status=(
+                                    f"⚠️ این ورکر به کانال مبدا دسترسی نداشت ({err_type}). "
+                                    f"تلاش {fail_count}/{max_source_fails} — ادامه با ورکر بعدی…"
+                                ),
+                                account=account_tag,
+                            )
+                            unsent.extend(targets[position:])
+                            stop_reason = "source_failed_retryable"
+
+                        dismiss_seen_event(client, peer_id)
+                        break
+
+                    except ChatForwardsRestricted as src_err:
+                        err_type = "ChatForwardsRestricted (fallback exhausted)"
+                        log_msg = _log_attempt("error", err_type, "Source Channel Error")
+
+                        session.add(OrderLog(
+                            order_id=order.id, account_id=account_db_id, target=target,
+                            status="error", error_message=log_msg
+                        ))
+                        await session.commit()
+
+                        fail_count = 1
+                        try:
+                            redis = _get_redis()
+                            fail_key = f"source_fail:{order.id}"
+                            fail_count = await redis.incr(fail_key)
+                            if fail_count == 1:
+                                await redis.expire(fail_key, 3600)
+                        except Exception as rc_err:
+                            logger.warning(f"Could not increment source_fail counter for Order #{order.id}: {rc_err}")
+
+                        max_source_fails = int(getattr(config, "SOURCE_FAIL_MAX_WORKERS", 3))
+                        if fail_count >= max_source_fails:
+                            await _notify_admins_on_source_failure(session, order.id, err_type)
+                            from sqlalchemy import update
+                            from database.models import OrderStatus
+                            await session.execute(
+                                update(Order).where(Order.id == order.id).values(status=OrderStatus.error)
+                            )
+                            await session.commit()
+                            try:
+                                await _get_redis().delete(f"source_fail:{order.id}")
+                            except Exception:
+                                pass
+                            stop_reason = "source_failed"
+                            unsent.extend(targets[position:])
+                        else:
+                            await _report(
+                                status=(
+                                    f"⚠️ این ورکر به کانال مبدا دسترسی نداشت ({err_type}). "
+                                    f"تلاش {fail_count}/{max_source_fails} — ادامه با ورکر بعدی…"
+                                ),
+                                account=account_tag,
+                            )
+                            unsent.extend(targets[position:])
+                            stop_reason = "source_failed_retryable"
+
+                        dismiss_seen_event(client, peer_id)
+                        break
+            else:
+                msg1 = await _send_stage_message(target, order.message_text, order.media_path, order.media_type, order.button_text, order.button_url)
+
+            if msg1:
+                stage_1_delivered = True
+
+            if not peer_id and msg1 and getattr(msg1, "chat", None):
+                peer_id = msg1.chat.id
+                if order.smart_flow:
+                    arm_seen_event(client, peer_id)
+
+            # ---- stage 2 ----
+            if order.message_2_text or order.media_2_path:
+                current_stage = 2
+                if order.smart_flow and peer_id:
+                    await _report(status="در انتظار دیده‌شدن پیام اول توسط تارگت", account=account_tag)
+                    timeout_val = random.uniform(config.SMARTFLOW_SEEN_TIMEOUT_MIN, config.SMARTFLOW_SEEN_TIMEOUT_MAX)
+                    seen = await wait_for_seen(client, peer_id, timeout=timeout_val)
+                    if seen:
+                        await asyncio.sleep(random.uniform(config.SMARTFLOW_STAGE_DELAY_MIN, config.SMARTFLOW_STAGE_DELAY_MAX))
+                    if order.message_3_text or order.media_3_path:
+                        arm_seen_event(client, peer_id)
+                else:
+                    await asyncio.sleep(await _pacing_delay())
+                    
+                stage_label = "در حال ارسال پیام دوم"
+                await _send_stage_message(target, order.message_2_text, order.media_2_path, order.media_2_type, None, None)
+
+            # ---- stage 3 ----
+            if order.message_3_text or order.media_3_path:
+                current_stage = 3
+                if order.smart_flow and peer_id:
+                    await _report(status="در انتظار دیده‌شدن پیام دوم توسط تارگت", account=account_tag)
+                    timeout_val = random.uniform(config.SMARTFLOW_SEEN_TIMEOUT_MIN, config.SMARTFLOW_SEEN_TIMEOUT_MAX)
+                    seen = await wait_for_seen(client, peer_id, timeout=timeout_val)
+                    if seen:
+                        await asyncio.sleep(random.uniform(config.SMARTFLOW_STAGE_DELAY_MIN, config.SMARTFLOW_STAGE_DELAY_MAX))
+                else:
+                    await asyncio.sleep(await _pacing_delay())
+                    
+                stage_label = "در حال ارسال پیام سوم"
+                await _send_stage_message(target, order.message_3_text, order.media_3_path, order.media_3_type, None, None)
+
+            # ---- Success Logging ----
+            log_msg = _log_attempt("success")
+            session.add(OrderLog(
+                order_id=order.id, account_id=account_db_id, target=target,
+                status="success", error_message=log_msg
+            ))
+            
+            if account_row:
+                account_row.consecutive_errors = 0
+                
+            await session.commit()
+            await incr_hourly_sent_count(account_db_id)
+            
+            sent_in_chunk += 1
+            await _bump_daily()
+
+            if progress_reporter is not None and sent_in_chunk % 20 == 0:
+                elapsed_min = max((time.monotonic() - chunk_started_ts) / 60.0, 1e-9)
+                speed = sent_in_chunk / elapsed_min
+                remaining = max(len(targets) - position - 1, 0)
+                eta_seconds = int(remaining / speed * 60) if speed > 0 else None
+                await _report(done=float(sent_in_chunk), total=float(len(targets)), speed=round(speed, 1), eta=eta_seconds, status=stage_label, account=account_tag)
 
         except FloodWait as e:
-            wait_seconds = e.value
-            logger.warning(f"Worker user_{account_db_id}/ triggered FloodWait ({wait_seconds}s).")
-            log_entry.status = LOG_STATUS_FLOOD
-            log_entry.error_message = f"FloodWait: {wait_seconds}s"
-            session.add(log_entry)
-            dismiss_seen_event(client, smart_flow_peer_id)
-            await apply_adaptive_flood_wait(session=session, account_id=account_db_id, wait_seconds=wait_seconds)
-            await mark_global_slowdown(wait_seconds)
-            unsent_targets.extend(targets[i:])
-            break 
+            wait_seconds = int(getattr(e, "value", 0) or 0)
+            log_status = "partial" if stage_1_delivered else "flood"
+            log_msg = _log_attempt(log_status, "FloodWait", f"Wait: {wait_seconds}s")
             
-        except UserRestricted as e:
-            logger.warning(f"Worker user_{account_db_id}/ is RESTRICTED (Spam limit). Triggering SpamBot appeal.")
-            log_entry.status = LOG_STATUS_RESTRICTED
-            log_entry.error_message = "UserRestricted"
-            session.add(log_entry)
-            dismiss_seen_event(client, smart_flow_peer_id)
-            asyncio.create_task(appeal_to_spambot(client, account_db_id))
-            unsent_targets.extend(targets[i:])
-            break 
-            
-        except (UserIsBlocked, PeerIdInvalid, UsernameInvalid, UsernameNotOccupied, UserIsBot) as e:
-            logger.info(f"Worker user_{account_db_id}/ skipped {target}: {e.__class__.__name__}")
-            log_entry.status = LOG_STATUS_ERROR
-            log_entry.error_message = e.__class__.__name__
-            session.add(log_entry)
-            dismiss_seen_event(client, smart_flow_peer_id)
-            continue
-
-        except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-            logger.warning(
-                f"Worker user_{account_db_id}/ transient connection error on {target} "
-                f"({e.__class__.__name__}: {e}); aborting chunk for Order #{order.id}, "
-                f"{len(targets) - i} target(s) re-queued."
-            )
-            log_entry.status = LOG_STATUS_ERROR
-            log_entry.error_message = f"TransientConnection: {e.__class__.__name__}: {e}"
-            session.add(log_entry)
-            dismiss_seen_event(client, smart_flow_peer_id)
-            unsent_targets.extend(targets[i:])
-            break
-            
-        except Exception as e:
-            logger.error(f"Worker user_{account_db_id}/ unexpected error on {target}: {e}")
-            log_entry.status = LOG_STATUS_ERROR
-            log_entry.error_message = str(e)
-            session.add(log_entry)
-            dismiss_seen_event(client, smart_flow_peer_id)
-            continue
-
-        if sent_message is not None and getattr(sent_message, "chat", None) is not None:
-            _spawn_crm_mark(sent_message.chat.id)
-
-        # ─── مرحله ۲: ارسال پیام دوم / بنر ───
-        if smart_flow_active:
-            # === منطق جریان هوشمند ===
-            if smart_flow_peer_id is not None:
-                seen = await wait_for_seen(client, smart_flow_peer_id, timeout=random.uniform(120, 420))
-            else:
-                seen = False
-                logger.warning(f"Worker user_{account_db_id}/ SmartFlow: peer of '{target}' unresolved; seen-wait skipped.")
-
-            if await is_order_killed(order.id):
-                logger.warning(f"Kill Switch activated during SmartFlow wait! Worker user_{account_db_id}/ aborting chunk.")
-                log_entry.status = LOG_STATUS_SUCCESS
-                session.add(log_entry)
-                success_count += 1
-                unsent_targets.extend(targets[i + 1:])
-                break
-
-            if await daily_cap_reached(account_db_id, daily_limit):
-                logger.warning(
-                    f"Worker user_{account_db_id}/ reached DAILY_SEND_LIMIT_PER_ACCOUNT={daily_limit} "
-                    f"before banner; aborting chunk for Order #{order.id}."
-                )
-                log_entry.status = LOG_STATUS_SUCCESS 
-                session.add(log_entry)
-                success_count += 1
-                unsent_targets.extend(targets[i + 1:])
-                break
-
-            await asyncio.sleep(random.uniform(30, 180))
-
-            banner_text = parse_spintax(safe_message_2)
-            if "[[FIRST_NAME]]" in banner_text or "[[USERNAME]]" in banner_text:
-                banner_text = banner_text.replace("[[FIRST_NAME]]", target_first_name).replace("[[USERNAME]]", target_username)
-
-            await incr_daily_sent_count(account_db_id)
-
-            try:
-                if order.media_2_path and order.media_2_type:
-                    if order.media_2_type == "photo":
-                        await client.send_photo(chat_id=target, photo=order.media_2_path, caption=banner_text)
-                    elif order.media_2_type == "video":
-                        await client.send_video(chat_id=target, video=order.media_2_path, caption=banner_text)
-                    elif order.media_2_type == "document":
-                        await client.send_document(chat_id=target, document=order.media_2_path, caption=banner_text)
-                else:
-                    await client.send_message(chat_id=target, text=banner_text)
-            except FloodWait as e:
-                wait_seconds = e.value
-                logger.warning(f"Worker user_{account_db_id}/ SmartFlow banner FloodWait ({wait_seconds}s).")
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"SmartFlow Banner FloodWait: {wait_seconds}s"
-                session.add(log_entry)
-                success_count += 1
-                await apply_adaptive_flood_wait(session=session, account_id=account_db_id, wait_seconds=wait_seconds)
-                await mark_global_slowdown(wait_seconds)
-                unsent_targets.extend(targets[i + 1:])
-                break
-            except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-                logger.warning(
-                    f"Worker user_{account_db_id}/ SmartFlow banner transient error on {target} "
-                    f"({e.__class__.__name__}: {e}); aborting chunk for Order #{order.id}, "
-                    f"{len(targets) - i - 1} target(s) re-queued."
-                )
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"SmartFlow Banner Transient: {e.__class__.__name__}: {e}"
-                session.add(log_entry)
-                success_count += 1
-                unsent_targets.extend(targets[i + 1:])
-                break
-            except Exception as e:
-                logger.error(f"Worker user_{account_db_id}/ SmartFlow banner error on {target}: {e}")
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"SmartFlow Banner: {e.__class__.__name__}: {e}"
-                session.add(log_entry)
-                success_count += 1
-                continue
-
-            logger.info(f"Worker user_{account_db_id}/ SmartFlow '{target}': seen={seen}; banner delivered.")
-
-        elif send_message_2:
-            # === منطق جریان ارسال عادی برای پیام دوم ===
-            await asyncio.sleep(await _humanized_send_delay())
-
-            if await daily_cap_reached(account_db_id, daily_limit):
-                logger.warning(
-                    f"Worker user_{account_db_id}/ reached DAILY_SEND_LIMIT_PER_ACCOUNT={daily_limit} "
-                    f"before message 2; aborting chunk for Order #{order.id}."
-                )
-                log_entry.status = LOG_STATUS_SUCCESS 
-                session.add(log_entry)
-                success_count += 1
-                unsent_targets.extend(targets[i + 1:])
-                break
-
-            banner_text = parse_spintax(safe_message_2)
-            if "[[FIRST_NAME]]" in banner_text or "[[USERNAME]]" in banner_text:
-                banner_text = banner_text.replace("[[FIRST_NAME]]", target_first_name).replace("[[USERNAME]]", target_username)
-
-            await incr_daily_sent_count(account_db_id)
-
-            try:
-                if order.media_2_path and order.media_2_type:
-                    if order.media_2_type == "photo":
-                        await client.send_photo(chat_id=target, photo=order.media_2_path, caption=banner_text)
-                    elif order.media_2_type == "video":
-                        await client.send_video(chat_id=target, video=order.media_2_path, caption=banner_text)
-                    elif order.media_2_type == "document":
-                        await client.send_document(chat_id=target, document=order.media_2_path, caption=banner_text)
-                else:
-                    await client.send_message(chat_id=target, text=banner_text)
-            except FloodWait as e:
-                wait_seconds = e.value
-                logger.warning(f"Worker user_{account_db_id}/ message-2 FloodWait ({wait_seconds}s).")
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"Message2 FloodWait: {wait_seconds}s"
-                session.add(log_entry)
-                success_count += 1
-                await apply_adaptive_flood_wait(session=session, account_id=account_db_id, wait_seconds=wait_seconds)
-                await mark_global_slowdown(wait_seconds)
-                unsent_targets.extend(targets[i + 1:])
-                break
-            except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-                logger.warning(
-                    f"Worker user_{account_db_id}/ message-2 transient error on {target} "
-                    f"({e.__class__.__name__}: {e}); aborting chunk for Order #{order.id}, "
-                    f"{len(targets) - i - 1} target(s) re-queued."
-                )
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"Message2 Transient: {e.__class__.__name__}: {e}"
-                session.add(log_entry)
-                success_count += 1
-                unsent_targets.extend(targets[i + 1:])
-                break
-            except Exception as e:
-                logger.error(f"Worker user_{account_db_id}/ message-2 error on {target}: {e}")
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"Message2: {e.__class__.__name__}: {e}"
-                session.add(log_entry)
-                success_count += 1
-                continue
-            
-            logger.info(f"Worker user_{account_db_id}/ Normal Flow: message 2 delivered to '{target}'.")
-
-        # ─── مرحله ۳: ارسال پیام سوم ───
-        if send_message_3:
-            await asyncio.sleep(await _humanized_send_delay())
-
-            if await daily_cap_reached(account_db_id, daily_limit):
-                logger.warning(
-                    f"Worker user_{account_db_id}/ reached DAILY_SEND_LIMIT_PER_ACCOUNT={daily_limit} "
-                    f"before message 3; aborting chunk for Order #{order.id}."
-                )
-                log_entry.status = LOG_STATUS_SUCCESS
-                session.add(log_entry)
-                success_count += 1
-                unsent_targets.extend(targets[i + 1:])
-                break
-
-            message_3_text = parse_spintax(safe_message_3)
-            if "[[FIRST_NAME]]" in message_3_text or "[[USERNAME]]" in message_3_text:
-                message_3_text = message_3_text.replace("[[FIRST_NAME]]", target_first_name).replace("[[USERNAME]]", target_username)
-
-            await incr_daily_sent_count(account_db_id)
-
-            try:
-                if order.media_3_path and order.media_3_type:
-                    if order.media_3_type == "photo":
-                        await client.send_photo(chat_id=target, photo=order.media_3_path, caption=message_3_text)
-                    elif order.media_3_type == "video":
-                        await client.send_video(chat_id=target, video=order.media_3_path, caption=message_3_text)
-                    elif order.media_3_type == "document":
-                        await client.send_document(chat_id=target, document=order.media_3_path, caption=message_3_text)
-                else:
-                    await client.send_message(chat_id=target, text=message_3_text)
-            except FloodWait as e:
-                wait_seconds = e.value
-                logger.warning(f"Worker user_{account_db_id}/ message-3 FloodWait ({wait_seconds}s).")
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"Message3 FloodWait: {wait_seconds}s"
-                session.add(log_entry)
-                success_count += 1
-                await apply_adaptive_flood_wait(session=session, account_id=account_db_id, wait_seconds=wait_seconds)
-                await mark_global_slowdown(wait_seconds)
-                unsent_targets.extend(targets[i + 1:])
-                break
-            except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-                logger.warning(
-                    f"Worker user_{account_db_id}/ message-3 transient error on {target} "
-                    f"({e.__class__.__name__}: {e}); aborting chunk for Order #{order.id}, "
-                    f"{len(targets) - i - 1} target(s) re-queued."
-                )
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"Message3 Transient: {e.__class__.__name__}: {e}"
-                session.add(log_entry)
-                success_count += 1
-                unsent_targets.extend(targets[i + 1:])
-                break
-            except Exception as e:
-                logger.error(f"Worker user_{account_db_id}/ message-3 error on {target}: {e}")
-                log_entry.status = LOG_STATUS_SUCCESS
-                log_entry.error_message = f"Message3: {e.__class__.__name__}: {e}"
-                session.add(log_entry)
-                success_count += 1
-                continue
-
-            logger.info(f"Worker user_{account_db_id}/ message 3 delivered to '{target}'.")
-
-        log_entry.status = LOG_STATUS_SUCCESS
-        session.add(log_entry)
-        success_count += 1
-        
-        await asyncio.sleep(await _humanized_send_delay())
-
-    copy_source_broken = (
-        copy_mode
-        and copy_attempts > 0
-        and source_error_count == copy_attempts
-        and success_count == 0
-    )
-    if copy_source_broken:
-        logger.error(
-            f"Order #{order.id}: ALL {copy_attempts} copy attempts of worker "
-            f"user_{account_db_id}/ failed with source-channel error "
-            f"({last_source_error}); marking order as error."
-        )
-        try:
-            await session.execute(
-                update(Order).where(Order.id == order.id).values(status=OrderStatus.error)
-            )
             session.add(OrderLog(
-                order_id=order.id,
-                account_id=account_db_id,
-                target="source_channel",
-                status=LOG_STATUS_ERROR,
-                error_message=(
-                    f"SourceChannel: کل chunk با خطای {last_source_error} شکست خورد — "
-                    "کانال مبدا حذف/بن شده یا کپی از آن محدود است."
-                ),
+                order_id=order.id, account_id=account_db_id, target=target, 
+                status=log_status, error_message=log_msg
             ))
+            
+            if account_row:
+                account_row.consecutive_errors += 1
+                max_errors = int(getattr(config, "MAX_CONSECUTIVE_ERRORS", 3))
+                if account_row.consecutive_errors >= max_errors:
+                    cooldown_mins = int(getattr(config, "COOLDOWN_MINUTES_ON_ERROR", 30))
+                    ret_time = datetime.now(timezone.utc) + timedelta(minutes=cooldown_mins)
+                    from workers.sender import change_account_status
+                    from database.models import AccountStatus
+                    await change_account_status(session, account_db_id, AccountStatus.cooldown, "Too many consecutive errors", log_msg, ret_time)
+                    stop_reason = "consecutive_errors"
+            
+            await session.commit()
+            await _report(status=f"⏳ قفل FloodWait — {wait_seconds} ثانیه صبر…", account=account_tag)
+            
+            from utils.limit_handler import register_account_limit
+            await register_account_limit(session, account_db_id, client, "flood_wait", wait_seconds)
+            
+            if not stop_reason:
+                stop_reason = "flood_wait"
+            
+            if stage_1_delivered:
+                unsent.extend(targets[position+1:])
+                sent_in_chunk += 1
+                await _bump_daily()
+                await incr_hourly_sent_count(account_db_id)
+            else:
+                unsent.extend(targets[position+1:])
+                
+            dismiss_seen_event(client, peer_id)
+            break
+
+        except PeerFlood as e:
+            log_status = "partial" if stage_1_delivered else "restricted"
+            log_msg = _log_attempt(log_status, "PeerFlood", "Spam Limit")
+            
+            session.add(OrderLog(
+                order_id=order.id, account_id=account_db_id, target=target, 
+                status=log_status, error_message=log_msg
+            ))
+            
+            from workers.sender import change_account_status
+            from database.models import AccountStatus
+            await change_account_status(session, account_db_id, AccountStatus.blocked, "Spam Limit (PeerFlood)", log_msg)
+            
+            await session.commit()
+            await _report(status="🚫 محدودیت اسپم (PeerFlood) — توقف ارسال و مسدود شدن اکانت…", account=account_tag)
+            
+            from utils.limit_handler import register_account_limit
+            await register_account_limit(session, account_db_id, client, "peer_flood")
+            
+            stop_reason = "blocked"
+            if stage_1_delivered:
+                unsent.extend(targets[position+1:])
+                sent_in_chunk += 1
+                await _bump_daily()
+                await incr_hourly_sent_count(account_db_id)
+            else:
+                unsent.extend(targets[position+1:])
+                
+            dismiss_seen_event(client, peer_id)
+            break
+
+        except (UserDeactivated, AuthKeyUnregistered, Unauthorized) as e:
+            err_type = e.__class__.__name__
+            log_status = "partial" if stage_1_delivered else "error"
+            log_msg = _log_attempt(log_status, err_type, str(e)[:100])
+            
+            session.add(OrderLog(
+                order_id=order.id, account_id=account_db_id, target=target, 
+                status=log_status, error_message=log_msg
+            ))
+            
+            from workers.sender import change_account_status
+            from database.models import AccountStatus
+            await change_account_status(session, account_db_id, AccountStatus.blocked, "Account Banned or Unregistered", str(e)[:100])
+            
+            await session.commit()
+            await _report(status="⛔️ اکانت بن یا از دسترس خارج شد!", account=account_tag)
+            
+            from utils.limit_handler import register_account_limit
+            await register_account_limit(session, account_db_id, client, "banned", is_banned=True)
+            
+            stop_reason = "blocked"
+            if stage_1_delivered:
+                unsent.extend(targets[position+1:])
+                sent_in_chunk += 1
+                await _bump_daily()
+                await incr_hourly_sent_count(account_db_id)
+            else:
+                unsent.extend(targets[position+1:])
+                
+            dismiss_seen_event(client, peer_id)
+            break
+
+        except (UserIsBlocked, PeerIdInvalid, UsernameInvalid, UsernameNotOccupied, UserIsBot, ValueError, KeyError) as e:
+            err_type = e.__class__.__name__
+            log_status = "partial" if stage_1_delivered else "error"
+            log_msg = _log_attempt(log_status, err_type, f"تارگت نامعتبر/حذف‌شده: {str(e)[:100]}")
+            
+            session.add(OrderLog(
+                order_id=order.id, account_id=account_db_id, target=target, 
+                status=log_status, error_message=log_msg
+            ))
+            await session.commit()
+            dismiss_seen_event(client, peer_id)
+            continue
+ 
+        except (
+            ConnectionError, 
+            TimeoutError, 
+            OSError, 
+            getattr(python_socks, 'ProxyError', ConnectionError),
+            getattr(python_socks, 'ProxyTimeoutError', TimeoutError),
+            getattr(python_socks, 'ProxyConnectionError', OSError)
+        ) as e:
+            err_type = e.__class__.__name__
+            log_status = "partial" if stage_1_delivered else "error"
+            log_msg = _log_attempt(log_status, err_type, f"قطعی ارتباط (پروکسی/شبکه): {str(e)[:100]}")
+            
+            session.add(OrderLog(
+                order_id=order.id, account_id=account_db_id, target=target, 
+                status=log_status, error_message=log_msg
+            ))
+            
+            if getattr(client, "proxy", None):
+                if account_row and account_row.proxy_string:
+                    from utils.health_checker import report_proxy_result
+                    asyncio.create_task(report_proxy_result(account_row.proxy_string, is_success=False))
+            
+            await session.commit()
+            await _report(status=f"⚠️ اتصال پروکسی قطع شد. توقف ارسال و انتقال موقت تارگت‌ها به وورکر بعدی...", account=account_tag)
+            
+            stop_reason = "proxy_connection_error"
+            if stage_1_delivered:
+                unsent.extend(targets[position+1:])
+                sent_in_chunk += 1
+                await _bump_daily()
+                await incr_hourly_sent_count(account_db_id)
+            else:
+                unsent.extend(targets[position:])
+                
+            dismiss_seen_event(client, peer_id)
+            break
+
         except Exception as e:
-            await session.rollback()
-            logger.error(f"Failed to mark Order #{order.id} as error (source channel): {e}")
+            err_type = e.__class__.__name__
+            
+            target_errors = [
+                "InputUserDeactivated", "ChatWriteForbidden", "UserNotMutualContact", 
+                "UserPrivacyRestricted", "YouBlockedUser", "ChannelPrivate", "ChatAdminRequired",
+                "NotAcceptable", "BadRequest"
+            ]
+            error_str = str(e).lower()
+            is_target_error = (
+                err_type in target_errors or 
+                "not occupied" in error_str or 
+                "invalid" in error_str or 
+                "not found" in error_str or 
+                "deactivated" in error_str or
+                "not acceptable" in error_str
+            )
+            
+            if is_target_error:
+                log_status = "partial" if stage_1_delivered else "error"
+                log_msg = _log_attempt(log_status, err_type, f"تارگت نامعتبر/غیرقابل ارسال: {str(e)[:100]}")
+                
+                session.add(OrderLog(
+                    order_id=order.id, account_id=account_db_id, target=target,
+                    status=log_status, error_message=log_msg,
+                ))
+                await session.commit()
+                dismiss_seen_event(client, peer_id)
+                continue
 
-    try:
-        await session.commit()
-    except Exception as db_err:
-        await session.rollback()
-        logger.error(f"Database commit failed for worker user_{account_db_id}/ chunk: {db_err}")
+            log_status = "partial" if stage_1_delivered else "error"
+            log_msg = _log_attempt(log_status, err_type, str(e)[:100])
+            
+            session.add(OrderLog(
+                order_id=order.id, account_id=account_db_id, target=target,
+                status=log_status, error_message=log_msg,
+            ))
+            
+            if account_row:
+                account_row.consecutive_errors += 1
+                max_errors = int(getattr(config, "MAX_CONSECUTIVE_ERRORS", 3))
+                if account_row.consecutive_errors >= max_errors:
+                    cooldown_mins = int(getattr(config, "COOLDOWN_MINUTES_ON_ERROR", 30))
+                    ret_time = datetime.now(timezone.utc) + timedelta(minutes=cooldown_mins)
+                    from workers.sender import change_account_status
+                    from database.models import AccountStatus
+                    await change_account_status(session, account_db_id, AccountStatus.cooldown, "Too many consecutive errors (Unknown)", log_msg, ret_time)
+                    stop_reason = "consecutive_errors"
+                    
+            try:
+                await session.commit()
+            except Exception as log_err:
+                await session.rollback()
+                logger.warning(f"Order #{order.id}: error log commit failed: {log_err}")
+            
+            if not stop_reason:
+                stop_reason = "error"
+            
+            if stage_1_delivered:
+                sent_in_chunk += 1
+                await _bump_daily()
+                await incr_hourly_sent_count(account_db_id)
+            else:
+                unsent.append(target)
+                
+            dismiss_seen_event(client, peer_id)
+            break
 
-    if copy_source_broken:
-        await _notify_admins_on_source_failure(session, order.id, last_source_error or "ChannelInvalid")
+        if stop_reason is None and position < len(targets) - 1:
+            await asyncio.sleep(await _pacing_delay())
 
-    logger.info(f"Worker user_{account_db_id}/ finished chunk for Order #{order.id}. Sent: {success_count}/{len(targets)}.")
-    
-    return unsent_targets
+    if sent_in_chunk > 0:
+        try:
+            await _get_redis().delete(f"source_fail:{order.id}")
+        except Exception:
+            pass
+
+    if sent_in_chunk > 0 and order.source_channel_id:
+        try:
+            from workers.task_queue import _mark_source_membership
+            await _mark_source_membership(account_db_id, order.source_channel_id)
+        except Exception as mark_err:
+            logger.debug(f"Could not mark source membership: {mark_err}")
+
+    logger.info(
+        f"Order #{order.id}: chunk finished for worker user_{account_db_id}/ "
+        f"(sent={sent_in_chunk}, unsent={len(unsent)}, stop={stop_reason})."
+    )
+    return unsent, stop_reason

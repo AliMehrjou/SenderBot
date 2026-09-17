@@ -12,6 +12,7 @@ from sqlalchemy import select, update, delete, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from utils.safe_edit import safe_edit_or_answer
+from workers.session_manager import worker_pool, remove_account_from_system, release_proxy_slot
 from pyrogram.raw.functions.account import GetAuthorizations
 from typing import Optional, List, Dict
 from database.models import Account, Category, Order, OrderLog, OrderStatus, APIKey
@@ -19,6 +20,10 @@ from bot.states.confirm_fsm import ConfirmStates
 from workers.session_manager import worker_pool
 from utils.advanced_anti_ban import terminate_other_sessions
 from utils.crypto import decrypt_session, build_session_file, mask_phone
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import case, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from database.models import OrderLog
 
 # 🟣 فاز ۷ (رفع بن‌بست FSM): helper های قبلی
 from bot.keyboards.main_menu import get_main_menu_keyboard, get_main_menu_button
@@ -89,24 +94,25 @@ def get_accounts_return_keyboard():
 # ==========================================
 # 📄 فاز ۴: شرط SQL فیلترهای لیست اکانت‌ها
 # ==========================================
-def _build_accounts_filter_conditions(filter_type: str, now: datetime):
+def _build_accounts_filter_conditions(filter_type: str, now_naive: datetime):
     """
     📄 فاز ۴: شرایط SQL هر فیلتر به‌صورت «لیست» (chain با AND).
-
-    خروجی None یعنی «همه» (بدون شرط). این لیست هم در کوئری COUNT و هم در
-    کوئری OFFSET/LIMIT استفاده می‌شود — پیش‌نیاز صفحه‌بندی در سطح دیتابیس.
     """
     if filter_type == "notreg":
         return [Account.session_string.is_(None)]
     if filter_type == "limited":
-        return [Account.is_banned == False, Account.flood_wait_until > now]
+        return [
+            Account.is_banned == False, 
+            Account.session_string.is_not(None), 
+            Account.flood_wait_until > now_naive
+        ]
     if filter_type == "active":
         return [Account.is_banned == False, Account.session_string.is_not(None)]
     if filter_type == "ability":
         return [
             Account.is_banned == False,
             Account.session_string.is_not(None),
-            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now),
+            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
         ]
     return None  # all
 
@@ -123,19 +129,9 @@ async def render_filtered_account_list(
     page: int = None,
     skip_answer: bool = False,
 ) -> None:
-    """
-    📋 لیست فیلتردار اکانت‌ها — 📄 فاز ۴:
-
-    - صفحه‌بندی به سطح دیتابیس منتقل شد (COUNT + OFFSET/LIMIT) — قبلاً
-      «همهٔ» اکانت‌های فیلترشده یک‌جا واکشی و در پایتون برش می‌خوردند
-      (با ۱۰هزار اکانت = واکشی ۱۰هزار ردیف برای نمایش ۱۰ تای آن!)
-    - دکمه‌های «🔄 بروزرسانی» (رفرش همان فیلتر/صفحه — همان callback ناوبری)
-      و «🔍 جستجو» اضافه شد
-    """
     if not skip_answer:
         await callback.answer()
 
-    # ۱. استخراج نوع فیلتر و شماره صفحه با Regex
     if filter_type is None or page is None:
         match = re.match(r"list_acc_filter_([a-z]+)_page_(\d+)/", callback.data)
         if not match:
@@ -144,22 +140,49 @@ async def render_filtered_account_list(
         page = int(match.group(2))
 
     now = datetime.now(timezone.utc)
+    now_naive = now.replace(tzinfo=None)
 
-    # --- مپ کردن نام فیلترها برای نمایش در هدر پیام ---
     filter_titles = {
         "all": "💢 تمام اکانت‌ها",
         "notreg": "⛔️ ثبت‌نام نشده",
         "limited": "❌ محدود شده",
         "active": "✅ فعال",
-        "ability": "♻️ آماده ارسال"
+        "ability": "♻️ آماده ارسال",
+        "cooldown": "💤 در حال استراحت" # 🟢 اضافه شدن تایتل جدید
     }
     display_title = filter_titles.get(filter_type, "لیست اکانت‌ها")
-    # -----------------------------------------------------------
 
-    # 📄 فاز ۴: شرایط فیلتر (مشترک بین COUNT و SELECT)
-    conditions = _build_accounts_filter_conditions(filter_type, now)
+    conditions = _build_accounts_filter_conditions(filter_type, now_naive)
 
-    # 🛡 فاز ۴: هر دو کوئری (شمارش + آیتم‌های صفحه) داخل حفاظ و در سطح DB
+    # 🟢 فاز جدید: اضافه کردن فیلتر Redis برای وضعیت استراحت (Cooldown)
+    try:
+        if filter_type in ["ability", "cooldown"]:
+            stmt_active = select(Account.id).where(
+                Account.is_banned == False,
+                Account.session_string.is_not(None)
+            )
+            active_ids = (await session.execute(stmt_active)).scalars().all()
+            cooldown_ids = []
+            if active_ids:
+                from workers.sender import _get_redis
+                redis_client = _get_redis()
+                pipe = redis_client.pipeline()
+                for aid in active_ids:
+                    pipe.exists(f"chunk_cooldown:{aid}")
+                results = await pipe.execute()
+                cooldown_ids = [aid for aid, res in zip(active_ids, results) if res]
+                
+            if filter_type == "cooldown":
+                if not cooldown_ids:
+                    conditions = [Account.id == -1] # شرط غیرممکن برای برگرداندن صفر نتیجه در صورت خالی بودن
+                else:
+                    conditions = [Account.id.in_(cooldown_ids)]
+            elif filter_type == "ability" and conditions is not None:
+                if cooldown_ids:
+                    conditions.append(Account.id.notin_(cooldown_ids)) # کسر استراحت‌کننده‌ها از لیست آماده ارسال
+    except Exception as e:
+        logger.error(f"Error filtering cooldown accounts: {e}")
+
     try:
         count_stmt = select(func.count(Account.id))
         list_stmt = (
@@ -185,31 +208,26 @@ async def render_filtered_account_list(
             callback, report_db_error("اکانت‌ها", e), get_main_menu_keyboard()
         )
 
-    # 📄 فاز ۴: ثبت زمینهٔ فعلی (بعد از clamp صفحه) برای بازگشت فلوی حذف
     if state is not None:
         await state.update_data(list_filter=filter_type, list_page=page)
 
     builder = InlineKeyboardBuilder()
 
-    # ── لیست خالی ──
     if total_accounts == 0:
         builder.button(text="🔍 جستجو با شماره", callback_data="search_accounts/")
         builder.button(text="🔙 بازگشت به داشبورد", callback_data="menu_list_accounts/")
         builder.adjust(1)
-        # 🛡 فاز ۴: ویرایش امن
         return await safe_edit_or_answer(
             callback.message,
             f"📋 <b>{display_title}</b>\n\n⚠️ هیچ اکانتی در این فیلتر یافت نشد.",
             reply_markup=builder.as_markup()
         )
 
-    # --- ساخت متن خروجی با هدر داینامیک ---
     text = (
         f"📋 <b>{display_title}</b>\n"
         f"🔢 مجموع: <b>{total_accounts}</b> اکانت\n"
         f"📄 صفحهٔ <b>{page}</b> از <b>{total_pages}</b>\n\n"
     )
-    # --------------------------------------------------
 
     for idx, acc in enumerate(current_accounts, start=offset + 1):
         if acc.is_banned:
@@ -220,6 +238,9 @@ async def render_filtered_account_list(
             status_badge = "⛔️ ثبت‌نام نشده"
         else:
             status_badge = "✅ فعال"
+            # 🟢 تغییر ایموجی برای لیست استراحت‌کننده‌ها
+            if filter_type == "cooldown":
+                 status_badge = "💤 در حال استراحت"
 
         cat_name = html.escape(acc.category.name) if acc.category else "بدون دسته"
 
@@ -237,13 +258,11 @@ async def render_filtered_account_list(
 
     text += "👇 برای حذف هر اکانت، روی دکمه مربوطه کلیک کنید:"
 
-    # ── ناوبری صفحات (📄 فاز ۴: زیرساخت مشترک — فرمت callback حفظ شده) ──
     add_pagination_nav_row(
         builder, page, total_pages,
         callback_prefix=f"list_acc_filter_{filter_type}_",
     )
 
-    # ── 📄 فاز ۴: 🔄 بروزرسانی (رفرش همان فیلتر/صفحه) + 🔍 جستجوی جدید ──
     builder.row(
         types.InlineKeyboardButton(
             text="🔄 بروزرسانی",
@@ -256,8 +275,8 @@ async def render_filtered_account_list(
         types.InlineKeyboardButton(text="🔙 بازگشت به داشبورد", callback_data="menu_list_accounts/")
     )
 
-    # 🛡 فاز ۴: ویرایش امن به جای edit_text خام
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
 
 
 # ==========================================
@@ -648,9 +667,9 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
         await cleanup_fsm_temp_files(state)
         await state.clear()
 
-    now = datetime.now(timezone.utc)
+    now_aware = datetime.now(timezone.utc)
+    now_naive = now_aware.replace(tzinfo=None)
 
-    # 🛡 فاز ۴ (مشکل ۱): هر ۵ کوئری شمارش بدون حفاظ بود
     try:
         # ۱. محاسبه آمار کل اکانت‌ها
         stmt_all = select(func.count(Account.id))
@@ -661,7 +680,11 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
         total_not_reg = (await session.execute(stmt_not_reg)).scalar() or 0
 
         # ۳. محاسبه اکانت‌های لیمیت شده
-        stmt_limited = select(func.count(Account.id)).where(Account.is_banned == False, Account.flood_wait_until > now)
+        stmt_limited = select(func.count(Account.id)).where(
+            Account.is_banned == False, 
+            Account.session_string.is_not(None),
+            Account.flood_wait_until > now_naive
+        )
         total_limited = (await session.execute(stmt_limited)).scalar() or 0
 
         # ۴. محاسبه اکانت‌های فعال
@@ -671,13 +694,31 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
         )
         total_active = (await session.execute(stmt_active)).scalar() or 0
 
-        # ۵. محاسبه اکانت‌های آماده ارسال
-        stmt_ability = select(func.count(Account.id)).where(
+        # ۵. دریافت آیدی اکانت‌های آماده ارسال برای بررسی در Redis
+        stmt_ability = select(Account.id).where(
             Account.is_banned == False,
             Account.session_string.is_not(None),
-            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now)
+            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive)
         )
-        total_ability = (await session.execute(stmt_ability)).scalar() or 0
+        ability_ids = (await session.execute(stmt_ability)).scalars().all()
+        
+        # 🟢 خواندن وضعیت Cooldown (استراحت) از Redis
+        total_cooldown = 0
+        if ability_ids:
+            from workers.sender import _get_redis
+            redis_client = _get_redis()
+            pipe = redis_client.pipeline()
+            for aid in ability_ids:
+                pipe.exists(f"chunk_cooldown:{aid}")
+            
+            results = await pipe.execute()
+            total_cooldown = sum(1 for res in results if res)
+
+        # 🟢 محاسبه تعداد واقعی اکانت‌های آماده ارسال (کسر استراحت‌کننده‌ها)
+        total_ability = len(ability_ids) - total_cooldown
+        if total_ability < 0:
+            total_ability = 0
+        
     except Exception as e:
         await session.rollback()
         return await answer_callback_error(
@@ -697,14 +738,18 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
     builder.button(text=f"❌ محدود شده ({total_limited})", callback_data="list_acc_filter_limited_page_1/")
     builder.button(text=f"♻️ آماده ارسال ({total_ability})", callback_data="list_acc_filter_ability_page_1/")
     builder.button(text=f"✅ فعال ({total_active})", callback_data="list_acc_filter_active_page_1/")
-    # 🔍 فاز ۴: ورود به فلوی جستجوی اکانت با شماره موبایل
+    
+    # 🟢 دکمه جدید برای اکانت‌های در حال استراحت
+    builder.button(text=f"💤 استراحت ({total_cooldown})", callback_data="list_acc_filter_cooldown_page_1/")
+    
     builder.button(text="🔍 جستجو با شماره", callback_data="search_accounts/")
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
 
-    builder.adjust(1, 2, 2, 1, 1)
+    # تنظیم چیدمان جدید دکمه‌ها
+    builder.adjust(1, 2, 2, 1, 1, 1)
 
-    # 🛡 فاز ۴: ویرایش امن
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
 
 # ==========================================
 # COMMAND HANDLERS: ACCOUNT ACTIONS
@@ -966,15 +1011,6 @@ async def confirm_delete_account_handler(callback: types.CallbackQuery, state: F
     # شد، خطای QUERY_ID_INVALID باعث کرش هندلرِ خطا نمی‌شود
     await safe_callback_answer(callback, "⏳ در حال پردازش...")
 
-    client = worker_pool.pop(acc_id, None)
-    if client:
-        try:
-            if client.is_connected:
-                await client.stop()
-            logger.info(f"Worker {acc_id} stopped and completely removed from RAM.")
-        except Exception as e:
-            logger.warning(f"Error stopping worker {acc_id} during memory cleanup: {e}")
-
     # 🛡 فاز ۴: خواندن اکانت از دیتابیس داخل حفاظ
     # (state عمداً پاک نمی‌شود — در خطای گذرا دکمه تأیید قابل استفاده مجدد می‌ماند)
     try:
@@ -995,8 +1031,16 @@ async def confirm_delete_account_handler(callback: types.CallbackQuery, state: F
     phone_display = str(acc.phone_number) if acc.phone_number else f"ID-{acc.id}"
 
     try:
+        old_proxy = acc.proxy_string
+        if old_proxy:
+            await release_proxy_slot(session, old_proxy)
+            
         await session.delete(acc)
         await session.commit()
+        
+        # 🔥 فراخوانی پاکسازی عمیق (توقف ورکر از RAM و حذف فایل سشن از هارد)
+        await remove_account_from_system(acc_id)
+        
     except Exception as e:
         # 🛡 فاز ۴ (مشکل ۱): پیام بر اساس نوع خطا
         await session.rollback()
@@ -1008,11 +1052,48 @@ async def confirm_delete_account_handler(callback: types.CallbackQuery, state: F
     await state.clear()
 
     await callback.message.answer(
-        f"✅ اکانت شماره <code>{phone_display}</code> با موفقیت از <b>دیتابیس</b> و <b>حافظه (RAM)</b> پاکسازی شد."
+        f"✅ اکانت شماره <code>{phone_display}</code> با موفقیت از <b>دیتابیس</b>، <b>حافظه (RAM)</b> و <b>سرور</b> پاکسازی شد."
     )
 
     # 🔍 فاز ۴: بازگشت به نمای درست
     return await _return_to_accounts_view(callback, session, state, fsm_data)
+
+async def render_throughput_stats(session: AsyncSession) -> str:
+    """
+    L-04 (Phase 6 / T6) — REAL throughput measured from the OrderLog table.
+
+    Counts actually-delivered messages (status='success') over the last 1h and
+    24h in ONE index-friendly query:
+
+        WHERE status = 'success' AND created_at >= <now - 24h>
+        + SUM(CASE WHEN created_at >= <now - 1h> THEN 1 ELSE 0 END)
+
+    Replaces the old cooldown-derived estimate (3600 / avg(SEND_DELAY_*)),
+    which was a guess, not a measurement.
+    """
+    # MySQL DATETIME columns come back naive; the system stores UTC everywhere,
+    # so build naive-UTC bounds to keep the comparison correct.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    one_hour_ago = now - timedelta(hours=1)
+    one_day_ago = now - timedelta(hours=24)
+
+    stmt = select(
+        func.sum(case((OrderLog.created_at >= one_hour_ago, 1), else_=0)),
+        func.count(OrderLog.id),
+    ).where(
+        OrderLog.status == "success",
+        OrderLog.created_at >= one_day_ago,
+    )
+
+    row = (await session.execute(stmt)).one()
+    last_1h = int(row[0] or 0)
+    last_24h = int(row[1] or 0)
+
+    return (
+        "🚀 <b>توان ارسال واقعی</b>\n"
+        f"├ ۱ ساعت گذشته: <b>{last_1h:,}</b> پیام\n"
+        f"└ ۲۴ ساعت گذشته: <b>{last_24h:,}</b> پیام\n"
+    )
 
 
 # ==========================================
@@ -1081,11 +1162,10 @@ async def delete_single_account(message: types.Message, state: FSMContext, sessi
 
 
 # ۳. هندلر بررسی وضعیت دقیق اکانت
-@router.message(F.text.regexp(r"^/status_(\d+)$"))
+# ۳. هندلر بررسی وضعیت دقیق اکانت (پشتیبانی از /status_id و /user_id)
+@router.message(F.text.regexp(r"^/(?:status|user)_(\d+)(?:/)?$"))
 async def show_account_status(message: types.Message, session: AsyncSession) -> None:
-    # 🛡 فاز ۱۰ (SEC-5): این دستور اطلاعات حساس اکانت را نشان می‌دهد → فقط ادمین اصلی.
-    # (توابع _is_main_admin / _MAIN_ADMIN_ID در ادامهٔ همین فایل تعریف شده‌اند؛
-    #  چون هندلر در «زمان اجرا» صدا زده می‌شود، ارجاع forward-reference مشکلی ندارد.)
+    # 🛡 فاز ۱۰ (SEC-5): این دستور اطلاعات حساس اکانت را نشان می‌دهد ← فقط ادمین اصلی.
     if not _is_main_admin(message.from_user):
         if _MAIN_ADMIN_ID is None:
             return await message.answer(
@@ -1093,7 +1173,8 @@ async def show_account_status(message: types.Message, session: AsyncSession) -> 
             )
         return await message.answer("⛔️ فقط ادمین اصلی اجازهٔ استفاده از این دستور را دارد.")
 
-    match = re.match(r"^/status_(\d+)$", message.text)
+    # دریافت آیدی از هر دو فرمت status و user
+    match = re.match(r"^/(?:status|user)_(\d+)(?:/)?$", message.text)
     if not match:
         return
 
@@ -1617,7 +1698,6 @@ async def terminate_account_sessions(message: types.Message, session: AsyncSessi
             reply_markup=get_back_keyboard()
         )
 
-
 # ==========================================
 # 13. HANDLER: Global Stats Dashboard
 # ==========================================
@@ -1628,8 +1708,9 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
     await cleanup_fsm_temp_files(state)
     await state.clear()
 
-    now = datetime.now(timezone.utc)
-    start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    now_aware = datetime.now(timezone.utc)
+    now_naive = now_aware.replace(tzinfo=None)
+    start_of_today = now_aware.replace(hour=0, minute=0, second=0, microsecond=0)
     start_of_yesterday = start_of_today - timedelta(days=1)
 
     try:
@@ -1661,14 +1742,39 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
 
         # اضافه شدن شرط غیرمسدود بودن اکانت (برای هم‌خوانی با acc_active)
         acc_limited = await session.scalar(
-            select(func.count(Account.id)).where(Account.is_banned == False, Account.flood_wait_until > now)
+            select(func.count(Account.id)).where(
+                Account.is_banned == False, 
+                Account.session_string.is_not(None),
+                Account.flood_wait_until > now_naive
+            )
         ) or 0
 
         acc_not_reg = await session.scalar(
             select(func.count(Account.id)).where(Account.session_string.is_(None))
         ) or 0
 
-        acc_ability = acc_active - acc_limited
+        # 🟢 1. دریافت لیست اکانت‌های فعال برای بررسی در Redis
+        stmt_all_active_accs = select(Account.id).where(
+            Account.is_banned == False, 
+            Account.session_string.is_not(None)
+        )
+        all_active_acc_ids = (await session.execute(stmt_all_active_accs)).scalars().all()
+        
+        # 🟢 2. بررسی Redis برای یافتن اکانت‌هایی که در حال استراحت دوره‌ای هستند
+        acc_cooldown = 0
+        if all_active_acc_ids:
+            from workers.sender import _get_redis
+            redis_client = _get_redis()
+            
+            pipe = redis_client.pipeline()
+            for aid in all_active_acc_ids:
+                pipe.exists(f"chunk_cooldown:{aid}")
+            
+            cooldown_results = await pipe.execute()
+            acc_cooldown = sum(1 for res in cooldown_results if res)
+
+        # 🟢 3. محاسبه و اصلاح نهایی «آماده ارسال»
+        acc_ability = acc_active - acc_limited - acc_cooldown
         if acc_ability < 0:
             acc_ability = 0
 
@@ -1677,6 +1783,9 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
         except Exception as e:
             logger.error(f"Error counting APIKeys: {e}")
             total_api = 0
+            
+        # L-04 (Phase 6 / T6): محاسبه توان ارسال واقعی
+        throughput_text = await render_throughput_stats(session)
 
     except Exception as e:
         await session.rollback()
@@ -1685,6 +1794,7 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
             reply_markup=get_back_keyboard()
         )
 
+    # 🟢 اضافه کردن acc_cooldown به متن خروجی
     stats_text = (
         "📊 <b>آمار سیستم</b>\n\n"
 
@@ -1698,9 +1808,12 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
         f"✅ فعال: {acc_active}\n"
         f"♻️ آماده ارسال: {acc_ability}\n"
         f"⚠️ محدود شده: {acc_limited}\n"
+        f"💤 در حال استراحت: {acc_cooldown}\n"
         f"⛔️ ثبت نشده: {acc_not_reg}\n\n"
 
-        f"🔘 <b>تعداد APIها:</b> {total_api}"
+        f"🔘 <b>تعداد APIها:</b> {total_api}\n\n"
+        
+        f"{throughput_text}"
     )
 
     builder = InlineKeyboardBuilder()
@@ -1711,3 +1824,101 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
     builder.adjust(1, 2)
 
     await safe_edit_message(callback.message, stats_text, reply_markup=builder.as_markup())
+
+
+# کد جدید (به انتهای فایل stats_handlers.py اضافه شود)
+@router.message(F.text.regexp(r"^/orderstats_(\d+)$"))
+async def show_detailed_order_stats(message: types.Message, session: AsyncSession) -> None:
+    """
+    فاز ۳: گزارش‌گیری دقیق آمار هر سفارش و سهم هر اکانت مستقیماً از روی ردیف‌های OrderLog.
+    این هندلر شمارنده‌های کش‌شده را نادیده می‌گیرد و واقعیت دیتابیس را بازسازی می‌کند.
+    """
+    # 🛡 دسترسی فقط برای ادمین اصلی
+    if not _is_main_admin(message.from_user):
+        if _MAIN_ADMIN_ID is None:
+            return await message.answer("⛔️ دسترسی محدود: شناسهٔ ادمین اصلی تنظیم نشده است.")
+        return await message.answer("⛔️ فقط ادمین اصلی اجازه دسترسی به این گزارش را دارد.")
+
+    match = re.match(r"^/orderstats_(\d+)$", message.text)
+    if not match:
+        return
+        
+    order_id = int(match.group(1))
+    
+    wait_msg = await message.answer("⏳ در حال استخراج و بازسازی آمار مستقیم از OrderLog...")
+
+    try:
+        # ۱. بررسی وجود سفارش
+        order = await session.get(Order, order_id)
+        if not order:
+            return await safe_edit_message(wait_msg, "⚠️ سفارشی با این شناسه در سیستم یافت نشد.")
+
+        # ۲. محاسبه آمار کلی سفارش با Group By روی status
+        status_stmt = (
+            select(OrderLog.status, func.count(OrderLog.id))
+            .where(OrderLog.order_id == order_id)
+            .group_by(OrderLog.status)
+        )
+        status_rows = (await session.execute(status_stmt)).all()
+
+        stats = {"success": 0, "error": 0, "flood": 0, "restricted": 0, "partial": 0}
+        total_logs = 0
+        for st, cnt in status_rows:
+            # مپ کردن مقادیر برای اطمینان
+            safe_st = st if st in stats else "error"
+            stats[safe_st] += cnt
+            total_logs += cnt
+
+        # ۳. محاسبه آمار تفکیکی هر اکانت با Group By روی account_id و status
+        acc_stmt = (
+            select(OrderLog.account_id, OrderLog.status, func.count(OrderLog.id))
+            .where(OrderLog.order_id == order_id)
+            .group_by(OrderLog.account_id, OrderLog.status)
+        )
+        acc_rows = (await session.execute(acc_stmt)).all()
+
+        acc_stats = {}
+        for acc_id, st, cnt in acc_rows:
+            if acc_id not in acc_stats:
+                acc_stats[acc_id] = {"success": 0, "error": 0, "flood": 0, "restricted": 0, "partial": 0, "total": 0}
+            safe_st = st if st in acc_stats[acc_id] else "error"
+            acc_stats[acc_id][safe_st] += cnt
+            acc_stats[acc_id]["total"] += cnt
+
+        # ۴. قالب‌بندی گزارش خروجی
+        status_val = order.status.value if hasattr(order.status, 'value') else order.status
+        
+        report = (
+            f"📊 <b>گزارش دقیق و بازسازی‌شده سفارش #{order_id}</b>\n\n"
+            f"🔸 <b>وضعیت فعلی سفارش:</b> <code>{status_val}</code>\n"
+            f"🔢 <b>مجموع تلاش‌های ثبت‌شده:</b> <b>{total_logs}</b>\n\n"
+            f"📈 <b>آمار کل (مبتنی بر لاگ):</b>\n"
+            f"✅ موفق کامل: <code>{stats['success']}</code>\n"
+            f"⚠️ موفق جزئی: <code>{stats['partial']}</code>\n"
+            f"❌ خطای ارسال: <code>{stats['error']}</code>\n"
+            f"⏳ محدودیت (FloodWait): <code>{stats['flood']}</code>\n"
+            f"🚫 محدودیت اسپم (PeerFlood): <code>{stats['restricted']}</code>\n\n"
+            f"🤖 <b>تفکیک عملکرد اکانت‌ها (Workers):</b>\n"
+        )
+
+        if not acc_stats:
+            report += "<i>هیچ رکوردی برای این سفارش در لاگ ثبت نشده است.</i>"
+        else:
+            for acc_id, ast in acc_stats.items():
+                acc_label = f"user_{acc_id}/" if acc_id else "سیستم"
+                report += (
+                    f"▫️ <b>{acc_label}</b> ➜ "
+                    f"موفق: <code>{ast['success']}</code> | "
+                    f"جزئی: <code>{ast['partial']}</code> | "
+                    f"خطا: <code>{ast['error']}</code> | "
+                    f"محدودیت: <code>{ast['flood']}</code> | "
+                    f"اسپم: <code>{ast['restricted']}</code> "
+                    f"(کل: <b>{ast['total']}</b>)\n"
+                )
+
+        await safe_edit_message(wait_msg, report)
+
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Error generating detailed order stats for #{order_id}: {e}", exc_info=True)
+        await safe_edit_message(wait_msg, f"❌ خطا در تولید گزارش: {e}")

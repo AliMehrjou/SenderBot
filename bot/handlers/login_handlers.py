@@ -6,6 +6,8 @@ import asyncio
 from typing import Dict, Optional, Tuple
 from contextlib import suppress
 import html
+import os
+import uuid
 from sqlalchemy import text
 from utils.advanced_anti_ban import terminate_other_sessions
 from aiogram import Router, types, F
@@ -18,6 +20,9 @@ from pyrogram.errors import (
     PhoneCodeExpired,
     PasswordHashInvalid
 )
+from utils.health_checker import report_proxy_result
+from sqlalchemy import or_
+from pyrogram.errors import AuthKeyUnregistered, SessionRevoked, UserDeactivated, UserDeactivatedBan, Unauthorized, AuthKeyDuplicated
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from workers.session_manager import (
@@ -45,7 +50,7 @@ from utils.fsm_cleanup import cleanup_fsm_temp_files
 from aiogram.filters import Command
 from datetime import datetime, timedelta, timezone
 from workers.session_manager import warmup_hours
-
+import tempfile
 _KNOWN_MENU_BUTTON_TEXTS = {t for row in MAIN_MENU_LAYOUT for t in row} | {"❌ انصراف"}
 from utils.safe_edit import safe_edit_or_answer
 
@@ -276,9 +281,6 @@ async def enter_add_account_flow(callback: types.CallbackQuery, state: FSMContex
 async def process_category_selection(callback: types.CallbackQuery, state: FSMContext) -> None:
     raw_id = callback.data.replace("logincat_", "").replace("/", "")
     if not raw_id.isdigit():
-        # 🟣 فاز ۲: خطا به صورت Alert نمایش داده می‌شود تا پیام انتخاب دسته‌بندی
-        # (به همراه کیبوردش) دست‌نخورده بماند و کاربر بتواند انتخاب را تکرار کند.
-        # (قبلاً با answer پیام جدیدی ارسال می‌شد و UI تکراری ایجاد می‌شد)
         return await callback.answer("⚠️ خطای نامعتبر در انتخاب دسته‌بندی.", show_alert=True)
 
     await callback.answer()
@@ -286,18 +288,24 @@ async def process_category_selection(callback: types.CallbackQuery, state: FSMCo
     category_id = int(raw_id)
     await state.update_data(category_id=category_id)
 
-    await state.set_state(LoginStates.waiting_for_phone)
+    await state.set_state(LoginStates.waiting_for_login_method)
     
-    with suppress(Exception):
-        await callback.message.delete()
-        
-    await callback.message.answer(
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📱 با شماره تلفن", callback_data="login_method_phone/")
+    builder.button(text="🔑 با StringSession", callback_data="login_method_session/")
+    builder.adjust(2)
+    builder.row(
+        types.InlineKeyboardButton(text="❌ انصراف", callback_data="cancel_login_flow/"),
+        types.InlineKeyboardButton(text="🏛 منوی اصلی", callback_data="menu_home/"),
+    )
+    
+    await safe_edit_or_answer(
+        callback.message,
         with_cancel_hint(
-            "📱 <b>اضافه کردن اکانت جدید</b>\n\n"
-            "لطفاً شماره موبایل را با فرمت بین‌المللی ارسال کنید.\n"
-            "<i>مثال: +1234567890</i>"
+            "⚙️ <b>انتخاب روش افزودن اکانت</b>\n\n"
+            "لطفاً مشخص کنید قصد دارید اکانت را چگونه وارد کنید:"
         ),
-        reply_markup=types.ReplyKeyboardRemove()
+        reply_markup=builder.as_markup()
     )
 
 
@@ -307,6 +315,7 @@ async def process_category_selection(callback: types.CallbackQuery, state: FSMCo
 # ==========================================
 # STATE: WAITING FOR PHONE
 # ==========================================
+
 @router.message(LoginStates.waiting_for_phone, F.text)
 async def process_phone_number(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
     phone_number = message.text.strip()
@@ -344,10 +353,8 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
 
     # بازخورد فوری به کاربر
     ack_msg = await message.answer(
-        f"✅ شماره <code>{phone_number}</code> دریافت شد.\n⏳ در حال اتصال به تلگرام و ارسال کد تایید..."
+        f"✅ شماره <code>{phone_number}</code> دریافت شد.\n⏳ در حال اتصال به تلگرام و تخصیص پروکسی لاگین..."
     )
-
-    admin_id = message.from_user.id
 
     settings_stmt = select(GlobalSettings).limit(1)
     settings = await session.scalar(settings_stmt)
@@ -396,34 +403,59 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
     active_api_hash = str(api_obj.api_hash)
     db_api_key_id = int(api_obj.id)
 
-    proxy_string = await claim_proxy_for_account(session, None)
+    # 🟢 دریافت پروکسی اختصاصی لاگین بدون اشغال ظرفیت (کوئری دو مرحله‌ای)
+    stmt_total_login_proxies = select(func.count(Proxy.id)).where(Proxy.usage_type.in_(("login", "both")))
+    total_login_proxies = await session.scalar(stmt_total_login_proxies) or 0
 
-    if not proxy_string:
-        await state.clear()
-        await release_login_reservations(admin_id, session)
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⚙️ رفتن به تنظیمات", callback_data="menu_settings/")
-        builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-        builder.adjust(2)
-        return await safe_edit_or_answer(
-            ack_msg,
-            "🚨 <b>اخطار امنیتی (IP Leak Guard):</b>\n\n"
-            "هیچ پراکسی سالم و فعالی با ظرفیت آزاد در دیتابیس یافت نشد! "
-            f"(سقف MAX_ACCOUNTS_PER_PROXY={config.MAX_ACCOUNTS_PER_PROXY})\n"
-            "برای جلوگیری از مسدود شدن سرور (Chain Ban)، عملیات لاگین متوقف شد.\n"
-            "<i>لطفاً ابتدا از منوی تنظیمات، لیست پراکسی‌های خود را شارژ کنید.</i>",
-            reply_markup=builder.as_markup()
+    proxy_string = None
+    proxy_dict = None
+
+    if total_login_proxies == 0:
+        from workers.session_manager import login_proxy_dict
+        env_proxy_dict = login_proxy_dict()
+        
+        if env_proxy_dict:
+            proxy_string = getattr(config, "LOGIN_PROXY_URL", "")
+            proxy_dict = env_proxy_dict
+        else:
+            await state.clear()
+            await release_login_reservations(admin_id, session)
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⚙️ رفتن به تنظیمات", callback_data="menu_settings/")
+            builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
+            builder.adjust(2)
+            return await safe_edit_or_answer(
+                ack_msg,
+                "شما هنوز هیچ پروکسی لاگینی در سیستم ثبت نکرده‌اید. لطفاً ابتدا از بخش تنظیمات یک پروکسی لاگین ثبت کنید یا متغیر LOGIN_PROXY_URL را مقداردهی نمایید.",
+                reply_markup=builder.as_markup()
+            )
+    else:
+        stmt_login_proxy = (
+            select(Proxy)
+            .where(Proxy.usage_type.in_(("login", "both")), Proxy.is_active == True, Proxy.health_state != "DEAD")
+            .order_by(func.random())
+            .limit(1)
         )
-
-    proxy_dict = parse_proxy_string(proxy_string)
+        login_proxy_obj = await session.scalar(stmt_login_proxy)
+        
+        if not login_proxy_obj:
+            await state.clear()
+            await release_login_reservations(admin_id, session)
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⚙️ رفتن به تنظیمات", callback_data="menu_settings/")
+            builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
+            builder.adjust(2)
+            return await safe_edit_or_answer(
+                ack_msg,
+                "شما پروکسی لاگین در سیستم دارید، اما در حال حاضر همگی از دسترس خارج (DEAD) شده‌اند. لطفاً وضعیت سرور پروکسی خود را بررسی کنید.",
+                reply_markup=builder.as_markup()
+            )
+            
+        proxy_string = login_proxy_obj.proxy_string
+        proxy_dict = parse_proxy_string(proxy_string)
+    
     if not proxy_dict:
-        logger.error(f"Claimed proxy for admin {admin_id} is malformed after claim.")
-        try:
-            await mark_proxy_failed(session, proxy_string)
-            await release_proxy_slot(session, proxy_string)
-            await session.commit()
-        except Exception:
-            await session.rollback()
+        logger.error(f"Login proxy for admin {admin_id} is malformed.")
         await state.clear()
         await release_login_reservations(admin_id, session)
         builder = InlineKeyboardBuilder()
@@ -432,44 +464,20 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
         builder.adjust(2)
         return await safe_edit_or_answer(
             ack_msg,
-            "🚨 <b>اخطار امنیتی (IP Leak Guard):</b>\n\n"
-            "پراکسیِ انتخاب‌شده معتبر نیست (parse نشد). عملیات لاگین متوقف شد.",
+            "🚨 <b>اخطار امنیتی:</b>\n\n"
+            "پراکسی لاگین یافت شده معتبر نیست (parse نشد). عملیات متوقف شد.",
             reply_markup=builder.as_markup()
         )
-
-    try:
-        await session.commit()
-    except Exception as commit_err:
-        logger.error(f"Failed to commit proxy claim for admin {admin_id}: {commit_err}")
-        await session.rollback()
-        await state.clear()
-        await release_login_reservations(admin_id, session)
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⚙️ رفتن به تنظیمات", callback_data="menu_settings/")
-        builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-        builder.adjust(2)
-        return await safe_edit_or_answer(
-            ack_msg,
-            "❌ <b>خطا:</b> امکان ثبت رزرو پراکسی وجود ندارد.\n\n"
-            "<i>لطفاً پس از چند لحظه دوباره تلاش کنید.</i>",
-            reply_markup=builder.as_markup()
-        )
-
-    _reserve_proxy_slot(admin_id, proxy_string)
 
     device_model = random.choice(DEVICE_MODELS)
     system_version = random.choice(SYSTEM_VERSIONS)
     app_version = random.choice(APP_VERSIONS)
 
     for attempt in range(2):
-
-        safe_api_id = int(active_api_id)
-        safe_api_hash = str(active_api_hash)
-
         client = Client(
             name=f"temp_{admin_id}",
-            api_id=safe_api_id,
-            api_hash=safe_api_hash,
+            api_id=active_api_id,
+            api_hash=active_api_hash,
             proxy=proxy_dict,
             in_memory=True,
             device_model=str(device_model),
@@ -484,19 +492,16 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
             await asyncio.wait_for(client.connect(), timeout=45)
             sent_code = await asyncio.wait_for(client.send_code(phone_number), timeout=45)
             
-            # گارد جلوگیری از رقابت: اگر کاربر وسط connect کنسل کرده باشد، state خالی است.
-            # گارد جلوگیری از رقابت: اگر کاربر وسط connect کنسل کرده باشد، state خالی است.
             if await state.get_state() is None:
                 return
 
-            # +++ اصلاح قطعی باگ struct.error +++
-            # چون اکانت هنوز لاگین نیست، user_id خالی است. یک عدد موقت می‌دهیم تا کرش نکند.
+            # رفع باگ struct.error
             if await client.storage.user_id() is None:
                 await client.storage.user_id(0)
-            # +++++++++++++++++++++++++++++++++++
 
             temp_session = await client.export_session_string()
 
+            # ذخیره پروکسی لاگین فقط به عنوان سابقه موقت در FSM
             await state.update_data(
                 phone_number=phone_number,
                 phone_code_hash=sent_code.phone_code_hash,
@@ -521,46 +526,37 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
 
         except Exception as e:
             logger.error(f"Failed to send code for {mask_phone(phone_number)} (Attempt {attempt+1}): {e}")
-            await session.rollback()
-            try:
-                await mark_proxy_failed(session, proxy_string)
-                await release_proxy_slot(session, proxy_string)
-                await session.commit()
-                _active_proxy_reservations.pop(admin_id, None)
-            except Exception as proxy_err:
-                logger.error(f"Failed to mark/release proxy {proxy_string}: {proxy_err}")
-                await session.rollback()
-            finally:
-                await cleanup_client(admin_id)
+            await cleanup_client(admin_id)
+
+            # ارسال سیگنال خرابی برای پروکسی بلافاصله پس از بروز خطا
+            if proxy_string:
+                asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
 
             if attempt == 0:
-                proxy_string = await claim_proxy_for_account(session, None)
-                if not proxy_string:
-                    e = Exception("No active proxy available for retry.")
+                # تلاش با یک پروکسی لاگین جایگزین در صورت بروز خطا
+                stmt_retry = (
+                    select(Proxy)
+                    .where(Proxy.usage_type.in_(("login", "both")), Proxy.is_active == True, Proxy.is_healthy == True, Proxy.proxy_string != proxy_string)
+                    .order_by(func.random())
+                    .limit(1)
+                )
+                # اعمال همان شروط (both و is_active) برای دریافت پراکسی جایگزین در مسیر خطا.
+                retry_proxy = await session.scalar(stmt_retry)
+                if not retry_proxy:
+                    e = Exception("پروکسی لاگین جایگزین سالمی برای تلاش مجدد یافت نشد. لطفاً در دیتابیس پراکسی جدید اضافه کنید یا متغیر LOGIN_PROXY_URL را ست کنید.")
                 else:
+                    proxy_string = retry_proxy.proxy_string
                     proxy_dict = parse_proxy_string(proxy_string)
                     if not proxy_dict:
-                        try:
-                            await mark_proxy_failed(session, proxy_string)
-                            await release_proxy_slot(session, proxy_string)
-                            await session.commit()
-                        except Exception:
-                            await session.rollback()
-                        e = Exception("Malformed backup proxy.")
+                        e = Exception("پروکسی لاگین جایگزین نامعتبر است.")
                     else:
-                        try:
-                            await session.commit()
-                            _reserve_proxy_slot(admin_id, proxy_string)
-                            continue
-                        except Exception as commit_err:
-                            await session.rollback()
-                            e = commit_err
+                        continue
 
             await state.clear()
             await release_login_reservations(admin_id, session)
             
             if isinstance(e, asyncio.TimeoutError):
-                error_text = "⏱ مهلت اتصال به تلگرام (۴۵ ثانیه) به پایان رسید. پراکسی مربوطه موقتاً کنار گذاشته شد. لطفاً دوباره تلاش کنید."
+                error_text = "⏱ مهلت اتصال به تلگرام (۴۵ ثانیه) به پایان رسید. به دلیل کندی شبکه ارتباط قطع شد. لطفاً دوباره تلاش کنید."
             else:
                 error_text = f"❌ <b>خطا:</b> امکان ارسال کد وجود ندارد.\n\n<code>{html.escape(str(e))}</code>\n\n<i>برای تلاش مجدد، از منوی اصلی دوباره «اضافه کردن اکانت» را انتخاب کنید.</i>"
 
@@ -570,6 +566,41 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
                 reply_markup=get_main_menu_keyboard()
             )
             break
+
+
+@router.callback_query(LoginStates.waiting_for_login_method, F.data == "login_method_phone/")
+async def method_phone_selected(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(LoginStates.waiting_for_phone)
+    
+    with suppress(Exception):
+        await callback.message.delete()
+        
+    await callback.message.answer(
+        with_cancel_hint(
+            "📱 <b>اضافه کردن اکانت جدید</b>\n\n"
+            "لطفاً شماره موبایل را با فرمت بین‌المللی ارسال کنید.\n"
+            "<i>مثال: +1234567890</i>"
+        ),
+        reply_markup=get_login_cancel_keyboard()
+    )
+
+@router.callback_query(LoginStates.waiting_for_login_method, F.data == "login_method_session/")
+async def method_session_selected(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(LoginStates.waiting_for_string_session)
+    
+    with suppress(Exception):
+        await callback.message.delete()
+        
+    await callback.message.answer(
+        with_cancel_hint(
+            "🔑 <b>افزودن اکانت با StringSession یا فایل</b>\n\n"
+            "لطفاً رشته متنی StringSession و یا <b>فایل <code>.session</code></b> خود را (به صورت Document) ارسال کنید:"
+        ),
+        reply_markup=get_login_cancel_keyboard()
+    )
+
 
 # ==========================================
 # STATE: WAITING FOR CODE
@@ -655,6 +686,8 @@ async def process_auth_code(message: types.Message, state: FSMContext, session: 
         await finalize_login_and_save(message, state, session, client, phone_number, code)
 
     except asyncio.TimeoutError:
+        if proxy_string:
+            asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
         # بدون ریست state
         await message.answer("⏱ مهلت پاسخگویی تلگرام به پایان رسید. لطفاً چند لحظه بعد دوباره کد را ارسال کنید.")
         
@@ -698,6 +731,8 @@ async def process_auth_code(message: types.Message, state: FSMContext, session: 
 
     except Exception as e:
         logger.error(f"Sign in error: {e}")
+        if proxy_string:
+            asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
         await state.clear()
         await release_login_reservations(admin_id, session)
         await message.answer(
@@ -708,6 +743,7 @@ async def process_auth_code(message: types.Message, state: FSMContext, session: 
     finally:
         if client.is_connected:
             await client.disconnect()
+
 
 # ==========================================
 # STATE: WAITING FOR PASSWORD (2FA)
@@ -793,6 +829,8 @@ async def process_2fa_password(message: types.Message, state: FSMContext, sessio
         await finalize_login_and_save(message, state, session, client, phone_number, last_login_code, password)
         
     except asyncio.TimeoutError:
+        if proxy_string:
+            asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
         # بدون ریست state
         await message.answer("⏱ مهلت پاسخگویی تلگرام به پایان رسید. لطفاً چند لحظه بعد دوباره رمز را ارسال کنید.")
         
@@ -815,6 +853,8 @@ async def process_2fa_password(message: types.Message, state: FSMContext, sessio
         
     except Exception as e:
         logger.error(f"Password error: {e}")
+        if proxy_string:
+            asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
         await state.clear()
         _release_admin_reservation(admin_id)
         await _release_admin_proxy_slot(admin_id)
@@ -829,8 +869,6 @@ async def process_2fa_password(message: types.Message, state: FSMContext, sessio
             await progress.delete()
         if client.is_connected:
             await client.disconnect()
-
-
 # ==========================================
 # UTILITY: FINALIZE & SAVE TO DB (آپدیت شده با تنظیمات On/Off)
 # ==========================================
@@ -907,6 +945,9 @@ async def finalize_login_and_save(
         session_string = await client.export_session_string()
         encrypted_session = encrypt_session(session_string)
         
+        # دریافت پروکسی ورکر برای ثبت نهایی تا اکانت به پروکسی لاگین گره نخورد
+        worker_proxy = await claim_proxy_for_account(session, None)
+        
         # دریافت اطلاعات زنده برای ذخیره در دیتابیس و نمایش در پیام
         me = None
         try:
@@ -920,7 +961,9 @@ async def finalize_login_and_save(
             session_string=encrypted_session,
             category_id=category_id,
             api_id=db_api_key_id,
-            proxy_string=fsm_data.get("proxy_string"),
+            proxy_string=worker_proxy,
+            proxy_status="ASSIGNED" if worker_proxy else "WAITING_PROXY",
+            proxy_queue_joined_at=None if worker_proxy else datetime.now(timezone.utc),
             is_banned=False,
             last_login_code=encrypt_session(last_login_code) if last_login_code else None,
             two_step_password=encrypt_session(two_step_password) if two_step_password else None,
@@ -943,7 +986,10 @@ async def finalize_login_and_save(
             termination_attempted = True
             sessions_terminated = await terminate_other_sessions(client)
 
-        started = await start_single_worker(new_account, session)
+        if not worker_proxy:
+            started = False
+        else:
+            started = await start_single_worker(new_account, session)
 
         if started:
             login_success = True
@@ -986,7 +1032,7 @@ async def finalize_login_and_save(
             await message.answer(msg, reply_markup=builder.as_markup())
         else:
             await message.answer(
-                f"⚠️ <b>اکانت اضافه شد اما روشن نشد!</b>\n\nلطفاً وضعیت پراکسی‌ها را بررسی کنید.",
+                f"⚠️ اکانت اضافه شد اما در حال حاضر به شبکه متصل نشد!\nسیستم در پس‌زمینه به صورت خودکار تلاش می‌کند تا آن را متصل کند.",
                 reply_markup=get_main_menu_keyboard()
             )
 
@@ -1048,7 +1094,9 @@ async def cleanup_client(admin_id: int) -> None:
     if client:
         try:
             if client.is_connected:
-                await client.disconnect()
+                await asyncio.wait_for(client.disconnect(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning("Timeout while disconnecting temporary client.")
         except Exception as e:
             logger.warning(f"Error disconnecting temporary client: {e}")
 
@@ -1067,43 +1115,57 @@ async def enter_import_flow(message: types.Message, state: FSMContext, session: 
     await _release_admin_proxy_slot(admin_id)
 
     await state.set_state(LoginStates.waiting_for_string_session)
+# متن پیام را در هر دو تابع به این شکل تغییر دهید:
     await message.answer(
         with_cancel_hint(
-            "🔑 <b>افزودن اکانت با StringSession</b>\n\n"
-            "لطفاً رشته StringSession (پشتیبانی شده در Pyrogram/Pyrofork) را ارسال کنید:"
+            "🔑 <b>افزودن اکانت با StringSession یا فایل</b>\n\n"
+            "لطفاً رشته متنی StringSession و یا <b>فایل <code>.session</code></b> خود را (به صورت Document) ارسال کنید:"
         ),
         reply_markup=get_login_cancel_keyboard()
-    )
+    )  
 
-
-@router.message(LoginStates.waiting_for_string_session, F.text)
+@router.message(LoginStates.waiting_for_string_session, F.text | F.document)
 async def process_string_session(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    session_string_input = message.text.strip()
+    import tempfile
+    import os
+    import uuid
+    
     admin_id = message.from_user.id
+    session_string_input = None
+    is_file = False
 
-    # ۳. حذف فوری پیام حاوی سشن از چت ادمین برای امنیت
+    # حذف فوری پیام ادمین برای امنیت
     with suppress(Exception):
         await message.delete()
 
-    # ۷. بررسی الگوهای انصراف و منو
-    if session_string_input == "🏛 منوی اصلی":
-        await cleanup_client(admin_id)
-        await release_login_reservations(admin_id, session)
-        await state.clear()
-        return await message.answer("🏛 شما به منوی اصلی بازگشتید.", reply_markup=get_main_menu_keyboard())
-    
-    if session_string_input == "❌ انصراف":
-        await cleanup_client(admin_id)
-        await release_login_reservations(admin_id, session)
-        await state.clear()
-        return await message.answer("🚫 <b>عملیات لغو شد.</b>\nنشست موقت پاکسازی شد.", reply_markup=get_main_menu_keyboard())
+    # --- بررسی نوع ورودی (فایل یا متن) ---
+    if message.document:
+        if not message.document.file_name.endswith('.session'):
+            return await message.answer(
+                "⚠️ لطفاً فقط فایل با پسوند <code>.session</code> یا رشته متنی ارسال کنید.",
+                reply_markup=get_login_cancel_keyboard()
+            )
+        is_file = True
+    else:
+        session_string_input = message.text.strip()
+        if session_string_input == "🏛 منوی اصلی":
+            await cleanup_client(admin_id)
+            await release_login_reservations(admin_id, session)
+            await state.clear()
+            return await message.answer("🏛 شما به منوی اصلی بازگشتید.", reply_markup=get_main_menu_keyboard())
+        
+        if session_string_input == "❌ انصراف":
+            await cleanup_client(admin_id)
+            await release_login_reservations(admin_id, session)
+            await state.clear()
+            return await message.answer("🚫 <b>عملیات لغو شد.</b>", reply_markup=get_main_menu_keyboard())
 
-    if session_string_input in _KNOWN_MENU_BUTTON_TEXTS or session_string_input.startswith("/"):
-        return await message.answer("⚠️ لطفاً فقط یک StringSession معتبر ارسال کنید یا فلوی فعلی را لغو کنید.")
+        if session_string_input in _KNOWN_MENU_BUTTON_TEXTS or session_string_input.startswith("/"):
+            return await message.answer("⚠️ لطفاً فقط یک StringSession معتبر یا فایل ارسال کنید.")
 
-    progress_msg = await message.answer("⏳ در حال بررسی اعتبار سشن و اتصال به تلگرام...")
+    progress_msg = await message.answer("⏳ در حال پردازش سشن...")
 
-    # تخصیص ظرفیت API
+    # --- تخصیص ظرفیت API ---
     settings_stmt = select(GlobalSettings).limit(1)
     settings = await session.scalar(settings_stmt)
     max_acc_per_api = settings.max_accounts_per_api if settings else 1
@@ -1128,11 +1190,7 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
 
         if not api_obj:
             await state.clear()
-            return await safe_edit_or_answer(
-                progress_msg, 
-                "⚠️ <b>ظرفیت تکمیل است!</b> هیچ API آزاد یافت نشد.", 
-                reply_markup=get_main_menu_keyboard()
-            )
+            return await safe_edit_or_answer(progress_msg, "⚠️ <b>ظرفیت تکمیل است!</b>", reply_markup=get_main_menu_keyboard())
 
         _reserve_api_slot(admin_id, api_obj.id)
 
@@ -1140,98 +1198,283 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
     active_api_hash = str(api_obj.api_hash)
     db_api_key_id = int(api_obj.id)
 
-    # تخصیص پراکسی
-    proxy_string = await claim_proxy_for_account(session, None)
-    if not proxy_string:
-        await state.clear()
-        await release_login_reservations(admin_id, session)
-        return await safe_edit_or_answer(progress_msg, "🚨 هیچ پراکسی سالمی با ظرفیت آزاد یافت نشد!", reply_markup=get_main_menu_keyboard())
+    # --- تخصیص پراکسی لاگین برای اعتبارسنجی سشن ---
+    stmt_total_login_proxies = select(func.count(Proxy.id)).where(Proxy.usage_type.in_(("login", "both")))
+    total_login_proxies = await session.scalar(stmt_total_login_proxies) or 0
 
-    proxy_dict = parse_proxy_string(proxy_string)
+    proxy_string = None
+    proxy_dict = None
+
+    if total_login_proxies == 0:
+        from workers.session_manager import login_proxy_dict
+        env_proxy_dict = login_proxy_dict()
+        
+        if env_proxy_dict:
+            proxy_string = getattr(config, "LOGIN_PROXY_URL", "")
+            proxy_dict = env_proxy_dict
+        else:
+            await state.clear()
+            await release_login_reservations(admin_id, session)
+            return await safe_edit_or_answer(
+                progress_msg,
+                "شما هنوز هیچ پروکسی لاگینی در سیستم ثبت نکرده‌اید. لطفاً ابتدا از بخش تنظیمات یک پروکسی لاگین ثبت کنید یا متغیر LOGIN_PROXY_URL را مقداردهی نمایید.",
+                reply_markup=get_main_menu_keyboard()
+            )
+    else:
+        stmt_login_proxy = (
+            select(Proxy)
+            .where(Proxy.usage_type.in_(("login", "both")), Proxy.is_active == True, Proxy.health_state != "DEAD")
+            .order_by(func.random())
+            .limit(1)
+        )
+        login_proxy_obj = await session.scalar(stmt_login_proxy)
+        
+        if not login_proxy_obj:
+            await state.clear()
+            await release_login_reservations(admin_id, session)
+            return await safe_edit_or_answer(
+                progress_msg,
+                "شما پروکسی لاگین در سیستم دارید، اما در حال حاضر همگی از دسترس خارج (DEAD) شده‌اند. لطفاً وضعیت سرور پروکسی خود را بررسی کنید.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            
+        proxy_string = login_proxy_obj.proxy_string
+        proxy_dict = parse_proxy_string(proxy_string)
+    
     if not proxy_dict:
+        await state.clear()
+        await release_login_reservations(admin_id, session)
+        return await safe_edit_or_answer(
+            progress_msg, "🚨 پراکسی لاگین رزرو شده معتبر نیست.", reply_markup=get_main_menu_keyboard()
+        )
+
+    # ==============================================================
+    # 🌟 ترفند نهایی: استخراج آفلاین فایل و تبدیل خودکار Telethon
+    # ==============================================================
+    if is_file:
+        await safe_edit_or_answer(progress_msg, "⏳ در حال استخراج اطلاعات از فایل (آفلاین)...")
+        temp_dir = tempfile.gettempdir()
+        base_name = f"temp_upload_{admin_id}_{uuid.uuid4().hex}"
+        temp_file_path = os.path.join(temp_dir, f"{base_name}.session")
+        
         try:
-            await mark_proxy_failed(session, proxy_string)
-            await release_proxy_slot(session, proxy_string)
-            await session.commit()
-        except Exception:
-            await session.rollback()
-        await state.clear()
-        await release_login_reservations(admin_id, session)
-        return await safe_edit_or_answer(progress_msg, "🚨 پراکسی رزرو شده نامعتبر بود. عملیات متوقف شد.", reply_markup=get_main_menu_keyboard())
+            await message.bot.download(message.document, destination=temp_file_path)
+            
+            import sqlite3
+            is_telethon = False
+            
+            # --- تشخیص هوشمند فرمت دیتابیس (آیا Telethon است؟) ---
+            try:
+                with sqlite3.connect(temp_file_path) as conn:
+                    c = conn.cursor()
+                    c.execute("PRAGMA table_info(version)")
+                    if "version" in [r[1] for r in c.fetchall()]:
+                        is_telethon = True
+            except:
+                pass
 
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        await state.clear()
-        await release_login_reservations(admin_id, session)
-        return await safe_edit_or_answer(progress_msg, "❌ خطای ثبت پراکسی در دیتابیس.")
+            if is_telethon:
+                await safe_edit_or_answer(progress_msg, "🔄 فرمت Telethon تشخیص داده شد! در حال استخراج خودکار...")
+                
+                # 1. خواندن اطلاعات حیاتی لاگین از دیتابیس Telethon
+                with sqlite3.connect(temp_file_path) as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT dc_id, auth_key, test_mode, user_id, is_bot FROM sessions LIMIT 1")
+                    row = c.fetchone()
+                
+                if not row:
+                    raise Exception("سشن Telethon خالی است یا به درستی لاگین نشده است.")
+                    
+                t_dc_id, t_auth_key, t_test_mode, t_user_id, t_is_bot = row
+                
+                # 2. استفاده از کلاینت in_memory برای تزریق مستقیم داده‌ها به RAM و گرفتن خروجی StringSession
+                dummy_client = Client(name="dummy", api_id=active_api_id, api_hash=active_api_hash, in_memory=True)
+                await dummy_client.storage.open()
+                
+                # تبدیل امن داده‌ها (برای جلوگیری از ارور required argument is not an integer)
+                safe_dc_id = int(t_dc_id) if t_dc_id is not None else 2
+                safe_user_id = int(t_user_id) if t_user_id is not None else 0
+                safe_test_mode = bool(t_test_mode)
+                safe_is_bot = bool(t_is_bot)
+                
+                
+                await dummy_client.storage.dc_id(safe_dc_id)
+                await dummy_client.storage.api_id(int(active_api_id))  # 👈 کلید قطعی حل مشکل اینجاست
+                await dummy_client.storage.auth_key(t_auth_key)
+                await dummy_client.storage.test_mode(safe_test_mode)
+                await dummy_client.storage.user_id(safe_user_id)
+                await dummy_client.storage.is_bot(safe_is_bot)
+                
+                # دریافت رشته متنی به صورت آنی!
+                session_string_input = await dummy_client.export_session_string()
+                
+                await dummy_client.storage.close()
+                del dummy_client
 
-    _reserve_proxy_slot(admin_id, proxy_string)
+            else:
+                # --- منطق اصلی برای فایل‌های استاندارد Pyrogram ---
+                dummy_client = Client(name=base_name, workdir=temp_dir, api_id=active_api_id, api_hash=active_api_hash)
+                
+                # باز کردن آفلاین دیتابیس
+                await dummy_client.storage.open()
+                
+                # استخراج رشته متنی
+                session_string_input = await dummy_client.export_session_string()
+                
+                # بستن استاندارد و امن دیتابیس برای شکستن قطعی قفل
+                await dummy_client.storage.close()
+                del dummy_client
+            
+        except Exception as e:
+            await release_login_reservations(admin_id, session)
+            await state.clear()
+            return await safe_edit_or_answer(
+                progress_msg, 
+                f"❌ فایل نامعتبر است:\n<code>{html.escape(str(e))}</code>",
+                reply_markup=get_login_cancel_keyboard()
+            )
+        finally:
+            # 🔥 فایل دیتابیس همینجا به طور کامل از روی سرور پاک می‌شود 🔥
+            with suppress(Exception):
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                journal_path = temp_file_path + "-journal"
+                if os.path.exists(journal_path):
+                    os.remove(journal_path)
+
+        await safe_edit_or_answer(progress_msg, "✅ اطلاعات با موفقیت خوانده شد. در حال اتصال به شبکه...")
+    # ==============================================================
 
     device_model = random.choice(DEVICE_MODELS)
     system_version = random.choice(SYSTEM_VERSIONS)
     app_version = random.choice(APP_VERSIONS)
 
-    # ۲. ایجاد کلاینت موقت بدون استارت ورکر
-    client = Client(
-        name=f"temp_import_{admin_id}",
-        api_id=active_api_id,
-        api_hash=active_api_hash,
-        session_string=session_string_input,
-        proxy=proxy_dict,
-        in_memory=True,
-        device_model=device_model,
-        system_version=system_version,
-        app_version=app_version,
-        lang_code="en"
-    )
+    from pyrogram.errors import AuthKeyUnregistered, SessionRevoked, UserDeactivated, UserDeactivatedBan, Unauthorized
+    from sqlalchemy import or_
 
     me = None
-    try:
-        await asyncio.wait_for(client.connect(), timeout=45)
-        me = await asyncio.wait_for(client.get_me(), timeout=30)
-    except asyncio.TimeoutError:
-        await safe_edit_or_answer(progress_msg, "⏱ مهلت اتصال به تلگرام به پایان رسید. ممکن است پراکسی کند باشد یا سشن نامعتبر باشد.")
-        await release_login_reservations(admin_id, session)
-        await state.clear()
-        return
-    except Exception as e:
-        await safe_edit_or_answer(progress_msg, f"❌ <b>خطا در سشن:</b>\n<code>{html.escape(str(e))}</code>\n\nاحتمالاً نشست نامعتبر (SessionRevoked) است.")
-        await release_login_reservations(admin_id, session)
-        await state.clear()
-        return
-    finally:
-        if client.is_connected:
-            await client.disconnect()
+    MAX_RETRIES = 3
+    
+    for attempt in range(MAX_RETRIES):
+        
+        # 💡 اکنون چه کاربر متن فرستاده باشد چه فایل، ما فقط یک StringSession در رم داریم (in_memory=True)
+        # هیچ فایلی روی دیسک درگیر این پروسه نمی‌شود!
+        client = Client(
+            name=f"temp_import_{admin_id}_{attempt}",
+            api_id=active_api_id,
+            api_hash=active_api_hash,
+            session_string=session_string_input,
+            proxy=proxy_dict,
+            in_memory=True,
+            device_model=device_model,
+            system_version=system_version,
+            app_version=app_version,
+            lang_code="en"
+        )
 
+        try:
+            await asyncio.wait_for(client.connect(), timeout=45)
+            me = await asyncio.wait_for(client.get_me(), timeout=90)
+            break
+            
+        except (AuthKeyUnregistered, SessionRevoked, UserDeactivated, UserDeactivatedBan, Unauthorized, AuthKeyDuplicated) as e:
+            await safe_edit_or_answer(progress_msg, f"❌ <b>خطا در سشن:</b>\n<code>{html.escape(str(e))}</code>\n\nنشست نامعتبر است (احتمالاً در سیستم دیگری در حال استفاده است).")
+            if client.is_connected:
+                with suppress(Exception):
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
+            break
+            
+        except asyncio.TimeoutError:
+            if proxy_string:
+                asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
+            if client.is_connected:
+                with suppress(Exception):
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
+            if attempt == MAX_RETRIES - 1:
+                await safe_edit_or_answer(progress_msg, "⏱ مهلت اتصال به تلگرام به پایان رسید.")
+            else:
+                await safe_edit_or_answer(progress_msg, f"⏳ تلاش ناموفق ({attempt+1}/{MAX_RETRIES}). در حال چرخش IP...")
+                
+        except Exception as e:
+            if proxy_string:
+                asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
+            if client.is_connected:
+                with suppress(Exception):
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
+            if attempt == MAX_RETRIES - 1:
+                await safe_edit_or_answer(progress_msg, f"❌ <b>خطای ناشناخته:</b>\n<code>{html.escape(str(e))}</code>")
+            else:
+                await safe_edit_or_answer(progress_msg, f"⏳ خطا موقت ({attempt+1}/{MAX_RETRIES}). در حال تلاش مجدد...")
+                
+        finally:
+            if client.is_connected:
+                with suppress(Exception):
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
+            del client
+
+    if not me:
+        await release_login_reservations(admin_id, session)
+        await state.clear()
+        # پیام صریح به همراه کیبورد منوی اصلی اضافه شد
+        await safe_edit_or_answer(
+            progress_msg,
+            "❌ <b>افزودن اکانت ناموفق بود!</b>\n\n"
+            "ربات نتوانست اطلاعات اکانت را از تلگرام دریافت کند (احتمالاً به دلیل قطعی موقت شبکه).\n"
+            "هیچ اکانتی در سیستم ثبت نشد. لطفاً چند لحظه بعد مجدداً تلاش کنید.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+
+    # --- ادامه منطق ثبت در دیتابیس ---
     phone_number = me.phone_number
     if not phone_number:
         phone_number = f"Unknown_{me.id}"
     else:
         phone_number = f"+{phone_number}"
 
-    # جلوگیری از ثبت اکانت تکراری
-    stmt_acc = select(Account).where(Account.phone_number == phone_number)
+    stmt_acc = select(Account).where(
+        or_(Account.phone_number == phone_number, Account.telegram_user_id == me.id)
+    )
     result_acc = await session.execute(stmt_acc)
-    if result_acc.scalar_one_or_none():
-        await safe_edit_or_answer(progress_msg, "⚠️ این اکانت (شماره موبایل) قبلاً در سیستم ثبت شده است.")
+    existing_account = result_acc.scalar_one_or_none()
+    
+    if existing_account:
+        masked = mask_phone(existing_account.phone_number)
+        await safe_edit_or_answer(
+            progress_msg, 
+            f"⚠️ <b>اکانت تکراری!</b>\nاین اکانت قبلاً در سیستم ثبت شده است.\n\n"
+            f"🆔 <b>آیدی:</b> <code>{existing_account.telegram_user_id}</code>\n"
+            f"📱 <b>شماره:</b> <code>{masked}</code>",
+            reply_markup=get_main_menu_keyboard()
+        )
         await release_login_reservations(admin_id, session)
         await state.clear()
         return
 
-    # ۴ و ۵ و ۶. ذخیره، استارت ورکر و اعلام نتیجه
     try:
+        fsm_data = await state.get_data()
+        category_id = fsm_data.get("category_id") 
+        
+        cat_name = "نامشخص"
+        if category_id:
+            cat_obj = await session.scalar(select(Category).where(Category.id == category_id))
+            if cat_obj:
+                cat_name = cat_obj.name
+                
         encrypted_session = encrypt_session(session_string_input)
         
-        # مقدار category_id فعلاً None تنظیم می‌شود؛ کاربر می‌تواند از ادمین‌پنل آن را تغییر دهد.
+        # تخصیص پروکسی ورکر برای ثبت نهایی تا اکانت به پروکسی لاگین گره نخورد
+        worker_proxy = await claim_proxy_for_account(session, None)
+        
         new_account = Account(
             phone_number=phone_number,
             telegram_user_id=me.id,
             session_string=encrypted_session,
-            category_id=None,
+            category_id=category_id,
             api_id=db_api_key_id,
-            proxy_string=proxy_string,
+            proxy_string=worker_proxy,  # <--- استفاده از پراکسی ورکر
+            proxy_status="ASSIGNED" if worker_proxy else "WAITING_PROXY",
+            proxy_queue_joined_at=None if worker_proxy else datetime.now(timezone.utc),
             is_banned=False,
             device_model=device_model,
             system_version=system_version,
@@ -1243,16 +1486,19 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
         await session.commit()
         await session.refresh(new_account)
 
-        # استارت همگام با معماری اصلی سیستم
         started = await start_single_worker(new_account, session)
 
         if started:
-            await maybe_enable_2fa(client, new_account, session, message.bot)
+            method_used = "فایل .session" if is_file else "StringSession"
             await safe_edit_or_answer(
                 progress_msg,
-                f"🎉 <b>اکانت با موفقیت ثبت و به استخر ورکرها افزوده شد!</b>\n\n"
-                f"<b>شماره/شناسه:</b> <code>{mask_phone(phone_number)}</code>\n"
-                f"<b>نام:</b> {html.escape(me.first_name or 'بدون‌نام')}\n"
+                f"🎉 <b>اکانت با موفقیت ثبت و روشن شد!</b>\n\n"
+                f"📱 <b>شماره:</b> <code>{mask_phone(phone_number)}</code>\n"
+                f"🆔 <b>آیدی:</b> <code>{me.id}</code>\n"
+                f"👤 <b>نام:</b> {html.escape(me.first_name or 'بدون‌نام')}\n"
+                f"🔗 <b>یوزرنیم:</b> @{me.username if me.username else 'ندارد'}\n"
+                f"📁 <b>دسته:</b> {html.escape(cat_name)}\n"
+                f"🔑 <b>روش افزودن:</b> {method_used}\n\n"
                 f"⏳ <i>دوره گرم‌شدن {warmup_hours()} ساعته از هم‌اکنون برای این اکانت فعال شد.</i>",
                 reply_markup=get_main_menu_keyboard()
             )

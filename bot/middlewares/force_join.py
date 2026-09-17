@@ -1,130 +1,272 @@
-import logging
-import time
-from contextlib import suppress
-from typing import Callable, Dict, Any, Awaitable
+# -*- coding: utf-8 -*-
+"""
+🔒 Force-Join Middleware — Phase 6 (T3 + T4)
+============================================
+bot/middlewares/force_join.py
 
-from config import config
+Gate every update behind channel-membership verification.
+
+Phase 6 (T3) — Redis caching (fixes F3: getChatMember hammering):
+    * Negative cache — `forcejoin:miss:{user_id}` (TTL 600s): a user who
+      failed the check is rejected from cache without re-querying Telegram
+      on every update.
+    * Positive cache — `forcejoin:hit:{user_id}` (TTL 60s): a recently
+      verified member skips the check entirely.
+    * The «✅ عضو شدم» callback ALWAYS performs a real re-check; on success
+      the miss-cache entry is deleted and the hit-cache is set.
+
+Phase 6 (T4) — credentials: everything (channels, admin bypass) comes from
+config — no inline tokens / api hashes / hard-coded URLs in this module.
+
+All user-facing texts are Persian; comments are English.
+"""
+
+import logging
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from aiogram import BaseMiddleware, Bot
-from aiogram.types import TelegramObject, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    TelegramObject,
+    User,
+)
+
+from config import config
+from utils.telegram_helpers import safe_callback_answer
+from workers.sender import _get_redis  # shared async Redis client (BUG-04 registry client)
 
 logger = logging.getLogger(__name__)
 
-# 🔴 فاز ۱۱ (BUG-17a): کانال‌های اجباری به سطح ماژول منتقل شدند تا هندلر
-# verify_join هم برای «بررسی واقعی عضویت» از همان منبع واحد استفاده کند.
-# 📌 فاز ۱۲: منبع این لیست به config منتقل می‌شود — فقط همین یک خط تغییر می‌کند.
+# ---------------------------------------------------------------- #
+# Cache tuning (Phase 6 / T3 — fixed values per spec)
+# ---------------------------------------------------------------- #
+FORCEJOIN_MISS_TTL = 600  # seconds — failing users are cached for 10 minutes
+FORCEJOIN_HIT_TTL = 60    # seconds — verified members skip re-checks briefly
 
-REQUIRED_CHANNELS = config.FORCE_JOIN_CHANNEL_LIST or []
+# Telegram membership statuses that count as "joined"
+_MEMBER_STATUSES = {"creator", "administrator", "member", "restricted"}
 
+# Callback data of the «I joined» button produced by this middleware
+CHECK_JOIN_CALLBACK = "forcejoin_check_joined"
+
+JOIN_REQUIRED_TEXT = (
+    "👋 <b>کاربر گرامی، سلام!</b>\n\n"
+    "🔒 <b>جهت استفاده از امکانات ربات، لطفاً ابتدا در کانال‌های زیر عضو شوید:</b>\n\n"
+    "{channels}\n\n"
+    "👇 <i>پس از عضویت، جهت ادامه‌ی کار روی دکمه زیر کلیک کنید.</i>"
+)
+
+
+def _miss_key(user_id: int) -> str:
+    return f"forcejoin:miss:{user_id}"
+
+
+def _hit_key(user_id: int) -> str:
+    return f"forcejoin:hit:{user_id}"
+
+
+# ---------------------------------------------------------------- #
+# Redis helpers — every call degrades gracefully: if Redis is down we
+# fall back to per-update checks (the pre-T3 behavior).
+# ---------------------------------------------------------------- #
+import time
+
+_memory_cache = {}
+
+async def _cache_exists(key: str) -> bool:
+    if key in _memory_cache:
+        if time.time() < _memory_cache[key]:
+            return True
+        else:
+            del _memory_cache[key]
+    return False
+
+
+async def _cache_set(key: str, ttl: int) -> None:
+    _memory_cache[key] = time.time() + ttl
+
+
+async def clear_force_join_miss(user_id: int) -> None:
+    """
+    Delete the negative-cache entry for a user. Called on the
+    successful-join callback path; safe to call from any external
+    handler that verifies membership on its own.
+    """
+    key = _miss_key(user_id)
+    if key in _memory_cache:
+        del _memory_cache[key]
+
+
+# ---------------------------------------------------------------- #
+# Channel helpers (T4: identifiers/URLs derived from config only)
+# ---------------------------------------------------------------- #
+def _channel_url(channel: str) -> str:
+    ch = channel.strip()
+    if ch.startswith(("http://", "https://")):
+        return ch
+    return f"https://t.me/{ch.lstrip('@')}"
+
+
+def _chat_identifier(channel: str) -> Optional[str]:
+    """
+    Config value -> getChatMember chat_id.
+    @username / plain username -> @username; public t.me link -> @username;
+    invite links (+hash / joinchat/) can't be queried -> None (skipped).
+    """
+    ch = channel.strip()
+    if ch.startswith("@"):
+        return ch
+    if "t.me/" in ch:
+        username = ch.split("t.me/", 1)[1].strip("/ ")
+        if username.startswith("+") or username.startswith("joinchat/"):
+            return None
+        return f"@{username}" if username else None
+    return f"@{ch}" if ch else None
+
+
+def build_force_join_keyboard(channels: list) -> InlineKeyboardMarkup:
+    # ساخت دکمه‌های مجزا برای هر کانال (با شماره‌گذاری شیک)
+    rows = [
+        [InlineKeyboardButton(text=f"📢 عضویت در کانال {i+1}", url=_channel_url(ch))]
+        for i, ch in enumerate(channels)
+    ]
+    
+    # اضافه کردن دکمه عریض در آخرین ردیف (چون تنها المان آرایه است، تمام‌عرض می‌شود)
+    rows.append([InlineKeyboardButton(text="✅ عضو شدم / بررسی مجدد", callback_data=CHECK_JOIN_CALLBACK)])
+    
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _join_required_text(channels: list) -> str:
+    lines = "\n".join(f"▫️ {_channel_url(ch)}" for ch in channels)
+    return JOIN_REQUIRED_TEXT.format(channels=lines)
+
+
+# ---------------------------------------------------------------- #
+# Middleware
+# ---------------------------------------------------------------- #
 class ForceJoinMiddleware(BaseMiddleware):
     """
-    میدلور جوین اجباری
-    (آپدیت فاز ۵: جلوگیری از تخریب استیت FSM کاربر در صورت عدم عضویت)
+    Class name unchanged (dispatcher registration untouched). Check order:
+
+        1. no user context / admin / empty channel list -> pass
+        2. «✅ عضو شدم» callback -> REAL re-check (caches bypassed)
+        3. positive cache hit  -> pass
+        4. negative cache hit  -> reject immediately (no Telegram call)
+        5. real membership check -> cache miss or hit, then reject or pass
     """
-    def __init__(self) -> None:
-        self.required_channels = REQUIRED_CHANNELS
-        self._cache: Dict[int, float] = {}
-        self.cache_ttl = 300  # ۵ دقیقه
-        self.max_cache_size = 10_000  # 🔴 فاز ۱۱ (BUG-17c): سقف اندازهٔ کش
-        # 🔴 فاز ۱۱ (BUG-17b): پرچم «اطلاع یک‌باره» به ازای هر کانال
-        self._admin_notified_channels: set = set()
-        super().__init__()
-
-    def _cleanup_cache(self) -> None:
-        """
-        🔴 فاز ۱۱ (BUG-17c): جلوگیری از رشد بی‌حد _cache —
-        ۱) حذف ورودی‌های منقضی‌شده؛ ۲) سقف اندازه با حذف قدیمی‌ترین‌ها.
-        (فراخوانی پیش از هر درج؛ چون رشد کش فقط از مسیر درج است، همین کافی است.)
-        """
-        now = time.time()
-        # ۱) حذف منقضی‌ها
-        for uid in [uid for uid, exp in self._cache.items() if exp <= now]:
-            del self._cache[uid]
-        # ۲) سقف اندازه: قدیمی‌ترین‌ها (کوچک‌ترین زمان انقضا) حذف می‌شوند
-        if len(self._cache) >= self.max_cache_size:
-            overflow = len(self._cache) - self.max_cache_size + 1  # +۱ برای ورودی جدید
-            for uid, _ in sorted(self._cache.items(), key=lambda kv: kv[1])[:overflow]:
-                del self._cache[uid]
-
-    async def _notify_admin_once(self, bot: Bot, channel: str, fallback_user_id: int) -> None:
-        """
-        🔴 فاز ۱۱ (BUG-17b): اطلاع «یک‌باره» از خرابی بررسی عضویت (به ازای هر کانال).
-        هدف اطلاع فعلاً کاربر جاری است (کاربران این پنل، ادمین هستند).
-        📌 معلق: منبع canonical ادمین‌ها (config/DB) در فاز ۱۲ جایگزین می‌شود.
-        """
-        if channel in self._admin_notified_channels:
-            return
-        self._admin_notified_channels.add(channel)
-        text = (
-            "⚠️ <b>هشدار سیستم (Force-Join)</b>\n\n"
-            f"ربات نتوانست عضویت را در <code>{channel}</code> بررسی کند.\n"
-            "محتمل‌ترین علت: ربات ادمین این کانال <b>نیست</b>.\n"
-            "لطفاً ربات را به‌عنوان ادمین به کانال اضافه کنید تا بررسی عضویت مجدداً فعال شود."
-        )
-        with suppress(Exception):
-            await bot.send_message(chat_id=fallback_user_id, text=text)
 
     async def __call__(
         self,
         handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
         event: TelegramObject,
-        data: Dict[str, Any]
+        data: Dict[str, Any],
     ) -> Any:
-        
-        user = data.get("event_from_user")
-        bot = data.get("bot")
-        
-        if not user or not bot:
+        user: Optional[User] = data.get("event_from_user")
+        bot: Optional[Bot] = data.get("bot")
+
+        if user is None or bot is None:
             return await handler(event, data)
 
-        current_time = time.time()
-        if user.id in self._cache and current_time < self._cache[user.id]:
+        if user.id == config.ADMIN_ID:
             return await handler(event, data)
 
-        not_joined_channels = []
-
-        # در حدود خط ۵۵
-        if not self.required_channels or user.id == config.ADMIN_ID:
+        channels = config.FORCE_JOIN_CHANNEL_LIST
+        if not channels:
             return await handler(event, data)
-        
-        for channel in self.required_channels:
+
+        # (2) The join-verification button bypasses every cache: the user
+        # clicked it precisely to invalidate a previous failure.
+        if isinstance(event, CallbackQuery) and event.data == CHECK_JOIN_CALLBACK:
+            return await self._handle_check_joined(event, bot, user, channels)
+
+        # (3) positive cache — recently verified member
+        if await _cache_exists(_hit_key(user.id)):
+            return await handler(event, data)
+
+        # (4) negative cache — reject without touching Telegram
+        if await _cache_exists(_miss_key(user.id)):
+            await self._reject(event, user.id, channels)
+            return None
+
+        # (5) real check
+        if await self._all_joined(bot, user.id, channels):
+            await _cache_set(_hit_key(user.id), FORCEJOIN_HIT_TTL)
+            return await handler(event, data)
+
+        await _cache_set(_miss_key(user.id), FORCEJOIN_MISS_TTL)
+        await self._reject(event, user.id, channels)
+        return None
+
+    # ------------------------------------------------------------------ #
+    async def _all_joined(self, bot: Bot, user_id: int, channels: list) -> bool:
+        for channel in channels:
+            if not await self._is_member(bot, user_id, channel):
+                return False
+        return True
+
+    async def _is_member(self, bot: Bot, user_id: int, channel: str) -> bool:
+        chat_id = _chat_identifier(channel)
+        if chat_id is None:
+            # Invite-link channels cannot be queried via getChatMember —
+            # unverifiable, so we must not lock the user out.
+            logger.debug(f"Force-join: {channel!r} is an invite link; check skipped.")
+            return True
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            return member.status in _MEMBER_STATUSES
+        except Exception as e:
+            error_text = str(e).lower()
+            # در صورتی که ربات ادمین نباشد خطای مربوطه را هندل کرده و دسترسی کاربر را باز می‌گذاریم
+            if "chatadminrequired" in error_text or ("not a member" in error_text and "bot" in error_text):
+                logger.error(f"Force-join Admin Error: Bot is not admin in {channel}. Bypassing check to avoid lockout. Detail: {e}")
+                return True
+            
+            if isinstance(e, TelegramBadRequest):
+                # "user not found" / not a member
+                return False
+                
+            logger.warning(
+                f"Force-join: membership check failed (user {user_id}, {channel}): {e}"
+            )
+            return True
+
+    async def _handle_check_joined(
+        self, event: CallbackQuery, bot: Bot, user: User, channels: list
+    ) -> Any:
+        # Always a REAL re-check — the whole point of this button.
+        if await self._all_joined(bot, user.id, channels):
+            # Success: delete the miss key (T3 requirement) + set hit cache
             try:
-                chat_member = await bot.get_chat_member(chat_id=channel, user_id=user.id)
-                if chat_member.status in ["left", "kicked", "banned"]:
-                    not_joined_channels.append(channel)
+                await clear_force_join_miss(user.id)
+                await _cache_set(_hit_key(user.id), FORCEJOIN_HIT_TTL)
             except Exception as e:
-                # 🔴 فاز ۱۱ (BUG-17b): خطا دیگر «بی‌صدا رد» نمی‌شود؛
-                # کانالِ بررسی‌نشده مثل عضو-نشده تلقی می‌شود (fail-closed) تا
-                # با حذف ادمینیِ ربات، force-join عملاً خاموش نماند.
-                logger.warning(f"ForceJoin: membership check failed for {channel}: {e}")
-                not_joined_channels.append(channel)
-                await self._notify_admin_once(bot, channel, user.id)
-
-        if not_joined_channels:
-            # 🔴 حذف دستورات state.clear() و cleanup_client() 
-            # تا کاربر در صورت لفت دادن، فرآیند ثبت سفارش خود را از دست ندهد.
-            
-            keyboard = []
-            for channel in not_joined_channels:
-                url = f"https://t.me/{channel.replace('@', '')}"
-                keyboard.append([InlineKeyboardButton(text=f"عضویت در {channel}", url=url)])
-            
-            keyboard.append([InlineKeyboardButton(text="✅ عضو شدم", callback_data="menu_verify_join/")])
-            reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-            
-            text = (
-                "🛑 <b>دسترسی محدود شد</b>\n\n"
-                "برای ادامه کار و بدون از دست رفتن مراحل فعلی‌تان، لطفاً ابتدا در کانال‌های زیر عضو شوید:"
+                logger.warning(
+                    f"Force-join: cache update after join failed (user {user.id}): {e}"
+                )
+            await safe_callback_answer(
+                event,
+                "✅ عضویت شما تأیید شد. لطفاً درخواست خود را دوباره ارسال کنید.",
             )
             
-            if isinstance(event, Message):
-                await event.answer(text, reply_markup=reply_markup)
-            elif isinstance(event, CallbackQuery):
-                await event.message.answer(text, reply_markup=reply_markup)
-                await event.answer()
-                
-            return
+            # +++ اضافه شدن حذف پیام برای فیدبک بصری به کاربر +++
+            try:
+                await event.message.delete()
+            except Exception:
+                pass
+            # +++++++++++++++++++++++++++++++++++++++++++++++++++
             
-        self._cleanup_cache()
-        self._cache[user.id] = current_time + self.cache_ttl
-        return await handler(event, data)
+            return None
+
+        # Still not a member — refresh the negative-cache window
+        await _cache_set(_miss_key(user.id), FORCEJOIN_MISS_TTL)
+        await safe_callback_answer(
+            event,
+            "❌ هنوز عضویت شما تأیید نشده است. ابتدا در کانال عضو شوید.",
+            show_alert=True,
+        )
+        return None

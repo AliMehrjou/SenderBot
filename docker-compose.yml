@@ -12,6 +12,8 @@ services:
     container_name: sender_bot_init_dirs
     restart: "no"
     user: "0:0"
+    environment:
+      - TZ=Asia/Tehran
     volumes:
       - ./sessions:/mnt/sessions
       - ./downloads:/mnt/downloads
@@ -38,6 +40,8 @@ services:
     build: .
     container_name: sender_bot_app
     restart: always
+    environment:
+      - TZ=Asia/Tehran
     env_file:
       - .env
     depends_on:
@@ -50,8 +54,8 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
     volumes:
       # 📦 فاز ۱۲ (BUG-22/DEP-2): همهٔ دایرکتوری‌های runtime باید bind-mount باشند،
       # وگرنه هر up --build محتوایشان را همراه لایهٔ کانتینر حذف می‌کند.
@@ -73,6 +77,7 @@ services:
     container_name: sender_bot_db
     restart: always
     environment:
+      TZ: Asia/Tehran
       MYSQL_DATABASE: ${DB_NAME}
       MYSQL_USER: ${DB_USER}
       MYSQL_PASSWORD: ${DB_PASS}
@@ -104,6 +109,7 @@ services:
     expose:
       - "6379"
     environment:
+      - TZ=Asia/Tehran
       - REDIS_PASS=${REDIS_PASS}
     command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASS\""]
     healthcheck:

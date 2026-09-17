@@ -21,7 +21,7 @@ from database.models import Order, OrderLog, OrderStatus
 from workers.session_manager import worker_pool
 from bot.states.extractor_fsm import ExtractorStates
 from bot.keyboards.cancel import get_cancel_keyboard, with_cancel_hint
-from bot.keyboards.main_menu import get_main_menu_button, get_main_menu_keyboard
+from bot.keyboards.main_menu import get_main_menu_button, get_main_menu_keyboard, get_main_menu_reply_keyboard
 from utils.fsm_cleanup import cleanup_fsm_temp_files
 from config import config
 from database.models import Order, OrderLog, OrderStatus
@@ -71,12 +71,28 @@ EXTRACTION_STATUS_BADGES.update({
 })
 
 #: برچسب فارسی الگوریتم استخراج (filter_type سفارش‌های extract)
+#: برچسب فارسی الگوریتم استخراج (filter_type سفارش‌های extract)
 EXTRACTION_TYPE_LABELS: dict = {
     "users": "👥 کاربران (ساده)",
     "messages": "💬 پیام‌ها (تارگت‌های فعال)",
     "golden": "🌟 طلایی (دقیق و تقاطعی)",
+    "online": "🟢 فقط آنلاین",
 }
+
 EXT_TRACKING_CODE_PATTERN = re.compile(r"EXT-[A-Z0-9]{1,20}")
+
+EXTRACTION_STRATEGY_TEXT = (
+    "⚙️ <b>سفارش استخراج — استراتژی را انتخاب کنید:</b>\n\n"
+    "👥 <b>همه اعضا:</b> لیست اعضای گروه (سقف ۱۰,۰۰۰)\n"
+    "   ⚠️ اگر ادمین گروه لیست اعضا را مخفی کرده، این گزینه نتیجه نمی‌دهد.\n\n"
+    "💬 <b>فرستندگان پیام:</b> کاربران فعال در تاریخچه اخیر\n"
+    "   ✅ حتی اگر لیست اعضا مخفی باشد، این گزینه کار می‌کند.\n\n"
+    "🥇 <b>طلایی:</b> تقاطع اعضا و فعالیت واقعی در پیام‌ها\n"
+    "   ⚠️ نیاز به دسترسی به لیست اعضا دارد.\n\n"
+    "🟢 <b>فقط آنلاین:</b> فقط اعضای آنلاین/اخیراً فعال\n"
+    "   ⚠️ نیاز به دسترسی به لیست اعضا دارد.\n\n"
+    "💡 <b>توصیه:</b> اگر مطمئن نیستید، ابتدا «همه اعضا» را امتحان کنید. اگر نتیجه نداد، ربات به‌طور خودکار «فرستندگان پیام» را پیشنهاد می‌دهد."
+)
 
 
 def get_extraction_status_badge(status) -> str:
@@ -86,6 +102,27 @@ def get_extraction_status_badge(status) -> str:
         badge = EXTRACTION_STATUS_BADGES.get(str(status), "❔ نامشخص")
     return badge or "❔ نامشخص"
 
+def get_wizard_filter_label(filter_str: str) -> str:
+    """تبدیل فرمت قدیمی و JSON جدید به لیبل فارسی خوانا"""
+    if not filter_str:
+        return "❔ نامشخص"
+    
+    # اگر فرمت JSON ویزارد جدید باشد
+    if filter_str.startswith("{"):
+        import json
+        try:
+            filters = json.loads(filter_str)
+            labels = []
+            if filters.get("online_only"): labels.append("آنلاین")
+            if filters.get("has_photo"): labels.append("عکس‌دار")
+            if filters.get("no_bots"): labels.append("بدون ربات")
+            return " + ".join(labels) if labels else "بدون فیلتر"
+        except:
+            return "فیلتر سفارشی"
+            
+    # اگر فرمت قدیمی باشد (users, messages, golden)
+    return EXTRACTION_TYPE_LABELS.get(filter_str, "❔ نامشخص")
+
 
 # ==========================================
 # BACKGROUND TASK: اجرای سناریوی استخراج در پس‌زمینه
@@ -94,176 +131,159 @@ def get_extraction_status_badge(status) -> str:
 # ==========================================
 
 # ==========================================
-# UI HANDLERS: تعامل با ادمین در ربات (منوی آنالیز)
+# ⚙️ جریان استخراج کلاسیک (لینک + پیام‌های ربات)
 # ==========================================
-@router.callback_query(F.data == "menu_analysis/")
-async def enter_analysis_menu(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await safe_callback_answer(callback)
+from aiogram.exceptions import TelegramBadRequest
+from contextlib import suppress
+from bot.handlers.order_handlers import get_extract_strategy_keyboard, FILTER_BY_TEXT
 
-    # 🟣 فاز ۱: پاکسازی امن state و فایل‌های موقت فلوی قبلی
-    # (اگر کاربر وسط فلوی دیگری مثل ثبت سفارش بوده باشد، فایل‌های موقتش
-    # orphan نمی‌شوند و بلافاصله از روی هارد پاک می‌شوند)
+
+@router.callback_query(F.data == "menu_analysis/")
+async def enter_classic_extraction(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await safe_callback_answer(callback)
     await cleanup_fsm_temp_files(state)
     await state.clear()
 
-    # تنظیم استیت روی انتظار برای انتخاب نوع آنالیز
-    await state.set_state(ExtractorStates.waiting_for_analysis_type)
-
-    # 📄 فاز ۵: دکمهٔ «📋 سفارشات استخراج» اضافه شد — راه پیگیری سفارش‌های
-    # استخراج بدون نیاز به حفظ کردن کد رهگیری EXT-XXXXXX
-    builder = InlineKeyboardBuilder()
-    builder.button(text="👥 کاربران", callback_data="analysis_users/")
-    builder.button(text="💬 پیام‌ها", callback_data="analysis_messages/")
-    builder.button(text="🌟 استخراج طلایی", callback_data="analysis_golden/")
-    builder.button(text="📋 سفارشات استخراج", callback_data="ext_list_page_1/")
-    builder.button(text="❌ انصراف", callback_data="cancel_current_flow/")
-    builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-
-    # چیدمان: دو دکمه در ردیف اول، «طلایی» و «لیست» هرکدام یک ردیف، انصراف+منو در آخر
-    builder.adjust(2, 1, 1, 2)
-
-    await safe_edit_or_answer(
-        callback.message,
-        with_cancel_hint("🌐 <b>نوع آنالیز را انتخاب کنید:</b>"),
-        reply_markup=builder.as_markup()
-    )
-
-
-@router.callback_query(ExtractorStates.waiting_for_analysis_type, F.data.in_(["analysis_users/", "analysis_messages/", "analysis_golden/"]))
-async def ask_for_analysis_link(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await safe_callback_answer(callback)
-
-    # استخراج نوع آنالیز از کال‌بک (users یا messages یا golden) و ذخیره آن در FSM
-    analysis_type = callback.data.replace("analysis_", "").replace("/", "")
-    await state.update_data(analysis_type=analysis_type)
-
-    # انتقال به استیت دریافت لینک
-    await state.set_state(ExtractorStates.waiting_for_link)
-
-    # درخواست لینک از کاربر
-    text_type = ""
-    if analysis_type == "users": text_type = "استخراج کاربران"
-    elif analysis_type == "messages": text_type = "استخراج پیام‌ها"
-    elif analysis_type == "golden": text_type = "استخراج طلایی"
-
-    # 🟣 فاز ۱: پیام prompt کیبورد انصراف و راهنمای /cancel دارد
-    # 📄 فاز ۵: ویرایش امن (پیام حذف‌شده/قدیمی → fallback به answer)
-    await safe_edit_or_answer(
-        callback.message,
-        with_cancel_hint(f"🔗 <b>لینک گروه را برای {text_type} ارسال کنید:</b>"),
-        reply_markup=get_cancel_keyboard()
-    )
-
-@router.message(ExtractorStates.waiting_for_link, F.text)
-async def process_extraction_link(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    link = message.text.strip()
+    # 🟢 گارد امنیتی: بررسی وضعیت ورکرها قبل از شروع ثبت سفارش استخراج
+    from database.models import Account, AccountStatus
+    from sqlalchemy import or_, select
+    from datetime import datetime, timezone
+    from contextlib import suppress
+    from aiogram.exceptions import TelegramBadRequest
     
-    from utils.telegram_helpers import parse_target_links
-    valid_links, invalid_lines = parse_target_links(link)
-
-    if not valid_links and invalid_lines:
-        invalid_text = "\n".join([f"خط {num}: <code>{html.escape(txt)}</code>" for num, txt in invalid_lines])
-        return await message.answer(
-            with_cancel_hint(
-                "⚠️ فرمت لینک نامعتبر است. خط(های) زیر معتبر نیستند:\n"
-                f"{invalid_text}\n\n"
-                "لطفاً فقط یکی از الگوهای مجاز را ارسال کنید:\n"
-                "• <code>t.me/username</code>\n"
-                "• <code>t.me/joinchat/...</code> یا <code>t.me/+...</code>\n"
-                "• <code>@username</code>"
-            ),
-            reply_markup=get_cancel_keyboard()
+    connected_ids = [acc_id for acc_id, c in worker_pool.items() if getattr(c, "is_connected", False)]
+    available_workers = 0
+    
+    if connected_ids:
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        # 🟢 تغییر: دریافت آی‌دی اکانت‌های معتبر
+        stmt = select(Account.id).where(
+            Account.id.in_(connected_ids),
+            Account.is_banned == False,
+            Account.status == AccountStatus.active,
+            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
+            or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
         )
+        valid_account_ids = (await session.scalars(stmt)).all()
         
-    if valid_links and invalid_lines:
-        invalid_text = "\n".join([f"خط {num}: <code>{html.escape(txt)}</code>" for num, txt in invalid_lines])
-        return await message.answer(
-            with_cancel_hint(
-                "⚠️ برخی خطوط معتبر نیستند:\n"
-                f"{invalid_text}\n\n"
-                "همه خطوط باید لینک معتبر باشند. لطفاً مجدداً کل ورودی را با فرمت درست ارسال کنید."
-            ),
-            reply_markup=get_cancel_keyboard()
-        )
-
-    if not valid_links:
-        return await message.answer(
-            with_cancel_hint(
-                "⚠️ هیچ لینک معتبری یافت نشد. لطفاً فقط یکی از الگوهای مجاز را ارسال کنید."
-            ),
-            reply_markup=get_cancel_keyboard()
-        )
+        if valid_account_ids:
+            try:
+                # 🟢 کسر اکانت‌های در حال استراحت
+                from workers.sender import _get_redis
+                redis_client = _get_redis()
+                pipe = redis_client.pipeline()
+                for aid in valid_account_ids:
+                    pipe.exists(f"chunk_cooldown:{aid}")
+                cooldown_results = await pipe.execute()
+                
+                available_workers = len(valid_account_ids) - sum(1 for res in cooldown_results if res)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"Redis check failed in extractor preflight: {e}")
+                available_workers = len(valid_account_ids)
         
-    # 🟢 فیکس فاز اول: جلوگیری از ورود چند لینک برای جلوگیری از اوررایت شدن خروجی استخراج
-    if len(valid_links) > 1:
-        return await message.answer(
-            with_cancel_hint(
-                "⚠️ <b>خطا: استخراج هم‌زمان مجاز نیست.</b>\n\n"
-                "برای جلوگیری از تداخل داده‌ها، سفارشات استخراج فقط باید شامل <b>یک لینک</b> باشند.\n"
-                "لطفاً فقط یک گروه را برای استخراج ارسال کنید."
-            ),
-            reply_markup=get_cancel_keyboard()
-        )
-        
-    # حالا مطمئنیم که دقیقاً یک لینک معتبر داریم
-    target_link = valid_links[0]
-
-    fsm_data = await state.get_data()
-    analysis_type = fsm_data.get("analysis_type", "users")
-    await state.clear()
-
-    chars = string.ascii_uppercase + string.digits
-    random_str = ''.join(random.choices(chars, k=6))
-    tracking_code = f"EXT-{random_str}"
-
-    type_fa = "استخراج کاربران (ساده)"
-    if analysis_type == "messages":
-        type_fa = "استخراج پیام‌ها (تارگت‌های فعال)"
-    elif analysis_type == "golden":
-        type_fa = "استخراج طلایی (دقیق و تقاطعی)"
-
-    # 🟢 فقط همان یک لینک به عنوان تارگت ذخیره می‌شود
-    new_order = Order(
-        order_type="extract",
-        target_data=target_link,
-        filter_type=analysis_type,
-        status=OrderStatus.pending,
-        tracking_code=tracking_code
-    )
-
-    session.add(new_order)
-
-    try:
-        await session.commit()
-    except Exception as e:
-        await session.rollback()
-        return await message.answer(
-            report_db_error("سفارش استخراج", e),
+    if available_workers <= 0:
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_reply_markup(reply_markup=None)
+            
+        return await safe_edit_or_answer(
+            callback.message,
+            "❌ <b>امکان ثبت سفارش آنالیز وجود ندارد</b>\n\n"
+            "در حال حاضر هیچ اکانتِ سالم و آزادی در سیستم یافت نشد.\n"
+            "(تمام ورکرها ممکن است در حال استراحت دوره‌ای باشند، یا مسدود و دارای محدودیت باشند)\n\n"
+            "<i>لطفاً اکانت جدیدی اضافه کنید یا منتظر پایان استراحت اکانت‌های فعلی بمانید.</i>",
             reply_markup=get_main_menu_keyboard()
         )
 
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📊 داشبورد استخراج", callback_data=f"ext_dashboard_{tracking_code}/")
-    builder.button(text="📋 سفارشات استخراج", callback_data="ext_list_page_1/")
-    builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-    builder.adjust(1)
+    # ۱. تنظیم نوع سفارش و هدایت به استیت دریافت لینک
+    await state.update_data(order_type="extract")
+    await state.set_state(ExtractorStates.waiting_for_link)
+    
+    with suppress(TelegramBadRequest):
+        await callback.message.edit_reply_markup(reply_markup=None)
 
-    await message.answer(
-        f"✅ <b>سفارش استخراج با موفقیت در صف قرار گرفت.</b>\n\n"
-        f"🆔 کد رهگیری: <code>{tracking_code}</code>\n"
-        f"📊 الگوریتم: <b>{type_fa}</b>\n\n"
-        f"⏳ سفارش در انتظار تایید ادمین است؛ پس از تایید، به‌طور خودکار وارد صف اجرا می‌شود و فایل خروجی ارسال خواهد شد.\n\n"
-        f"<i>برای پیگیری زندهٔ وضعیت از دکمهٔ زیر استفاده کنید:</i>",
-        reply_markup=builder.as_markup()
+    text = (
+        "🌐 <b>سفارش استخراج (آنالیز)</b>\n\n"
+        "لطفاً لینک گروه مورد نظر خود را ارسال کنید:\n"
+        "<i>(مثال: t.me/groupname یا @groupname)</i>"
+    )
+    
+    await callback.message.answer(
+        with_cancel_hint(text),
+        reply_markup=get_cancel_keyboard() 
     )
 
+
+@router.message(ExtractorStates.waiting_for_link, F.text)
+async def classic_process_link(message: types.Message, state: FSMContext) -> None:
+    link = message.text.strip()
+    from utils.telegram_helpers import parse_target_links
+    valid_links, _ = parse_target_links(link)
+
+    if not valid_links or len(valid_links) > 1:
+        return await message.answer(
+            with_cancel_hint("⚠️ لطفاً دقیقاً **یک لینک گروه معتبر** ارسال کنید."),
+            reply_markup=get_cancel_keyboard()
+        )
+
+    # ۲. ذخیره لینک و نمایش کیبورد متنی استراتژی‌ها
+    await state.update_data(target_link=valid_links[0])
+    await state.set_state(ExtractorStates.waiting_for_strategy)
+    
+    await message.answer(
+        with_cancel_hint(EXTRACTION_STRATEGY_TEXT),
+        reply_markup=get_extract_strategy_keyboard()
+    )
+
+@router.message(ExtractorStates.waiting_for_strategy, F.text.in_(FILTER_BY_TEXT))
+async def classic_confirm_and_start(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
+    # ۳. نگاشت انتخاب کاربر به استراتژی استخراج (مثل "messages", "users", و ...)
+    filter_type = FILTER_BY_TEXT[message.text.strip()]
+    
+    data = await state.get_data()
+    target_link = data.get("target_link")
+    await state.clear()
+
+    import string
+    import random
+    from config import config
+    
+    chars = string.ascii_uppercase + string.digits
+    tracking_code = f"EXT-{''.join(random.choices(chars, k=6))}"
+
+    # ۴. ساخت و درج سفارش در دیتابیس با مقدار استراتژی کلاسیک
+    new_order = Order(
+        order_type="extract",
+        target_data=target_link,
+        filter_type=filter_type, 
+        status=OrderStatus.pending,
+        tracking_code=tracking_code,
+        user_id=message.from_user.id,
+        is_approved=False
+    )
+    session.add(new_order)
+    await session.commit()
+
+    type_fa = EXTRACTION_TYPE_LABELS.get(filter_type, "نامشخص")
+
+    # --- پیام تایید نهایی برای کاربر ---
+    text = (
+        f"✅ <b>سفارش استخراج در صف قرار گرفت!</b>\n\n"
+        f"🆔 کد رهگیری: <code>{tracking_code}</code>\n"
+        f"🎯 تارگت: {target_link}\n"
+        f"⚙️ استراتژی: <b>{type_fa}</b>\n\n"
+        "⏳ سفارش در انتظار تایید ادمین است؛ پس از تایید به‌طور خودکار آغاز می‌شود."
+    )
+    
+    # جایگزینی کیبورد ربات با کیبورد اصلی
+    await message.answer(text, reply_markup=get_main_menu_reply_keyboard())
+    
+    # --- ارسال پیام تایید/رد برای ادمین ---
     admin_builder = InlineKeyboardBuilder()
     admin_builder.button(text="✅ تایید و شروع", callback_data=f"approve_order_{new_order.id}/")
     admin_builder.button(text="❌ رد سفارش", callback_data=f"reject_order_{new_order.id}/")
     admin_builder.adjust(2)
     
-    target_summary = html.escape(target_link)
-        
     try:
         await message.bot.send_message(
             chat_id=config.ADMIN_ID,
@@ -271,16 +291,22 @@ async def process_extraction_link(message: types.Message, state: FSMContext, ses
                 f"🛎 <b>سفارش استخراج جدید نیازمند تایید</b>\n\n"
                 f"🆔 شناسه: <code>{new_order.id}</code>\n"
                 f"🎟 کد رهگیری: <code>{new_order.tracking_code}</code>\n"
-                f"📊 الگوریتم: <b>{type_fa}</b>\n"
-                f"🎯 تارگت: <code>{target_summary}</code>\n\n"
+                f"📊 استراتژی: <b>{type_fa}</b>\n"
+                f"🎯 تارگت: <code>{html.escape(target_link)}</code>\n\n"
                 f"<i>لطفاً جهت ورود این سفارش به صف اجرا آن را تایید کنید.</i>"
             ),
             reply_markup=admin_builder.as_markup(),
             disable_web_page_preview=True
         )
     except Exception as e:
-        logger.error(f"Failed to send extraction approval request to admin for order {new_order.id}: {e}")
+        logger.error(f"Failed to send extraction approval request to admin: {e}")
 
+@router.message(ExtractorStates.waiting_for_strategy)
+async def classic_strategy_fallback(message: types.Message) -> None:
+    await message.answer(
+        with_cancel_hint("⚠️ لطفاً استراتژی استخراج را از طریق دکمه‌های کیبورد پایین صفحه انتخاب کنید."),
+        reply_markup=get_extract_strategy_keyboard()
+    )
 
 # ==========================================
 # 📄 فاز ۵: لیست سفارشات استخراج (صفحه‌بندی استاندارد)
@@ -290,6 +316,7 @@ async def render_extraction_orders_list(
     session: AsyncSession,
     state: Optional[FSMContext] = None,
     page: int = 1,
+    send_new: bool = False,
 ) -> None:
     try:
         total_count = await session.scalar(
@@ -325,13 +352,14 @@ async def render_extraction_orders_list(
     if total_count == 0:
         builder.row(types.InlineKeyboardButton(text="🔙 بازگشت به آنالیز", callback_data="menu_analysis/"))
         builder.row(types.InlineKeyboardButton(text="🏛 منوی اصلی", callback_data="menu_home/"))
-        return await safe_edit_or_answer(
-            callback.message,
+        text_empty = (
             "📋 <b>لیست سفارشات استخراج</b>\n\n"
             "⚠️ موردی یافت نشد.\n\n"
-            "برای شروع، از منوی آنالیز یکی از انواع استخراج را انتخاب کنید:",
-            reply_markup=builder.as_markup()
+            "برای شروع، از منوی آنالیز یکی از انواع استخراج را انتخاب کنید:"
         )
+        if send_new:
+            return await callback.message.answer(text_empty, reply_markup=builder.as_markup())
+        return await safe_edit_or_answer(callback.message, text_empty, reply_markup=builder.as_markup())
 
     text = (
         "📋 <b>لیست سفارشات استخراج</b>\n"
@@ -341,7 +369,7 @@ async def render_extraction_orders_list(
 
     for idx, order in enumerate(orders, start=offset + 1):
         badge = get_extraction_status_badge(order.status)
-        type_label = EXTRACTION_TYPE_LABELS.get(order.filter_type, "❔ نامشخص")
+        type_label = get_wizard_filter_label(order.filter_type)
         # 🟢 فیکس فاز دوم: اگر ثبت نشده باشد (درحال اجرا)، صرفا 0 نشان داده می‌شود
         extracted = order.extracted_count or 0 
         created_date = order.created_at.strftime("%Y/%m/%d") if order.created_at else "نامشخص"
@@ -371,7 +399,10 @@ async def render_extraction_orders_list(
         types.InlineKeyboardButton(text="🏛 منوی اصلی", callback_data="menu_home/"),
     )
 
-    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+    if send_new:
+        await callback.message.answer(text, reply_markup=builder.as_markup())
+    else:
+        await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
 
 @router.callback_query(F.data.startswith("ext_list_page_"))
 async def extraction_orders_list_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
@@ -402,16 +433,31 @@ async def build_extraction_dashboard_view(
         if not extraction:
             return None, None
 
-        # 🟢 فیکس فاز دوم: حذف کوئری غلط روی جدول OrderLog
         extracted_count = extraction.extracted_count or 0
 
     except Exception as e:
-        # 🟢 فیکس ضدالگوی پرتاب عریان خطا
         logger.error(f"Error building extraction dashboard for {tracking_code}: {e}", exc_info=True)
         return None, None
 
-    badge = get_extraction_status_badge(extraction.status)
-    type_label = EXTRACTION_TYPE_LABELS.get(extraction.filter_type, "❔ نامشخص")
+    # 🟢 تشخیص وضعیت دقیق‌تر برای داشبورد استخراج
+    if extraction.status == OrderStatus.pending:
+        if extraction.is_approved:
+            badge = "🕒 در صف انتظار دیسپچ"
+        else:
+            badge = "⏳ در انتظار تایید ادمین"
+    elif extraction.status == OrderStatus.running:
+        badge = "🚀 در حال اجرا"
+    elif extraction.status == OrderStatus.completed:
+        badge = "✅ تکمیل شده"
+        if extraction.reject_reason == "fallback_messages":
+            badge = "✅ تکمیل شده (فال‌بک پیام‌ها)"
+    else:
+        if not extraction.is_approved and extraction.reject_reason:
+            badge = f"❌ رد شده\n💬 علت: <i>{html.escape(extraction.reject_reason)}</i>"
+        else:
+            badge = "🛑 متوقف/لغو شده"
+
+    type_label = get_wizard_filter_label(extraction.filter_type)
     source_display = html.escape(extraction.target_data or "نامشخص")
     created_date = extraction.created_at.strftime("%Y/%m/%d %H:%M") if extraction.created_at else "نامشخص"
 
@@ -428,35 +474,41 @@ async def build_extraction_dashboard_view(
 
     if extraction.status == OrderStatus.completed:
         text += "\n📁 فایل نتیجه آماده است — برای دریافت آن از دکمهٔ «📥 خروجی» استفاده کنید.\n"
+        if extraction.reject_reason == "fallback_messages":
+            text += "\n⚠️ <i>توجه: به دلیل مخفی بودن لیست اعضای این گروه، استخراج به صورت خودکار از میان «پیام‌دهندگان اخیر» انجام شد تا سفارش با موفقیت تکمیل گردد.</i>\n"
+    elif extraction.status == OrderStatus.error and extracted_count > 0:
+        text += "\n📁 عملیات متوقف شد، اما فایل استخراج تا این لحظه آماده است.\n"
 
     builder = InlineKeyboardBuilder()
+    
+    # 🟢 دکمه‌های تایید برای وضعیت در انتظار تایید
+    if extraction.status == OrderStatus.pending and not extraction.is_approved:
+        builder.button(text="✅ تایید و شروع", callback_data=f"approve_order_{extraction.id}/")
+        builder.button(text="❌ رد سفارش", callback_data=f"reject_order_{extraction.id}/")
+
     builder.button(text="🔄 بروزرسانی", callback_data=f"ext_dashboard_{tracking_code}/")
     
-    if extraction.status == OrderStatus.completed:
+    # 🟢 دکمه توقف برای تمامی عملیات‌های فعال (حتی قبل از تایید و در صف انتظار)
+    if extraction.status in [OrderStatus.pending, OrderStatus.running]:
+        builder.button(text="🛑 توقف عملیات / لغو", callback_data=f"cancel_order_{extraction.id}/")
+    
+    # 🟢 دکمه خروجی برای عملیات تمام شده یا متوقف شده (در صورت وجود دیتا)
+    if extraction.status in [OrderStatus.completed, OrderStatus.error]:
         builder.button(text="📥 خروجی", callback_data=f"export_order_{extraction.id}/")
-        builder.button(text="🔙 بازگشت به لیست استخراج", callback_data=f"ext_list_page_{back_page}/")
-        builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-        builder.adjust(1, 2, 1)
-    else:
-        builder.button(text="🔙 بازگشت به لیست استخراج", callback_data=f"ext_list_page_{back_page}/")
-        builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-        builder.adjust(1, 1, 1)
+    
+    
+    builder.adjust(1)
 
     return text, builder.as_markup()
 
 
-@router.callback_query(F.data.startswith("ext_dashboard_") & F.data.endswith("/"))
-async def show_extraction_dashboard(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    """
-    📊 فاز ۵: داشبورد زندهٔ سفارش استخراج — وضعیت، تعداد استخراج‌شده، 🔄 بروزرسانی
-    و 📥 خروجی (که توسط هندلر export_order در order_fsm_router پردازش می‌شود).
-    """
-    tracking_code = callback.data.replace("ext_dashboard_", "").replace("/", "")
+@router.callback_query(F.data.startswith("ext_dashboard_new_") & F.data.endswith("/"))
+async def show_extraction_dashboard_new(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await safe_callback_answer(callback)
+    tracking_code = callback.data.replace("ext_dashboard_new_", "").replace("/", "")
 
     if not EXT_TRACKING_CODE_PATTERN.fullmatch(tracking_code):
-        return await safe_callback_answer(callback, "⚠️ کد پیگیری نامعتبر است.", show_alert=True)
-
-    await safe_callback_answer(callback)
+        return await callback.message.answer("⚠️ کد پیگیری نامعتبر است.")
     
     fsm_data = await state.get_data()
     back_page = fsm_data.get("ext_list_page", 1)
@@ -465,15 +517,81 @@ async def show_extraction_dashboard(callback: types.CallbackQuery, state: FSMCon
         text, markup = await build_extraction_dashboard_view(session, tracking_code, back_page)
     except Exception as e:
         await session.rollback()
+        return await callback.message.answer(report_db_error("سفارش استخراج", e))
+
+    if not text:
+        return await safe_callback_answer(callback, "❌ سفارش استخراج یافت نشد.", show_alert=True)
+
+    await callback.message.answer(
+        text,
+        reply_markup=markup,
+        link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+    )
+
+@router.callback_query(F.data.startswith("ext_list_new_page_"))
+async def extraction_orders_list_new_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await safe_callback_answer(callback)
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+    page = parse_page_from_callback(callback.data.replace("_new", ""))
+    await render_extraction_orders_list(callback, session, state=state, page=page, send_new=True)
+
+@router.callback_query(F.data.startswith("ext_dashboard_") & F.data.endswith("/"))
+async def show_extraction_dashboard(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    """
+    📊 فاز ۵/۶: داشبورد زندهٔ سفارش استخراج با قابلیت بروزرسانی خودکار در پیام جدید
+    """
+    await safe_callback_answer(callback)
+
+    tracking_code = callback.data.replace("ext_dashboard_", "").replace("/", "")
+    # هندل کردن دکمه‌های قدیمی ثبت‌شده که ممکن است هنوز new_ داشته باشند
+    if tracking_code.startswith("new_"):
+        tracking_code = tracking_code[4:]
+
+    if not EXT_TRACKING_CODE_PATTERN.fullmatch(tracking_code):
+        return await safe_edit_message(callback.message, "⚠️ کد پیگیری نامعتبر است.")
+    
+    fsm_data = await state.get_data()
+    back_page = fsm_data.get("ext_list_page", 1)
+
+    try:
+        order = await session.scalar(
+            select(Order).where(
+                Order.tracking_code == tracking_code,
+                Order.order_type == "extract",
+            )
+        )
+        if not order:
+            return await safe_edit_message(callback.message, "❌ سفارش استخراج یافت نشد.")
+
+        text, markup = await build_extraction_dashboard_view(session, tracking_code, back_page)
+    except Exception as e:
+        await session.rollback()
         return await answer_callback_error(
             callback, report_db_error("سفارش استخراج", e), get_main_menu_button()
         )
 
     if not text:
-        return await safe_callback_answer(callback, "❌ سفارش استخراج یافت نشد.", show_alert=True)
+        return await safe_edit_message(callback.message, "❌ سفارش استخراج یافت نشد.")
 
-    await safe_edit_message(
-        callback.message, text,
+    # 🟢 پاک کردن پیام قدیمی برای ارسال داشبورد در پیام جدید طبق نیاز کارفرما
+    from contextlib import suppress
+    with suppress(Exception):
+        await callback.message.delete()
+        
+    is_active = order.status in [OrderStatus.pending, OrderStatus.running]
+    indicator = "\n\n🟢 <b>لایو</b> (به‌روزرسانی خودکار فعال)" if is_active else ""
+
+    sent_message = await callback.message.answer(
+        text + indicator,
         reply_markup=markup,
         link_preview_options=types.LinkPreviewOptions(is_disabled=True),
     )
+
+    # 🟢 اتصال به سیستم تسک‌های پس‌زمینهٔ داشبورد /gtg_ برای رفرش خودکار
+    if is_active:
+        from bot.handlers.order_handlers import _active_refresh_tasks, _auto_refresh_dashboard_task
+        task_key = f"{sent_message.chat.id}_{sent_message.message_id}"
+        _active_refresh_tasks[task_key] = asyncio.create_task(
+            _auto_refresh_dashboard_task(sent_message, order.id, callback.bot)
+        )

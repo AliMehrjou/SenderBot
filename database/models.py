@@ -11,6 +11,7 @@ class OrderStatus(str, enum.Enum):
     running = "running"
     completed = "completed"
     error = "error"
+    on_hold_proxy = "on_hold_proxy"
 
 order_category_assoc = Table(
     "order_category_assoc",
@@ -26,6 +27,7 @@ class Admin(Base):
     __tablename__ = "admins"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    progress_notify: Mapped[bool] = mapped_column(default=True, nullable=False)
 
 
 class APIKey(Base):
@@ -44,6 +46,10 @@ class Category(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     
+    # فاز جدید: پراکسی پرمیوم مشتری
+    has_premium_proxy: Mapped[bool] = mapped_column(default=False, server_default="0", nullable=False)
+    premium_proxy_string: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
     # 🛡 اصلاح فاز ۱۰: حذف delete-orphan برای جلوگیری از پاک شدن اکانت‌های زیرمجموعه
     accounts: Mapped[List["Account"]] = relationship(
         back_populates="category", 
@@ -55,11 +61,24 @@ class Category(Base):
     def custom_id(self) -> str:
         return f"user_{self.id}/"
     
+class AccountStatus(str, enum.Enum):
+    active = "active"
+    cooldown = "cooldown"
+    blocked = "blocked"
+    disabled = "disabled"
+
+
 class Account(Base):
     __tablename__ = "accounts"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone_number: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)
     telegram_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
+    
+    # 🩺 فاز ۱۰: سیستم سلامت اکانت
+    status: Mapped[AccountStatus] = mapped_column(SQLAlchemyEnum(AccountStatus), default=AccountStatus.active, nullable=False, index=True)
+    status_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    expected_return_time: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    consecutive_errors: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
     session_string: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     
     # 🛡 اصلاح فاز ۱۰: اضافه شدن ondelete="SET NULL" برای همخوانی با فلسفه حفظ اکانت‌ها
@@ -68,11 +87,21 @@ class Account(Base):
         nullable=True, index=True
     )
     proxy_string: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    
+    # 🧱 فاز ۳: قرارداد وضعیت پروکسی و صف انتظار
+    proxy_status: Mapped[str] = mapped_column(String(20), default="WAITING_PROXY", server_default="'WAITING_PROXY'", nullable=False, index=True)
+    proxy_queue_joined_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    
     is_banned: Mapped[bool] = mapped_column(default=False)
     flood_wait_until: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=True)
     warmed_up_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    last_limit_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    spambot_report: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    spambot_checked_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    restricted_until: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     category: Mapped[Optional["Category"]] = relationship(
         back_populates="accounts", 
@@ -98,6 +127,21 @@ class Account(Base):
     def custom_id(self) -> str:
         return f"user_{self.id}/"
 
+# مسیر فایل: database/models.py
+# بلوک کد الحاقی (انتهای فایل):
+class WorkerEvent(Base):
+    """🩺 فاز ۱۰: ثبت رویدادهای تغییر وضعیت اکانت‌ها (لاگ‌های سلامت)"""
+    __tablename__ = "worker_events"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True)
+    old_status: Mapped[str] = mapped_column(String(50), nullable=False)
+    new_status: Mapped[str] = mapped_column(String(50), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    error_details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    account: Mapped["Account"] = relationship()
+
 class Order(Base):
     __tablename__ = "orders"
     
@@ -111,7 +155,7 @@ class Order(Base):
     order_type: Mapped[str] = mapped_column(String(50), nullable=False)
     target_data: Mapped[str] = mapped_column(LONGTEXT, nullable=False)
     target_count: Mapped[Optional[int]] = mapped_column(nullable=True)
-    filter_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    filter_type: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     
     message_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     media_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -131,6 +175,11 @@ class Order(Base):
     inflight_data: Mapped[Optional[str]] = mapped_column(LONGTEXT, nullable=True)
     fail_streak: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
     use_banner_pool: Mapped[bool] = mapped_column(default=False, nullable=False)
+    
+    hold_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    server_ip_consent: Mapped[bool] = mapped_column(default=False, server_default="0", nullable=False)
+
+    speed_mode: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
 
     source_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     source_message_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -139,6 +188,8 @@ class Order(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     scheduled_for: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     tracking_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, index=True, nullable=True)
+
+    user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
 
     is_approved: Mapped[bool] = mapped_column(default=False, server_default="0", nullable=False)
     reject_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -271,21 +322,26 @@ class GlobalSettings(Base):
     __tablename__ = "global_settings"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     max_accounts_per_api: Mapped[int] = mapped_column(default=5, nullable=False)
-    send_limit_per_run: Mapped[int] = mapped_column(default=40, nullable=False)
-    cooldown_hours: Mapped[int] = mapped_column(default=24, nullable=False)
-    spam_penalty_days: Mapped[int] = mapped_column(default=3, nullable=False)
+    send_limit_per_run: Mapped[int] = mapped_column(default=80, nullable=False)
+    cooldown_hours: Mapped[int] = mapped_column(default=1, nullable=False)
+    spam_penalty_days: Mapped[int] = mapped_column(default=1, nullable=False)
     
     auto_set_2fa: Mapped[bool] = mapped_column(default=True, nullable=False)         
     terminate_sessions: Mapped[bool] = mapped_column(default=False, nullable=False)    
-    # 🎭 مدیریت پیشرفته پروفایل‌ها: سوئیچ واحد قبلی (auto_set_profile) به سه سوئیچ
-    # مستقل تفکیک شد و قابلیت یوزرنیم (auto_set_username) کامل حذف گردید.
-    auto_set_bio: Mapped[bool] = mapped_column(default=True, nullable=False)         # تغییر خودکار بیوگرافی
-    auto_set_name: Mapped[bool] = mapped_column(default=True, nullable=False)        # تغییر خودکار نام (first/last)
-    # 🖼 تغییر خودکار عکس پروفایل (پکیج‌های ۳ تایی) — مصرف‌کننده:
-    # rotate_profile_photos که از session_manager فراخوانی می‌شود
+    auto_set_bio: Mapped[bool] = mapped_column(default=True, nullable=False)
+    auto_set_name: Mapped[bool] = mapped_column(default=True, nullable=False)
     auto_set_photo: Mapped[bool] = mapped_column(default=False, nullable=False)
     public_order_access: Mapped[bool] = mapped_column(default=False, nullable=False)   
 
+    # 🚀 فاز جدید: پروفایل سرعت و ریسک‌پذیری
+# --- کد تغییر یافته ---
+    extraction_speed_mode: Mapped[str] = mapped_column(String(8), default="safe", server_default="safe", nullable=False)
+    turbo_risk_acknowledged: Mapped[bool] = mapped_column(default=False, server_default="0", nullable=False)
+    worker_residency: Mapped[str] = mapped_column(String(15), default="ephemeral", server_default="'ephemeral'", nullable=False)
+    smart_anti_ban: Mapped[bool] = mapped_column(default=True, server_default="1", nullable=False)
+    
+    # 🚀 فاز جدید: تنظیمات ارسال مستقیم یا با پراکسی
+    use_proxy_for_sending: Mapped[bool] = mapped_column(default=False, server_default="0", nullable=False)
 
 class Proxy(Base):
     """
@@ -304,6 +360,19 @@ class Proxy(Base):
     #    ALTER TABLE proxies ADD COLUMN in_use INT NOT NULL DEFAULT 0;
     #    (backfill اولیه به‌صورت خودکار توسط reconcile_proxy_usage در استارتاپ انجام می‌شود)
     in_use: Mapped[int] = mapped_column(default=0, nullable=False)
+
+    # 🩺 فاز جدید: تفکیک نوع پراکسی و بررسی سلامت
+    usage_type: Mapped[str] = mapped_column(String(20), default="both", server_default="'both'", nullable=False)
+    is_healthy: Mapped[bool] = mapped_column(default=True, server_default="1", nullable=False)
+    
+    # فاز ۲: ماشین وضعیت سلامت پروکسی
+    health_state: Mapped[str] = mapped_column(String(20), default="HEALTHY", server_default="'HEALTHY'", nullable=False)
+    consecutive_successes: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
+    consecutive_failures: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
+    last_state_changed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    ping_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_checked_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     @property
     def custom_id(self) -> str:

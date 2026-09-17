@@ -6,16 +6,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, unquote
 import asyncio
-from typing import Set
-
-
+from typing import Set, Iterable
+from pathlib import Path
+import sqlite3
 
 from pyrogram import Client
 from pyrogram.errors import (
     AuthKeyUnregistered,
     UserDeactivated,
     UserDeactivatedBan,
-    Unauthorized
+    Unauthorized,
+    AuthKeyDuplicated
 )
 from pyrogram.handlers import MessageHandler
 from pyrogram import filters
@@ -33,10 +34,13 @@ from utils.advanced_anti_ban import (
     rotate_profile_photos,
     terminate_other_sessions,
 )
+
 from utils.crm_catcher import incoming_message_handler
 from utils.seen_watcher import attach_seen_listener  # 🧠 جریان هوشمند (Smart Flow): شنود «سین» تارگت
+from utils.join_request_listener import attach_join_request_listener  # 🟢 شنود تأیید/رد عضویت
 from utils.crypto import decrypt_session 
 from workers.sender import _get_redis
+from utils.admin_broadcast import broadcast_to_admins
 logger = logging.getLogger(__name__)
 # ==========================================
 # CONSTANTS: SPOOFING DATA
@@ -49,6 +53,46 @@ DEVICE_MODELS = [
 SYSTEM_VERSIONS = ["15.0", "16.0", "13.0", "12.0", "14.0", "17.0"]
 APP_VERSIONS = ["9.6.5", "9.7.0", "9.5.2", "10.0.1", "10.1.3", "10.2.0"]
 _background_tasks: Set[asyncio.Task] = set()
+
+SESSIONS_DIR = Path("sessions")
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+
+# ==========================================
+# 🟢 فاز ۷: throttle بین warm-upهای ورکرها
+# ==========================================
+_warmup_lock_key = "warmup_lock:worker_cache"
+
+def direct_ip_fallback_enabled(account_id: int) -> bool:
+    return getattr(config, "FALLBACK_TO_DIRECT_IP", True)
+
+async def _acquire_warmup_slot() -> None:
+    """
+    🟢 فاز ۷: قبل از warm_worker_cache، این تابع صدا زده می‌شود تا مطمئن شویم
+    فقط یک ورکر همزمان در حال get_dialogs است.
+    """
+    from workers.sender import _get_redis
+    
+    try:
+        redis = _get_redis() # 🛡 استفاده از سینگلتون بجای ساختن کانکشن‌پول جدید
+        throttle_min = float(getattr(config, "WARMUP_THROTTLE_MIN", 2.0))
+        throttle_max = float(getattr(config, "WARMUP_THROTTLE_MAX", 5.0))
+        throttle_seconds = random.uniform(throttle_min, throttle_max)
+        
+        for _ in range(20):
+            acquired = await redis.set(
+                _warmup_lock_key, "1",
+                nx=True,
+                px=int((throttle_seconds + 2.0) * 1000),
+            )
+            if acquired:
+                return
+            await asyncio.sleep(0.5)
+        
+        logger.warning("warmup throttle: could not acquire lock after 10s — proceeding anyway.")
+    except Exception as e:
+        logger.debug(f"warmup throttle skipped (best-effort): {e}")
 # ==========================================
 # 🔥 فاز ۶ (R7): گرم‌شدن اجباری اکانت تازه-لاگین
 # ==========================================
@@ -120,19 +164,56 @@ def _proxy_cap() -> int:
     """سقف اکانت روی هر پراکسی — همیشه >= 1."""
     return max(1, config.MAX_ACCOUNTS_PER_PROXY)
 
+async def process_proxy_queue(session: AsyncSession) -> None:
+    """منطق صف FIFO برای تخصیص ظرفیت‌های خالی به اکانت‌های منتظر"""
+    stmt = (
+        select(Account)
+        .where(Account.proxy_status == "WAITING_PROXY")
+        .order_by(Account.proxy_queue_joined_at.is_(None), Account.proxy_queue_joined_at.asc())
+        .limit(30)
+    )
+    waiting_accounts = (await session.scalars(stmt)).all()
 
-async def release_proxy_slot(session: AsyncSession, proxy_string: str) -> None:
-    """
-    آزادسازی یک اسلاتِ مصرفِ پراکسی (کاهش in_use با گاردِ عدم منفی شدن).
-    🛡 BUG-30: commit نمی‌زند — کنترل تراکنش با caller است.
-    """
+    for acc in waiting_accounts:
+        claimed = await claim_proxy_for_account(session, acc.id)
+        if not claimed:
+            break # اتمام ظرفیت، خروج از صف
+        await log_proxy_event(session, acc.id, "DEQUEUE", claimed, "Assigned from FIFO queue")
+
+
+async def background_process_proxy_queue() -> None:
+    """Wrapper برای اجرای پس‌زمینه صف بدون تداخل با تراکنش caller"""
+    try:
+        from database.engine import async_session
+        async with async_session() as session:
+            await process_proxy_queue(session)
+            await session.commit()
+    except Exception as e:
+        logger.error(f"Error in background_process_proxy_queue: {e}")
+
+
+async def release_proxy_slot(session: AsyncSession, proxy_string: str, account_id: Optional[int] = None) -> None:
+    """آزادسازی یک اسلات و بیدار کردن رویدادمحورِ صف انتظار."""
     stmt = (
         update(Proxy)
         .where(Proxy.proxy_string == proxy_string, Proxy.in_use > 0)
         .values(in_use=Proxy.in_use - 1)
         .execution_options(synchronize_session=False)
     )
-    await session.execute(stmt)
+    res = await session.execute(stmt)
+    if res.rowcount > 0 and account_id:
+        await log_proxy_event(session, account_id, "RELEASE", proxy_string, "Slot released")
+
+    # 🔄 فاز ۵: اعمال Cooldown برای پروکسیِ تازه رهاشده تا مدتی کاندید نشود
+    try:
+        from workers.sender import _get_redis
+        await _get_redis().set(f"proxy_cd:{proxy_string}", "1", ex=getattr(config, "ROTATE_COOLDOWN_SECONDS", 300))
+    except Exception as e:
+        logger.debug(f"Failed to set proxy cooldown for {proxy_string}: {e}")
+
+    # بیدار کردن رویدادمحور صف انتظار (Event-Driven)
+    asyncio.create_task(background_process_proxy_queue())
+
 
 
 async def reconcile_proxy_usage(session: AsyncSession) -> None:
@@ -178,141 +259,249 @@ async def reconcile_proxy_usage(session: AsyncSession) -> None:
         )
 
 
-async def claim_proxy_for_account(
-    session: AsyncSession, account_id: Optional[int] = None
-) -> Optional[str]:
+async def mark_proxy_failed(session: AsyncSession, proxy_string: str) -> None:
     """
-    🧲 فاز ۵ (BUG-14a/14b) + فاز ۴ (رفع آنتی‌پترن لاگین): تخصیص اتمیکِ پراکسیِ
-    با ظرفیت آزاد — دو حالت فراخوانی (با account_id برای چرخش ورکر؛ با
-    account_id=None برای جریان لاگین که هنوز Accountی ساخته نشده).
-
-    ۱) sticky (با account_id): اکانت روی پراکسی فعلی‌اش می‌ماند؛ فقط هنگام چرخش، اسلاتِ پراکسی
-       قبلی در همین تراکنش آزاد می‌شود.
-    ۲) کاندیدها «بدون FOR UPDATE» خوانده می‌شوند — کوئری قبلی
-       (ORDER BY RAND() ... FOR UPDATE SKIP LOCKED) عملاً همه‌ی ردیف‌های فعال را
-       تا commit قفل می‌کرد (sort روی همه‌ی ردیف‌ها) و رزرو واقعی هم نبود.
-    ۳) رزرو واقعی با UPDATE اتمیک روی سطرِ تنها:
-       UPDATE proxies SET in_use = in_use + 1 WHERE id = ? AND in_use < cap
-       شرط WHERE با current-read (آخرین مقدار commit شده) ارزیابی می‌شود →
-       دو claim همزمان هرگز سقف را رد نمی‌کنند. rowcount == 1 یعنی مالِ ما؛
-       0 یعنی رقابت/ظرفیت پر → کاندید بعدی.
-    ۴) کاندید قبل از claim با parse_proxy_string اعتبارسنجی می‌شود تا اکانت
-       هرگز به پراکسی غیرقابل‌پارس bind نشود (حفظ رفتار «جایگزینی فقط با
-       parse مجدد» — caller باز هم parse مجدد می‌کند).
-    ۵) binding جدید (accounts.proxy_string) در همان تراکنش ثبت می‌شود.
-       🛡 BUG-30: commit با caller است؛ rollback اتمیک claim را هم برمی‌گرداند.
-
-    خروجی: proxy_string در صورت موفقیت؛ None یعنی ظرفیت آزادی نیست. در حالت
-    account_id ارائه‌شده، اکانت روی binding فعلی‌اش می‌ماند و هیچ تغییری در
-    in_use رخ نمی‌دهد. در حالت account_id=None، هیچ تغییر پایداری روی Account
-    رخ نداده (فقط in_use + ۱ که caller باید در صورت شکست آزاد کند).
+    Marks a proxy as failed by feeding it to the health hysteresis machine.
     """
-    cap = _proxy_cap()
+    if not proxy_string:
+        return
+        
+    try:
+        from utils.health_checker import report_proxy_result
+        # ارسال شکست به ماشین سلامت؛ این تابع خودش commit مستقل دارد و is_healthy را هم سینک می‌کند
+        await report_proxy_result(proxy_string, is_success=False)
+        logger.info(f"Proxy marked as failed via health machine: {proxy_string}")
+    except Exception as e:
+        logger.error(f"Failed to mark proxy as failed via health machine: {e}")
 
-    # پراکسی فعلی اکانت — فقط در حالت چرخش (account_id ارائه شده) معنا دارد.
-    # در جریان لاگین (account_id is None) همیشه None است و آزادسازی رخ نمی‌دهد.
-    old_proxy_str: Optional[str] = None
-    if account_id is not None:
-        old_proxy_str = await session.scalar(
-            select(Account.proxy_string).where(Account.id == account_id)
-        )
+# ==========================================
+# 🧲 PROXY CLAIM & LOGIN LOGIC (NEW ATOMIC FLOW)
+# ==========================================
 
-    # کاندیدها: فعال + ظرفیت آزاد + پراکسیِ فعلی خودِ اکانت نیست (در حالت چرخش)
-    cand_filters = [Proxy.is_active == True, Proxy.in_use < cap]
-    if old_proxy_str:
-        cand_filters.append(Proxy.proxy_string != old_proxy_str)
-    cand_stmt = (
-        select(Proxy.id, Proxy.proxy_string)
-        .where(*cand_filters)
-        .order_by(func.rand())
-        .limit(PROXY_CLAIM_CANDIDATES)
+def login_proxy_dict() -> Optional[dict]:
+    """پارس کردن پراکسی مخصوص لاگین (در صورت وجود). اگر نامعتبر باشد لاگ می‌دهد."""
+    url = getattr(config, "LOGIN_PROXY_URL", "")
+    if not url:
+        return None
+    
+    parsed = parse_proxy_string(url)
+    if not parsed:
+        logger.warning(f"LOGIN_PROXY_URL is set but invalid: {url}")
+        return None
+    return parsed
+
+
+WORKER_PROXY_USAGE = ("sender", "both")
+
+
+async def log_proxy_event(session: AsyncSession, account_id: int, action: str, proxy_string: Optional[str], reason: str) -> None:
+    """ثبت Audit Log رویدادهای تخصیص و صف پروکسی"""
+    from database.models import WorkerEvent
+    event = WorkerEvent(
+        account_id=account_id,
+        old_status="PROXY_QUEUE",
+        new_status=action,
+        reason=reason,
+        error_details=f"Proxy: {proxy_string}" if proxy_string else None
     )
-    candidates = (await session.execute(cand_stmt)).all()
+    session.add(event)
 
-    claimed_proxy_str: Optional[str] = None
-    for proxy_id, proxy_str in candidates:
-        # اعتبارسنجی قبل از claim — پراکسی خراب نه اسلات می‌گیرد نه bind می‌شود
-        if not parse_proxy_string(proxy_str):
-            logger.error(f"Proxy candidate id={proxy_id} is malformed - marking failed and skipping.")
-            try:
-                await mark_proxy_failed(session, proxy_str)
-            except Exception as mark_err:
-                logger.error(f"Failed to mark malformed proxy candidate: {mark_err}")
-            continue
 
-        # 🧲 رزرو واقعی — UPDATE شرطیِ اتمیک + چک rowcount
-        claim_stmt = (
+
+async def claim_proxy_for_account(
+    session: AsyncSession, account_id: Optional[int] = None, ignore_cooldown: bool = False
+) -> Optional[str]:
+    cap = max(1, config.MAX_ACCOUNTS_PER_PROXY)
+    
+    cooldown_proxies = []
+    if not ignore_cooldown:
+        try:
+            from workers.sender import _get_redis
+            redis = _get_redis()
+            # جایگزینی الگوی مسدودکننده KEYS با SCAN (O(N) امن‌تر) برای فاز ۱۱
+            async for key in redis.scan_iter(match="proxy_cd:*", count=100):
+                k_str = key.decode("utf-8") if isinstance(key, bytes) else key
+                cooldown_proxies.append(k_str.split(":", 1)[1])
+        except Exception:
+            pass
+
+    # فاز ۳/۵: پروکسی HEALTHY با ظرفیت آزاد (Least-Loaded). نادیده گرفتن پروکسی‌های در Cooldown.
+    stmt = select(Proxy).where(
+        Proxy.is_active == True, 
+        Proxy.in_use < cap,
+        Proxy.health_state == "HEALTHY",
+        Proxy.usage_type.in_(("sender", "both"))
+    )
+    
+    # اعمال فیلتر Cooldown روی کوئری
+    if cooldown_proxies:
+        stmt = stmt.where(Proxy.proxy_string.notin_(cooldown_proxies))
+        
+    stmt = stmt.order_by(Proxy.in_use.asc(), Proxy.ping_ms.is_(None), Proxy.ping_ms.asc()).limit(10)
+    
+    result = await session.execute(stmt)
+    candidates = result.scalars().all()
+
+    # 🛡 فاز ۱ (F9): مرحله دوم Claim (Fallback به WEAK)
+    allow_weak_fallback = getattr(config, "PROXY_ALLOW_WEAK_FALLBACK", True)
+    if not candidates and allow_weak_fallback:
+        stmt_weak = select(Proxy).where(
+            Proxy.is_active == True,
+            Proxy.in_use < cap,
+            Proxy.health_state == "WEAK",
+            Proxy.usage_type.in_(("sender", "both"))
+        )
+        if cooldown_proxies:
+            stmt_weak = stmt_weak.where(Proxy.proxy_string.notin_(cooldown_proxies))
+            
+        stmt_weak = stmt_weak.order_by(Proxy.ping_ms.is_(None), Proxy.ping_ms.asc(), Proxy.in_use.asc()).limit(10)
+        result_weak = await session.execute(stmt_weak)
+        candidates = result_weak.scalars().all()
+        if candidates:
+            logger.warning(f"No HEALTHY proxies available. Fallback: Claiming from WEAK proxies for account {account_id}.")
+    
+    if not candidates:
+        # باگ ۴: گارد نشت اسلات — اگر Claim شکست خورد و اکانت از قبل پروکسی داشت، آن را آزاد می‌کنیم
+        if account_id is not None:
+            old_proxy_stmt = select(Account.proxy_string).where(Account.id == account_id)
+            old_proxy_str = await session.scalar(old_proxy_stmt)
+            if old_proxy_str:
+                await release_proxy_slot(session, old_proxy_str, account_id)
+                clear_stmt = (
+                    update(Account)
+                    .where(Account.id == account_id)
+                    .values(proxy_string=None, proxy_status="WAITING_PROXY")
+                    .execution_options(synchronize_session=False)
+                )
+                await session.execute(clear_stmt)
+        return None
+    
+    for proxy in candidates:
+        # رقابت اتمیک (Atomic Claim): در محیط‌های چندهسته‌ای، فقط ورکری که rowcount > 0 بگیرد برنده است
+        update_stmt = (
             update(Proxy)
-            .where(Proxy.id == proxy_id, Proxy.in_use < cap)
+            .where(Proxy.id == proxy.id, Proxy.is_active == True, Proxy.in_use < cap)
             .values(in_use=Proxy.in_use + 1)
             .execution_options(synchronize_session=False)
         )
-        result = await session.execute(claim_stmt)
-        if result.rowcount == 1:
-            claimed_proxy_str = proxy_str
-            break
-        # rowcount == 0 → همزمانی: ظرفیت در لحظه‌ی UPDATE پر بود → کاندید بعدی
-
-    if claimed_proxy_str is None:
-        return None
-
-    # آزادسازی اسلات پراکسی قبلی + ثبت binding جدید — فقط در حالت چرخش
-    # (account_id ارائه شده). در جریان لاگین (account_id is None) هیچ Accountی
-    # برای bind کردن وجود ندارد؛ caller proxy_string را در FSM ذخیره می‌کند
-    # و در finalize_login_and_save روی Account تنظیم می‌کند.
-    # 🛡 BUG-30: commit با caller است.
+        res = await session.execute(update_stmt)
+        
+        if res.rowcount > 0:
+            new_proxy_str = proxy.proxy_string
+            
+            if account_id is not None:
+                old_proxy_stmt = select(Account.proxy_string).where(Account.id == account_id)
+                old_proxy_str = await session.scalar(old_proxy_stmt)
+                
+                # ثبت پروکسی جدید برای اکانت و خروج از صف انتظار
+                bind_stmt = (
+                    update(Account)
+                    .where(Account.id == account_id)
+                    .values(
+                        proxy_string=new_proxy_str,
+                        proxy_status="ASSIGNED",
+                        proxy_queue_joined_at=None
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                await session.execute(bind_stmt)
+                await log_proxy_event(session, account_id, "ASSIGNED", new_proxy_str, "Claimed new capacity")
+                
+                # آزادسازی ظرفیت پروکسی قبلی (که خودش Cooldown را برای آن اعمال می‌کند)
+                if old_proxy_str and old_proxy_str != new_proxy_str:
+                    await release_proxy_slot(session, old_proxy_str, account_id)
+                    
+            return new_proxy_str
+            
+    # باگ ۴: گارد نشت اسلات — در صورت شکست تمام کاندیدها (از دست دادن رقابت اتمیک)
     if account_id is not None:
+        old_proxy_stmt = select(Account.proxy_string).where(Account.id == account_id)
+        old_proxy_str = await session.scalar(old_proxy_stmt)
         if old_proxy_str:
-            await release_proxy_slot(session, old_proxy_str)
-        await session.execute(
-            update(Account).where(Account.id == account_id).values(proxy_string=claimed_proxy_str)
-        )
-    return claimed_proxy_str
+            await release_proxy_slot(session, old_proxy_str, account_id)
+            clear_stmt = (
+                update(Account)
+                .where(Account.id == account_id)
+                .values(proxy_string=None, proxy_status="WAITING_PROXY")
+                .execution_options(synchronize_session=False)
+            )
+            await session.execute(clear_stmt)
+            
+    return None
 
-async def mark_proxy_failed(session: AsyncSession, proxy_string: str) -> None:
+async def direct_budget_ok(session: AsyncSession) -> bool:
     """
-    Increments fail count for a proxy and deactivates it if it fails too often.
-
-    🛡 فاز ۳ (BUG-30): commit درون‌تابعی حذف شد. قبلاً این commit تراکنشِ بازِ
-    caller را بی‌صدا می‌بست و تغییرات pending مربوط به caller را زودتر از موعد
-    ثبت می‌کرد (الگوی خطرناک SQLAlchemy). کنترل تراکنش حالا با caller است:
-    تغییر fail_count/is_active روی همان sessionِ caller می‌ماند و با commit بعدیِ
-    خود caller ثبت می‌شود (در چرخش پراکسی، همان commitِ آپدیت proxy_stringِ
-    اکانت این تغییر را هم در همان تراکنش ثبت می‌کند).
+    بررسی بودجه ارسال مستقیم (بدون پراکسی).
+    اگر تعداد اکانت‌های بدون پراکسی از سقف MAX_DIRECT_ACCOUNTS عبور کند،
+    False برگردانده و هشدار می‌دهد.
     """
-    stmt = select(Proxy).where(Proxy.proxy_string == proxy_string)
-    result = await session.execute(stmt)
-    proxy_obj = result.scalar_one_or_none()
+    stmt = select(func.count()).select_from(Account).where(Account.proxy_string.is_(None))
+    direct_count = await session.scalar(stmt)
     
-    if proxy_obj:
-        proxy_obj.fail_count += 1
-        if proxy_obj.fail_count >= 5:
-            proxy_obj.is_active = False
-            logger.warning(f"Proxy {proxy_string} marked as inactive due to high failure rate.")
-        # 🛡 BUG-30: دیگر اینجا commit نمی‌زنیم — کنترل تراکنش با caller است.
-
-
-# ==========================================
-# 🔒 IP LEAK GUARD (یکدست‌شده در همه‌ی مسیرها)
-# ==========================================
-def direct_ip_fallback_enabled(account_id: int) -> bool:
-    """
-    🔒 سیاست امنیتی «قطع به‌جای افشای IP سرور»:
-    اتصال بدون پراکسی فقط با فال‌بک صریح FALLBACK_TO_DIRECT_IP=true مجاز است.
-    پیش‌فرض False است؛ یعنی هیچ اکانتی هرگز با IP مستقیم سرور اجرا نمی‌شود.
-    """
-    if not config.FALLBACK_TO_DIRECT_IP:
+    if direct_count is not None and direct_count >= config.MAX_DIRECT_ACCOUNTS:
+        # استفاده از الگوی هشدار throttle شده (آیدی 0 به عنوان شناسه سیستم رزرو شده)
+        if not _no_proxy_alert_throttled(0):
+            logger.critical(
+                "█" * 62 + "\n"
+                f"⚠️ سقف اکانت‌های دایرکت (MAX_DIRECT_ACCOUNTS={config.MAX_DIRECT_ACCOUNTS}) "
+                f"پر شده است (فعلی: {direct_count}).\n"
+                "⚠️ اکانت‌های جدید بدون پراکسی تا زمان آزاد شدن ظرفیت متصل نخواهند شد.\n"
+                + "█" * 62
+            )
         return False
-    # ⚠️ لاگ هشدار بزرگ: فال‌بک خطرناک فعال است (ریسک Chain Ban همه‌ی اکانت‌ها)
-    logger.critical(
-        "█" * 62 + "\n"
-        f"⚠️  FALLBACK_TO_DIRECT_IP=TRUE → Worker {account_id} بدون پراکسی و با "
-        "IP مستقیم سرور اجرا می‌شود!\n"
-        "⚠️  ریسک: Chain Ban همه‌ی اکانت‌ها و مسدود شدن IP سرور.\n"
-        "⚠️  در پروداکشن حتماً FALLBACK_TO_DIRECT_IP=false باشد.\n"
-        + "█" * 62
-    )
     return True
+
+
+# ==========================================
+# 🔄 تابع سوییچ مشترک پروکسی (DRY - فاز ۴ و ۵)
+# ==========================================
+async def switch_worker_proxy(account_id: int, session: AsyncSession, reason: str, ignore_cooldown: bool = False) -> bool:
+    """
+    سوییچ پروکسی درجا برای یک ورکرِ فعال در استخر (پس از اتمام چانک یا خطا).
+    در صورت نبود کاندید مناسب، False برمی‌گرداند (سوییچ لغو می‌شود).
+    """
+    from workers.sender import _get_redis
+    old_proxy = await session.scalar(select(Account.proxy_string).where(Account.id == account_id))
+    
+    # گرفتن پروکسی جدید با گارد ظرفیت و سلامت (و اعمال یا نادیده‌گرفتن Cooldown)
+    new_proxy_str = await claim_proxy_for_account(session, account_id, ignore_cooldown=ignore_cooldown)
+    
+    if not new_proxy_str:
+        logger.info(f"Rotation skipped for user_{account_id}/ (no healthy candidates) - keeping current proxy.")
+        return False
+        
+    await session.commit()
+    
+    proxy_dict = parse_proxy_string(new_proxy_str)
+    
+    # توقف کلاینت قبلی
+    client = worker_pool.get(account_id)
+    if client and client.is_connected:
+        try:
+            await client.stop()
+        except Exception: pass
+        
+    # بازسازی و اجرای کلاینت با پروکسی جدید
+    account = await session.get(Account, account_id)
+    new_client = await build_worker_client(account, session, proxy_dict)
+    if not new_client:
+        return False
+        
+    try:
+        await asyncio.wait_for(new_client.start(), timeout=45)
+        worker_pool[account_id] = new_client
+        logger.info(f"Worker user_{account_id}/ rotated proxy from {old_proxy} to {new_proxy_str}. Reason: {reason}")
+        
+        # ریست کانترهای چرخش
+        redis = _get_redis()
+        await redis.set(f"worker_chunks:{account_id}", "0")
+        await redis.set(f"worker_last_rot:{account_id}", str(time.time()))
+        
+        return True
+    except Exception as e:
+        logger.error(f"Failed to start worker {account_id} with new proxy {new_proxy_str}: {e}")
+        worker_pool.pop(account_id, None)
+        return False
 
 
 # ==========================================
@@ -323,6 +512,15 @@ def direct_ip_fallback_enabled(account_id: int) -> bool:
 NO_PROXY_ALERT_THROTTLE_SECONDS = 30 * 60
 _last_no_proxy_alert_at: Dict[int, float] = {}
 
+_last_disconnect_alert_at: Dict[int, float] = {}
+
+def _disconnect_alert_throttled(account_id: int) -> bool:
+    """True اگر هشدار «قطعی عمومی ورکر» برای این اکانت در ۱ ساعت گذشته ارسال شده باشد."""
+    now = time.monotonic()
+    if now - _last_disconnect_alert_at.get(account_id, 0.0) < 3600:
+        return True
+    _last_disconnect_alert_at[account_id] = now
+    return False
 
 def _no_proxy_alert_throttled(account_id: int) -> bool:
     """True اگر هشدار «اتمام پراکسی»ی همین اکانت به‌تازگی ارسال شده باشد."""
@@ -332,46 +530,14 @@ def _no_proxy_alert_throttled(account_id: int) -> bool:
     _last_no_proxy_alert_at[account_id] = now
     return False
 
-
 async def notify_admins(bot: Optional[Bot], text: str) -> int:
     """
-    ارسال هشدار/گزارش فوری به ادمین اصلی (ADMIN_ID از config) و ساب‌ادمین‌های
-    جدول Admin. بهترین تلاش (best-effort) است و خطای ارسال هرگز فلوی اصلی را
-    نمی‌شکند. (این تابع اینجا تعریف شده تا health_checker بتواند بدون ایجاد
-    import دور، از آن استفاده کند.) خروجی: تعداد ارسال‌های موفق.
+    ارسال هشدار/گزارش فوری به ادمین اصلی و ساب‌ادمین‌ها از طریق helper مرکزی.
     """
     if bot is None:
         return 0
-
-    target_admins = set()
-    if config.ADMIN_ID and config.ADMIN_ID != 0:
-        target_admins.add(config.ADMIN_ID)
-
-    try:
-        async with async_session() as db_session:
-            stmt = select(Admin.telegram_id)
-            result = await db_session.execute(stmt)
-            for admin_id in result.scalars().all():
-                target_admins.add(admin_id)
-    except Exception as db_err:
-        logger.error(f"notify_admins: failed to fetch sub-admins: {db_err}")
-
-    if not target_admins:
-        logger.warning(
-            "notify_admins: هیچ مقصدی برای هشدار امنیتی پیدا نشد - "
-            "ADMIN_ID را در فایل .env تنظیم کنید!"
-        )
-        return 0
-
-    sent = 0
-    for admin_tg_id in target_admins:
-        try:
-            await bot.send_message(chat_id=admin_tg_id, text=text)
-            sent += 1
-        except Exception as send_err:
-            logger.error(f"notify_admins: failed to notify admin {admin_tg_id}: {send_err}")
-    return sent
-
+    res = await broadcast_to_admins(bot, text)
+    return res.get("sent", 0)
 
 # ==========================================
 # 🏭 WORKER CLIENT FACTORY (منبع واحد ساخت کلاینت)
@@ -399,18 +565,34 @@ async def build_worker_client(
         worker_api_id = int(api_obj.api_id) if api_obj else int(config.API_ID)
         worker_api_hash = str(api_obj.api_hash) if api_obj else str(config.API_HASH)
 
-        client = Client(
-            name=f"worker_acc_{account.id}",
-            session_string=decrypt_session(account.session_string),
+        session_name = f"worker_acc_{account.id}"
+        session_file = SESSIONS_DIR / f"{session_name}.session"
+
+        client_kwargs = dict(
+            name=session_name,
+            workdir=SESSIONS_DIR,          # pyrofork FileStorage -> sessions/<name>.session
             api_id=worker_api_id,
             api_hash=worker_api_hash,
             proxy=proxy_dict,
-            in_memory=True,
+            sleep_threshold=60,            # L-02: auto-sleep on FloodWait <= 60s instead of raising
             device_model=account.device_model or random.choice(DEVICE_MODELS),
             system_version=account.system_version or random.choice(SYSTEM_VERSIONS),
             app_version=account.app_version or random.choice(APP_VERSIONS),
-            lang_code="en"
+            lang_code="en",
         )
+
+        if session_file.exists():
+            # Persistent session: peers + access hashes survive restarts.
+            client = Client(**client_kwargs)
+        else:
+            # First run for this account: bootstrap from the encrypted DB string.
+            # (session_string -> MemoryStorage; the file is written by
+            #  _persist_memory_session() after a successful start + warmup.)
+            client = Client(
+                session_string=decrypt_session(account.session_string),
+                in_memory=True,
+                **client_kwargs,
+            )
 
         # اتصال هندلر CRM (منطق CRM دست‌نخورده)
         client.add_handler(
@@ -422,16 +604,128 @@ async def build_worker_client(
 
         # 🧠 جریان هوشمند (Smart Flow): نصب شنود «سین» تارگت
         attach_seen_listener(client)
+        
+        # 🟢 نصب شنودگر تأیید/رد عضویت
+        attach_join_request_listener(client)
 
         return client
     except Exception as e:
         logger.error(f"Failed to build worker client for account {account.id}: {e}")
         return None
+    
+
+_PG_SESSION_DDL = """
+CREATE TABLE sessions
+(
+    dc_id     INTEGER PRIMARY KEY,
+    api_id    INTEGER,
+    test_mode INTEGER,
+    auth_key  BLOB,
+    date      INTEGER NOT NULL,
+    user_id   INTEGER,
+    is_bot    INTEGER
+);
+
+CREATE TABLE peers
+(
+    id             INTEGER PRIMARY KEY,
+    access_hash    INTEGER,
+    type           INTEGER NOT NULL,
+    username       TEXT,
+    phone_number   TEXT,
+    last_update_on INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s', 'now') AS INTEGER))
+);
+
+CREATE TABLE version
+(
+    number INTEGER PRIMARY KEY
+);
+
+CREATE INDEX idx_peers_id ON peers (id);
+CREATE INDEX idx_peers_username ON peers (username);
+CREATE INDEX idx_peers_phone_number ON peers (phone_number);
+"""
+
+
+async def _persist_memory_session(client: Client, account_id: int) -> Optional[Path]:
+    """
+    Copy the ':memory:' SQLite storage of a session_string-bootstrapped
+    client into sessions/worker_acc_{account_id}.session, so the NEXT
+    restart opens a FileStorage client that already knows the auth key
+    AND the peer/access-hash cache. Best-effort: never raises.
+    """
+    dest_path = SESSIONS_DIR / f"worker_acc_{account_id}.session"
+    if dest_path.exists():
+        return dest_path
+    src = getattr(client.storage, "conn", None)  # aiosqlite ':memory:' conn
+    if src is None:
+        return None
+    try:
+        async def _fetch(sql: str) -> list:
+            async with src.execute(sql) as cur:
+                return await cur.fetchall()
+
+        session_rows = await _fetch(
+            "SELECT dc_id, api_id, test_mode, auth_key, date, user_id, is_bot FROM sessions")
+        peer_rows = await _fetch(
+            "SELECT id, access_hash, type, username, phone_number, last_update_on FROM peers")
+        version_rows = await _fetch("SELECT number FROM version")
+
+        def _write() -> None:
+            dest = sqlite3.connect(str(dest_path))
+            try:
+                dest.executescript(_PG_SESSION_DDL)
+                dest.executemany(
+                    "INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?)", session_rows)
+                dest.executemany(
+                    "INSERT OR REPLACE INTO peers "
+                    "(id, access_hash, type, username, phone_number, last_update_on) "
+                    "VALUES (?,?,?,?,?,?)", peer_rows)
+                dest.executemany("INSERT OR REPLACE INTO version VALUES (?)", version_rows)
+                dest.commit()
+            finally:
+                dest.close()
+
+        await asyncio.to_thread(_write)
+        logger.info(f"Persisted session file for account {account_id} -> {dest_path}")
+        return dest_path
+    except Exception as e:
+        logger.warning(f"Could not persist session file for account {account_id}: {e}")
+        try:
+            dest_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+async def warm_worker_cache(client: Client, extra_peer_ids: Optional[Iterable[int]] = None) -> None:
+    """
+    C-01 mitigation: after start, populate the session peer cache so
+    resolve_peer() never runs against an empty peers table (which is what
+    previously dropped whole update batches). Best-effort: never raises.
+    
+    🟢 فاز ۷: قبل از get_dialogs، یک throttle lock گرفته می‌شود تا از FloodWait
+    ناشی از warm-up همزمان چندین ورکر جلوگیری شود.
+    """
+    # 🟢 فاز ۷: throttle بین warm-upهای ورکرهای مختلف
+    await _acquire_warmup_slot()
+    
+    try:
+        async for _ in client.get_dialogs(limit=500):
+            pass
+    except Exception as e:
+        logger.warning(f"warmup get_dialogs failed for {client.name}: {e}")
+    if extra_peer_ids:
+        for pid in extra_peer_ids:
+            try:
+                await client.get_chat(pid)
+            except Exception as e:
+                logger.debug(f"warmup get_chat({pid}) failed for {client.name}: {e}")
 
 
 # ==========================================
 # 🖼 PHOTO PACKAGE: PROFILE PHOTO ROTATION
 # ==========================================
+
 async def _get_photo_package_for_account(
     session: AsyncSession, account_id: int
 ) -> Optional[ProfilePhotoPackage]:
@@ -488,26 +782,42 @@ async def apply_photo_package_now(account_id: int) -> bool:
 # ==========================================
 # WORKER INITIALIZATION (با پشتیبانی از تنظیمات On/Off)
 # ==========================================
+# بازنویسی کامل: initialize_workers — workers/session_manager.py
+async def get_use_proxy_for_sending(session: AsyncSession) -> bool:
+    """خواندن سوییچ ارسال با پروکسی/مستقیم با یک پیش‌فرض واحد (True)"""
+    stmt_settings = select(GlobalSettings).limit(1)
+    global_settings = await session.scalar(stmt_settings)
+    return getattr(global_settings, "use_proxy_for_sending", True) if global_settings else True
+
 async def initialize_workers(session: AsyncSession, bot: Optional[Bot] = None) -> None:
     """
-    🔒 فاز ۵: گارد نشت IP اینجا هم (یکدست با start_single_worker) اعمال می‌شود:
-    اکانتِ بدون proxy_string معتبر skip می‌شود، لیست آن لاگ می‌گردد و از طریق
-    نمونه‌ی bot به ادمین گزارش داده می‌شود. تنها استثنا: FALLBACK_TO_DIRECT_IP=true
+    🔒 مقدار use_proxy_for_sending پیش از راه اندازی خوانده می‌شود.
+    در صورت اتصال مستقیم، پروکسی به کلاینت تزریق نخواهد شد (سرعت بالا).
     """
-    # 🧲 فاز ۵ (BUG-14): reconcile شمارنده‌ی in_use از منبع حقیقت
-    # (accounts.proxy_string) — خودترمیمی بعد از کرش/ویرایش دستی DB.
-    # اولین statement روی session است تا commit داخلی‌اش تراکنشِ بازِ
-    # caller را نبندد (الگوی BUG-30).
     await reconcile_proxy_usage(session)
+
+    # خواندن از تنظیمات سراسری به کمک helper واحد
+    use_proxy_for_sending = await get_use_proxy_for_sending(session)
+    
+    # اصلاح باگ ۱: در حالت Direct (بدون پروکسی)، اکانت‌هایی که در گذشته پروکسی خود را 
+    # از دست داده‌اند (WAITING_PROXY) به NO_PROXY تبدیل می‌شوند تا در چرخه Reconnect دیده شوند.
+    if not use_proxy_for_sending:
+        stmt_fix = (
+            update(Account)
+            .where(Account.proxy_status == "WAITING_PROXY")
+            .values(proxy_status="NO_PROXY")
+            .execution_options(synchronize_session=False)
+        )
+        await session.execute(stmt_fix)
+        await session.commit()
+
+    stmt_settings = select(GlobalSettings).limit(1)
+    global_settings = await session.scalar(stmt_settings)
 
     stmt = select(Account).where(Account.is_banned == False)
     result = await session.execute(stmt)
     accounts = result.scalars().all()
 
-    # 🆔 فاز ۵ (R5): هشدار خوشه‌ی API_ID مشترک — اکانت‌های بدون API اختصاصی
-    # همه به config.API_ID سراسری برمی‌گردند؛ بیش از N اکانت روی یک api_id =
-    # خوشه تشخیصی بزرگ (ریسک بن دسته‌ای). طبق scope این فاز فقط «هشدار/گزارش»؛
-    # پیاده‌سازی per-account API → فاز آینده (گزارش طراحی در همین پاسخ).
     shared_api_accounts = [acc for acc in accounts if acc.session_string and not acc.api_id]
     if len(shared_api_accounts) > config.SHARED_API_ID_WARN_THRESHOLD:
         shared_ids = ", ".join(str(acc.id) for acc in shared_api_accounts)
@@ -533,39 +843,48 @@ async def initialize_workers(session: AsyncSession, bot: Optional[Bot] = None) -
     result_apis = await session.execute(stmt_apis)
     all_apis = {api.id: api for api in result_apis.scalars().all()}
 
-    stmt_settings = select(GlobalSettings).limit(1)
-    global_settings = await session.scalar(stmt_settings)
-
     # 🔒 اکانت‌های skipشده به دلیل نبود پراکسی معتبر (برای لاگ + گزارش ادمین)
     skipped_no_proxy: List[Account] = []
+    skipped_direct_budget: List[Account] = []
 
     for account in accounts:
         if not account.session_string:
             continue
 
-        # 🔒 IP Leak Guard (همان منطق گارد start_single_worker):
-        # بدون proxy_string معتبر، ورکر اصلاً ساخته نمی‌شود تا بعداً با IP
-        # مستقیم سرور بالا نیاید (ریسک Chain Ban).
-        proxy_dict = parse_proxy_string(account.proxy_string) if account.proxy_string else None
-        if not proxy_dict and not direct_ip_fallback_enabled(account.id):
-            logger.error(
-                f"IP Leak Guard: Skipping account {account.id} "
-                f"(phone={account.phone_number}) - no valid proxy_string! "
-                "Worker NOT created to prevent server IP leak."
-            )
-            skipped_no_proxy.append(account)
-            continue
+        proxy_dict = None
+        if use_proxy_for_sending:
+            # 🛡 رفع باگ: بررسی سلامت پروکسی قبل از بوت شدن اکانت
+            if account.proxy_string:
+                health = await session.scalar(select(Proxy.health_state).where(Proxy.proxy_string == account.proxy_string))
+                if health == "DEAD":
+                    logger.warning(f"Worker {account.id} is bound to a DEAD proxy. Trying to claim a new one...")
+                    new_proxy = await claim_proxy_for_account(session, account.id)
+                    account.proxy_string = new_proxy
+                    await session.commit()
 
+            proxy_dict = parse_proxy_string(account.proxy_string) if account.proxy_string else None
+            if not proxy_dict and not direct_ip_fallback_enabled(account.id):
+                logger.error(
+                    f"IP Leak Guard: Skipping account {account.id} - no valid proxy_string!"
+                )
+                skipped_no_proxy.append(account)
+                continue
+        else:
+            if not await direct_budget_ok(session):
+                skipped_direct_budget.append(account)
+                continue
+            proxy_dict = None  # تضمین صریح ارسال بدون پروکسی
+            logger.debug(f"Direct connection enabled (proxy bypassed) for account {account.id}.")
+ 
         client = await build_worker_client(account, session, proxy_dict, prefetched_apis=all_apis)
         if client is None:
-            # خطای ساخت کلاینت (مثلاً شکست رمزگشایی سشن) نباید بقیه‌ی اکانت‌ها را متوقف کند
+            # خطای ساخت کلاینت نباید بقیه‌ی اکانت‌ها را متوقف کند
             continue
 
         worker_pool[account.id] = client
         
         if global_settings and global_settings.terminate_sessions:
             async def delayed_terminate(c: Client):
-                # باگ ۵: رفع مشکل رقابت با استفاده از حلقه انتظار به جای خواب ثابت
                 for _ in range(30):
                     if c.is_connected:
                         break
@@ -573,7 +892,6 @@ async def initialize_workers(session: AsyncSession, bot: Optional[Bot] = None) -
                 if c.is_connected:
                     await terminate_other_sessions(c)
 
-            # باگ ۳: ذخیره reference قوی برای task
             task = asyncio.create_task(delayed_terminate(client))
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
@@ -588,34 +906,43 @@ async def initialize_workers(session: AsyncSession, bot: Optional[Bot] = None) -
             f"(no valid proxy) → [{skipped_ids}]"
         )
         if bot is not None:
+            # نمایش دقیق حداکثر ۲۰ ردیف و شمارش الباقی (F15)
             detail_lines = [
                 f"▫️ آیدی {acc.id} (<code>{acc.phone_number if acc.phone_number else '؟'}</code>)"
-                for acc in skipped_no_proxy[:30]
+                for acc in skipped_no_proxy[:20]
             ]
-            if len(skipped_no_proxy) > 30:
-                detail_lines.append("▫️ ... و موارد دیگر")
-            await notify_admins(
-                bot,
-                "🔒 <b>گارد نشت IP — اکانت‌های بدون پراکسی skip شدند</b>\n\n"
-                f"تعداد <b>{len(skipped_no_proxy)}</b> اکانت به دلیل نبود پراکسی معتبر از "
-                "استخر ورکرها حذف شدند (سیاست امنیتی: قطع به‌جای افشای IP سرور).\n\n"
-                "📋 <b>لیست اکانت‌های skipشده:</b>\n"
+            if len(skipped_no_proxy) > 20:
+                detail_lines.append(f"▫️ ... و {len(skipped_no_proxy) - 20} مورد دیگر")
+            
+            # اصلاح پیام ادمین: شفاف‌سازی حالت انتظار برای پروکسی جدید (باگ ۱)
+            alert_text = (
+                f"⚠️ <b>هشدار گارد IP (نشت آی‌پی)</b>\n"
+                f"تعداد {len(skipped_no_proxy)} اکانت به دلیل نداشتن پروکسی معتبر متصل نشدند:\n\n"
                 + "\n".join(detail_lines) +
-                "\n\n💡 برای فعال‌سازی این اکانت‌ها ابتدا در پنل مدیریت پراکسی سالم ثبت کنید؛ "
-                "حلقه‌ی Reconnect خودکار ظرف حداکثر ۵ دقیقه آن‌ها را به استخر برمی‌گرداند."
+                "\n\n💡 این اکانت‌ها در صف انتظار پروکسی (WAITING_PROXY) قرار گرفتند. به محض افزودن یا آزاد شدن پروکسی سالم، حلقه‌ی اتصال مجدد (هر ۵ دقیقه) آن‌ها را به استخر برمی‌گرداند."
             )
+            await notify_admins(bot, alert_text)
+            
+    if skipped_direct_budget:
+        skipped_budget_ids = ", ".join(str(acc.id) for acc in skipped_direct_budget)
+        logger.warning(f"Direct Budget Guard: {len(skipped_direct_budget)} account(s) SKIPPED (MAX_DIRECT_ACCOUNTS) → [{skipped_budget_ids}]")
+        if bot is not None:
+            detail_lines = [
+                f"▫️ آیدی {acc.id} (<code>{acc.phone_number if acc.phone_number else '؟'}</code>)"
+                for acc in skipped_direct_budget[:30]
+            ]
+            if len(skipped_direct_budget) > 30:
+                detail_lines.append("▫️ ... و موارد دیگر")
+            
+            alert_text = (
+                f"⚠️ <b>سقف اکانت‌های مستقیم تکمیل شد!</b>\n"
+                f"تعداد {len(skipped_direct_budget)} اکانت به دلیل رسیدن به سقف دایرکت (MAX_DIRECT_ACCOUNTS) متصل نشدند:\n"
+                + "\n".join(detail_lines)
+            )
+            await notify_admins(bot, alert_text)
 
 
-# ==========================================
-# 🛡 فاز ۴ (BUG-23): قرنطینه‌ی اکانت — متمایز از بن/حذف
-# AuthKeyUnregistered گاهی گذرا/سمت-سروری است؛ به‌جای is_banned=True +
-# session_string=None (نابودی سشن)، اکانت با فلگی جدا قرنطینه می‌شود و
-# سشن در DB دست‌نخورده می‌ماند (قابل بازیابی). تا پایان قرنطینه استارت/دیسپچ
-# نمی‌گیرد؛ بعد از TTL به‌طور خودکار دوباره امتحان می‌شود.
-# بازیابی دستی: DEL quarantine_auth:{account_id} در Redis.
-# کلید Redis: quarantine_auth:{account_id} (TTL) + آینه‌ی درون-حافظه‌ای —
-# همان الگوی chunk_cooldown در workers/sender.py (fallback قطع Redis).
-# ==========================================
+
 AUTH_QUARANTINE_SECONDS = 24 * 3600  # پنجره‌ی قرنطینه: ۲۴ ساعت
 
 _local_quarantine_until: Dict[int, datetime] = {}
@@ -669,10 +996,15 @@ async def start_all_workers(session: AsyncSession, bot: Optional[Bot] = None) ->
     stmt_settings = select(GlobalSettings).limit(1)
     global_settings = await session.scalar(stmt_settings)
     
+    use_proxy_for_sending = await get_use_proxy_for_sending(session)
     for account_id, client in list(worker_pool.items()):
         # 🔒 گارد دفاعی دوم (Defense-in-Depth): اگر به هر دلیلی کلاینتِ بدون پراکسی
         # داخل استخر باشد و فال‌بک صریح فعال نباشد، هرگز استارت نمی‌شود.
-        if getattr(client, "proxy", None) is None and not config.FALLBACK_TO_DIRECT_IP:
+        if (
+            use_proxy_for_sending
+            and getattr(client, "proxy", None) is None 
+            and not direct_ip_fallback_enabled(account_id)
+        ):
             logger.critical(
                 f"IP Leak Guard: Worker {account_id} has NO proxy - refusing to start "
                 "and removing from pool to prevent server IP leak!"
@@ -686,6 +1018,8 @@ async def start_all_workers(session: AsyncSession, bot: Optional[Bot] = None) ->
             # خطای غیرمنتظره‌ی یک ورکر نباید استارت بقیه را متوقف کند
             logger.error(f"Unexpected error while starting worker {account_id}: {e}")
 
+
+# بازنویسی کامل: start_worker_with_rotation — workers/session_manager.py
 async def start_worker_with_rotation(
     account_id: int,
     client: Client,
@@ -693,43 +1027,97 @@ async def start_worker_with_rotation(
     global_settings: Optional[GlobalSettings],
     bot: Optional[Bot] = None,
 ) -> bool:
-    """
-    ⚙️ همان منطق retry/چرخش پراکسی که قبلاً داخل start_all_workers بود؛ به‌صورت
-    تابع مستقل درآمده تا حلقه‌ی Reconnect خودکار (utils/health_checker.py) هم
-    دقیقاً از همین مسیر استفاده کند. خروجی: True در صورت اتصال موفق.
-    """
-    # 🛡 فاز ۴ (BUG-23): اکانت قرنطینه‌شده (AuthKeyUnregistered مکرر) تا پایان
-    # قرنطینه استارت نمی‌گیرد — سشنش در DB محفوظ است و کلاینتش هم از استخر
-    # خارج می‌ماند تا دیسپچر chunk ندهد.
     if await is_account_quarantined(account_id):
         logger.info(f"Worker {account_id} is quarantined (repeated AuthKeyUnregistered); skipping start attempt.")
         worker_pool.pop(account_id, None)
         return False
 
     MAX_RETRIES = 3
-    # 🛡 فاز ۴ (BUG-23): شمارش بروز AuthKeyUnregistered در همین چرخه‌ی retry
     auth_key_failures = 0
     
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            await client.start()
+            # 🟢 گارد پیشگیرانه: تست مسدودی آی‌پی سرور قبل از استارت بدون پروکسی
+            if getattr(client, "proxy", None) is None:
+                is_blocked = False
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection("149.154.167.50", 443), timeout=3.0
+                    )
+                    writer.write(b'\xef')
+                    await asyncio.wait_for(writer.drain(), timeout=2.0)
+                    try:
+                        data = await asyncio.wait_for(reader.read(1), timeout=1.5)
+                        if not data:
+                            is_blocked = True
+                    except asyncio.TimeoutError:
+                        pass
+                    finally:
+                        writer.close()
+                        try: await writer.wait_closed()
+                        except Exception: pass
+                except Exception:
+                    is_blocked = True
+
+                if is_blocked:
+                    logger.critical(f"Worker {account_id}: Server IP is BLOCKED (DPI/Ban). Aborting direct start.")
+                    if bot is not None and not _no_proxy_alert_throttled(0):
+                        try:
+                            await notify_admins(bot, "🚨 <b>هشدار مسدودی آی‌پی سرور</b>\n\nپروکسی‌های سالم تمام شدند و آی‌پی سرور شما قابلیت اتصال مستقیم ندارد (مسدود یا در ایران است).\n<i>اکانت‌ها به وضعیت انتظار منتقل شدند.</i>")
+                        except Exception: pass
+                    
+                    stmt_wait = (
+                        update(Account)
+                        .where(Account.id == account_id)
+                        .values(proxy_status="WAITING_PROXY", proxy_queue_joined_at=datetime.now(timezone.utc))
+                        .execution_options(synchronize_session=False)
+                    )
+                    await session.execute(stmt_wait)
+                    await session.commit()
+                    worker_pool.pop(account_id, None)
+                    return False
+
+            try:
+                await asyncio.wait_for(client.start(), timeout=45)
+            except asyncio.TimeoutError:
+                raise Exception("Timeout connecting to Telegram during start().")
+            except sqlite3.DatabaseError as db_err:
+                session_file = SESSIONS_DIR / f"worker_acc_{account_id}.session"
+                if session_file.exists() and not getattr(client, "in_memory", False):
+                    logger.critical(f"Worker {account_id} session file is corrupt. Deleting and rebuilding via memory bootstrap. Error: {db_err}")
+                    try:
+                        session_file.unlink()
+                    except Exception as unlink_err:
+                        logger.error(f"Failed to delete corrupt session file for {account_id}: {unlink_err}")
+                    
+                    stmt_acc = select(Account).where(Account.id == account_id)
+                    account_obj = await session.scalar(stmt_acc)
+                    if account_obj:
+                        new_client = await build_worker_client(account_obj, session, getattr(client, "proxy", None))
+                        if new_client:
+                            client = new_client
+                            await client.start()
+                        else:
+                            raise db_err
+                    else:
+                        raise db_err
+                else:
+                    raise
+            
             logger.info(f"Worker {account_id} connected successfully.")
             
-            # باگ ۱: ثبت کلاینت در pool در صورت موفقیت
+            await warm_worker_cache(client, extra_peer_ids=config.FORCE_JOIN_CHANNEL_LIST or None)
+            if getattr(client, "in_memory", False):
+                await _persist_memory_session(client, account_id)
+
             worker_pool[account_id] = client
             
-            # 🎭 مدیریت پیشرفته پروفایل‌ها: آبجکت تنظیمات به randomize_profile پاس
-            # می‌شود؛ سوئیچ‌های مستقل نام/بیو داخل خود تابع اعمال می‌شوند.
-            # باگ ۳: ذخیره reference قوی
             task_profile = asyncio.create_task(
                 randomize_profile(client, account_id, settings=global_settings)
             )
             _background_tasks.add(task_profile)
             task_profile.add_done_callback(_background_tasks.discard)
 
-            # 🖼 پکیج عکس پروفایل: فقط اگر auto_set_photo روشن باشد و اکانت
-            # پکیج متصل داشته باشد، چرخش عکس در تسکی «کاملاً جداگانه» اجرا
-            # می‌شود تا شکست عکس هرگز آپدیت نام/بیو را خراب نکند.
             if global_settings and getattr(global_settings, "auto_set_photo", False):
                 photo_package = await _get_photo_package_for_account(session, account_id)
                 if photo_package and photo_package.photos:
@@ -742,19 +1130,28 @@ async def start_worker_with_rotation(
             return True
             
         except AuthKeyUnregistered as e:
-            # 🛡 فاز ۴ (BUG-23): این خانواده‌ی خطا گاهی گذرا/سمت-سروری است؛ قبلاً
-            # اولین بروز، بلافاصله is_banned=True + session_string=None می‌شد (نابودی
-            # دائمی سشن از DB). فیکس: تا ۲ بار «استارت تازه + چرخش پراکسی»؛ فقط
-            # تکرارِ سوم قرنطینه می‌شود (فلگ متمایز از حذف — سشن در DB می‌ماند).
-            # ⚠️ این except باید قبل از خانواده‌ی ۴۰۱ بیاید: AuthKeyUnregistered
-            # زیرکلاسِ Unauthorized است وگرنه مسیر نابودکننده می‌گیردش.
+            # باگ ۲: ابتدا چک می‌کنیم که آیا پروکسی در دسترس است؟
+            new_proxy_str = await claim_proxy_for_account(session, account_id)
+            if not new_proxy_str:
+                logger.warning(
+                    f"Worker {account_id}: AuthKeyUnregistered but NO healthy proxy available for rotation. "
+                    f"Moving to WAITING_PROXY instead of quarantining."
+                )
+                stmt_wait = (
+                    update(Account)
+                    .where(Account.id == account_id)
+                    .values(proxy_status="WAITING_PROXY", proxy_queue_joined_at=datetime.now(timezone.utc))
+                    .execution_options(synchronize_session=False)
+                )
+                await session.execute(stmt_wait)
+                await session.commit()
+                worker_pool.pop(account_id, None)
+                return False # خروج تمیز، شمارنده AuthKeyUnregistered افزایش نیافت
+
+            # اگر پروکسی بود، شمارنده خطای سشن اعمال می‌شود
             auth_key_failures += 1
             if auth_key_failures >= MAX_RETRIES:
-                logger.error(
-                    f"Worker {account_id}: AuthKeyUnregistered persisted after "
-                    f"{auth_key_failures} attempts - quarantining account "
-                    f"(session data preserved in DB). Error: {e}"
-                )
+                logger.error(f"Worker {account_id}: AuthKeyUnregistered persisted after {auth_key_failures} attempts - quarantining account.")
                 worker_pool.pop(account_id, None)
                 await mark_account_quarantined(account_id)
                 if bot is not None:
@@ -762,72 +1159,59 @@ async def start_worker_with_rotation(
                         await notify_admins(
                             bot,
                             "🟠 <b>قرنطینه اکانت (AuthKeyUnregistered)</b>\n\n"
-                            f"اکانت <code>{account_id}</code> پس از چندین تلاش استارت با خطای "
-                            "AuthKeyUnregistered مواجه شد.\n"
-                            "سشن اکانت <b>حفظ شده</b> و حذف نشده است؛ اکانت موقتاً قرنطینه شد و تا "
-                            "پایان قرنطینه استارت/دیسپچ نمی‌گیرد.\n"
-                            "اگر خطا گذرا/سمت-سروری بوده، پس از پایان قرنطینه به‌صورت خودکار دوباره "
-                            "تلاش می‌شود؛ در غیر این صورت سشن برای بررسی دستی باقی مانده است."
+                            f"اکانت <code>{account_id}</code> موقتاً قرنطینه شد و سشن آن در DB محفوظ است."
                         )
-                    except Exception as notify_err:
-                        logger.error(f"Quarantine admin notification failed for {account_id}: {notify_err}")
+                    except Exception: pass
                 return False
 
             logger.warning(
-                f"Worker {account_id}: AuthKeyUnregistered (possibly transient/server-side) - {e}; "
+                f"Worker {account_id}: AuthKeyUnregistered - {e}; "
                 f"auth retry {auth_key_failures}/{MAX_RETRIES - 1} with fresh client + rotated proxy."
             )
-            # استارت تازه + چرخش پراکسی — همان گاردهای مسیر خطای عمومی (پراکسی
-            # تازه باید قابل‌پارس باشد؛ بدون آن چرخشی انجام نمی‌شود). پراکسیِ فعلی
-            # fail-mark نمی‌شود چون خطای auth-key تقصیر پراکسی نیست.
-            # 🧲 فاز ۵ (BUG-14): claim اتمیک از ظرفیت آزاد — سقف اکانت per proxy
-            # رعایت می‌شود و اسلاتِ پراکسیِ فعلی اکانت در همان تراکنش آزاد می‌گردد.
-            new_proxy_str = await claim_proxy_for_account(session, account_id)
-            new_proxy_dict = parse_proxy_string(new_proxy_str) if new_proxy_str else None
-            if new_proxy_str and not new_proxy_dict:
+            
+            new_proxy_dict = parse_proxy_string(new_proxy_str)
+            if not new_proxy_dict:
                 try:
                     await mark_proxy_failed(session, new_proxy_str)
-                except Exception as mark_err:
-                    logger.error(f"Failed to mark malformed proxy as failed: {mark_err}")
-                new_proxy_dict = None
-            if not new_proxy_dict:
-                # پراکسی جایگزین معتبری نیست؛ استارتِ تازه ممکن نیست — همان کلاینت
-                # در تلاش بعدی دوباره امتحان می‌شود تا شمارنده به قرنطینه برسد.
+                    await session.commit()
+                except Exception: pass
                 await asyncio.sleep(2)
                 continue
+                
             try:
-                # claim خودش binding (accounts.proxy_string) و in_use را در همین
-                # تراکنش نوشته است — اینجا فقط ثبت نهایی (commit) است.
                 await session.commit()
             except Exception:
                 await session.rollback()
+                
             if client.is_connected:
                 try:
                     await client.stop()
-                except Exception:
-                    pass
+                except Exception: pass
+                
             stmt_acc = select(Account).where(Account.id == account_id)
             account_obj = await session.scalar(stmt_acc)
             if not account_obj or not account_obj.session_string:
-                logger.error(f"Cannot recreate worker {account_id}: missing session data in DB.")
                 worker_pool.pop(account_id, None)
                 return False
+                
             new_client = await build_worker_client(account_obj, session, new_proxy_dict)
             if new_client is None:
-                logger.error(f"Cannot recreate worker {account_id}: client build failed.")
                 worker_pool.pop(account_id, None)
                 return False
+                
             worker_pool[account_id] = new_client
             client = new_client
 
+        except AuthKeyDuplicated as e:
+            logger.error(f"Worker {account_id}: AuthKeyDuplicated - session used elsewhere. Quarantining.")
+            worker_pool.pop(account_id, None)
+            await mark_account_quarantined(account_id)
+            return False
+
         except (UserDeactivated, UserDeactivatedBan, Unauthorized) as e:
-            # 🛡 فاز ۴ (BUG-23): AuthKeyUnregistered از این مسیر جدا شد (بلوک بالا)؛
-            # بقیه‌ی خانواده‌ی ۴۰۱ (SessionRevoked و…) همچنان قطعی تلقی و پاکسازی می‌شوند.
             logger.error(f"Worker {account_id} session revoked or banned: {e}")
             worker_pool.pop(account_id, None)
             try:
-                # 🧲 فاز ۵ (BUG-14): پراکسیِ اکانتِ بن‌شده آزاد می‌شود تا ظرفیتش
-                # برای اکانت سالم قابل claim باشد (in_use یک واحد کم می‌شود).
                 banned_proxy_str = await session.scalar(
                     select(Account.proxy_string).where(Account.id == account_id)
                 )
@@ -836,117 +1220,159 @@ async def start_worker_with_rotation(
                 if banned_proxy_str:
                     await release_proxy_slot(session, banned_proxy_str)
                 await session.commit()
-                logger.info(f"Account {account_id} flagged as banned and session data cleared from DB.")
-            except Exception as db_err:
+            except Exception:
                 await session.rollback()
-                logger.error(f"Failed to flag account {account_id} as banned: {db_err}")
             return False
             
         except Exception as e:
             logger.warning(f"Worker {account_id} connection failed (Attempt {attempt}/{MAX_RETRIES}): {e}")
-            
             try:
                 acc_stmt = select(Account).where(Account.id == account_id)
                 failed_acc = await session.scalar(acc_stmt)
                 if failed_acc and failed_acc.proxy_string:
                     await mark_proxy_failed(session, failed_acc.proxy_string)
+                    await session.commit()
             except Exception as db_err:
                 logger.error(f"Error reading original proxy string for account {account_id}: {db_err}")
             
-            # 🧲 فاز ۵ (BUG-14): claim اتمیک از ظرفیتِ آزاد (سقف اکانت per proxy)؛
-            # اسلاتِ پراکسی قبلی اکانت در همان تراکنش آزاد و binding جدید ثبت می‌شود.
             new_proxy_str = await claim_proxy_for_account(session, account_id)
             if new_proxy_str:
-                # 🔒 گارد نشت IP در چرخش: پراکسیِ تازه‌چرخیده باید قابل‌پارس باشد.
-                # (در نسخه‌ی قبل اگر رشته‌ی پراکسیِ فعالِ دیتابیس خراب بود، کلاینت
-                # با proxy=None و IP مستقیم سرور ساخته می‌شد — نشت IP!)
                 new_proxy_dict = parse_proxy_string(new_proxy_str)
                 if not new_proxy_dict:
-                    logger.error(
-                        f"Rotated proxy for worker {account_id} is malformed - marking it "
-                        "failed and NOT falling back to direct IP."
-                    )
                     try:
                         await mark_proxy_failed(session, new_proxy_str)
-                    except Exception as mark_err:
-                        logger.error(f"Failed to mark malformed proxy as failed: {mark_err}")
+                        await session.commit()
+                    except Exception: pass
                     await asyncio.sleep(2)
                     continue
                 
-                logger.info(f"Rotating proxy for worker {account_id}...")
-                
-                # ۱. commit تراکنشِ claim — binding جدید + شمارنده‌ی in_use
                 try:
                     await session.commit()
                 except Exception:
                     await session.rollback()
                     
-                # 🔴 اصلاح فاز ۳: ساخت مجدد (Re-instantiation) کلاینت به جای تغییر درجای پراکسی
-                # توقف امن کلاینت قبلی (در صورت وجود سوکت باز)
                 if client.is_connected:
                     try:
                         await client.stop()
-                    except Exception:
-                        pass
+                    except Exception: pass
                         
-                # واکشی اطلاعات کامل اکانت برای ساخت کلاینت جدید
                 stmt_acc = select(Account).where(Account.id == account_id)
                 account_obj = await session.scalar(stmt_acc)
                 
                 if not account_obj or not account_obj.session_string:
-                    logger.error(f"Cannot recreate worker {account_id}: missing session data in DB.")
                     worker_pool.pop(account_id, None)
                     return False
                     
-                # ساخت کلاینت کاملاً جدید از کارخانه‌ی واحد
-                # (CRM و شنود «سین» همان قبل - دست‌نخورده)
                 new_client = await build_worker_client(account_obj, session, new_proxy_dict)
                 if new_client is None:
-                    logger.error(f"Cannot recreate worker {account_id}: client build failed.")
                     worker_pool.pop(account_id, None)
                     return False
                 
-                # جایگزینی کلاینت جدید در استخر ورکرها و متغیر لوپ فعلی
                 worker_pool[account_id] = new_client
                 client = new_client
-                
             else:
-                # 🧲 فاز ۵: claim می‌تواند به‌دلیل «اتمام پراکسی فعال» یا «پُر بودن
-                # ظرفیت همه‌ی پراکسی‌ها (MAX_ACCOUNTS_PER_PROXY)» ناموفق باشد.
-                logger.critical(
-                    f"CRITICAL: No proxy with FREE capacity for Worker {account_id} "
-                    f"(MAX_ACCOUNTS_PER_PROXY={config.MAX_ACCOUNTS_PER_PROXY})! Disconnecting."
-                )
-                worker_pool.pop(account_id, None)
-                # ⚠️ هشدار Realtime به ادمین: پراکسی سالم این ورکر تمام شده است.
-                # اولین رخداد بلافاصله ارسال می‌شود؛ تکرارهای بعدیِ همان اکانت
-                # (از حلقه‌ی Reconnect) برای جلوگیری از اسپم تا ۳۰ دقیقه سرکوب می‌شوند.
-                if not _no_proxy_alert_throttled(account_id):
-                    await notify_admins(
-                        bot,
-                        "🚨 <b>هشدار امنیتی: اتمام پراکسی‌های سالم</b>\n\n"
-                                                f"🔴 ورکر <code>{account_id}</code> به دلیل اتمام پراکسی‌های سالم یا پُر بودن ظرفیت آن‌ها، "
-                        "قطع و از استخر حذف شد.\n\n"
-                        "طبق سیاست امنیتی «قطع به‌جای افشای IP سرور»، این اکانت با IP مستقیم "
-                        "سرور اجرا نخواهد شد.\n"
-                        "💡 لطفاً در پنل مدیریت پراکسی سالم جدید ثبت کنید؛ حلقه‌ی Reconnect "
-                        "خودکار ظرف حداکثر ۵ دقیقه ورکر را به استخر برمی‌گرداند."
-                    )
-                else:
-                    logger.info(
-                        f"No-proxy alert for worker {account_id} throttled (sent recently)."
-                    )
-                return False
+                # 🟢 بررسی فال‌بک دایرکت آی‌پی در زمان قطعی کامل پروکسی‌ها با گارد تشخیص ایران/مسدودی
+                from workers.session_manager import direct_ip_fallback_enabled, direct_budget_ok, _no_proxy_alert_throttled
+                fallback_used = False
+                
+                if direct_ip_fallback_enabled(account_id) and await direct_budget_ok(session):
+                    logger.warning(f"Worker {account_id}: No proxy available, checking direct IP fallback...")
+                    
+                    telegram_reachable = False
+                    try:
+                        # 🟢 تست هوشمند موقعیت سرور و دسترسی به تلگرام (MTProto + GeoIP)
+                        import aiohttp
+                        async with aiohttp.ClientSession(trust_env=False) as http_session:
+                            # ۱. بررسی اینکه آیا سرور در ایران است؟
+                            async with http_session.get("http://ip-api.com/json/", timeout=3.0) as geo_resp:
+                                geo_data = await geo_resp.json()
+                                if geo_data.get("countryCode") == "IR":
+                                    logger.warning(f"Server is in Iran (IP: {geo_data.get('query')}). Direct connection is blocked by DPI.")
+                                    telegram_reachable = False
+                                else:
+                                    # ۲. تست واقعی MTProto برای دیتاسنتر ۴ تلگرام (تشخیص آی‌پی بن شده)
+                                    reader, writer = await asyncio.wait_for(
+                                        asyncio.open_connection("149.154.167.50", 443), timeout=3.0
+                                    )
+                                    writer.write(b'\xef')
+                                    await writer.drain()
+                                    try:
+                                        data = await asyncio.wait_for(reader.read(1), timeout=1.5)
+                                        if not data:
+                                            logger.warning("MTProto socket dropped instantly by server (IP Banned or DPI).")
+                                            telegram_reachable = False
+                                        else:
+                                            telegram_reachable = True
+                                    except asyncio.TimeoutError:
+                                        telegram_reachable = True
+                                    finally:
+                                        writer.close()
+                                        try:
+                                            await writer.wait_closed()
+                                        except Exception:
+                                            pass
+                    except Exception as e:
+                        logger.debug(f"Direct connection check failed: {e}")
+                        telegram_reachable = False
+                        
+                    if telegram_reachable:
+                        logger.info(f"Direct IP is accessible. Switching worker {account_id} to direct connection.")
+                        try:
+                            stmt = update(Account).where(Account.id == account_id).values(proxy_string=None, proxy_status="NO_PROXY").execution_options(synchronize_session=False)
+                            await session.execute(stmt)
+                            await session.commit()
+                            fallback_used = True
+                        except Exception:
+                            await session.rollback()
+                            
+                        if fallback_used:
+                            if client.is_connected:
+                                try: await client.stop()
+                                except Exception: pass
+                                
+                            stmt_acc = select(Account).where(Account.id == account_id)
+                            account_obj = await session.scalar(stmt_acc)
+                            new_client = await build_worker_client(account_obj, session, None)
+                            if new_client:
+                                worker_pool[account_id] = new_client
+                                client = new_client
+                                continue # تلاش مجدد با کلاینت بدون پروکسی در همین حلقه
+                    else:
+                        logger.warning(f"Worker {account_id}: Direct IP fallback failed (Server IP is blocked or in Iran).")
+                        if bot is not None and not _no_proxy_alert_throttled(0):
+                            try:
+                                await notify_admins(bot, "🚨 <b>هشدار مسدودی آی‌پی سرور</b>\n\nپروکسی‌های سالم تمام شدند، اما آی‌پی سرور شما قابلیت اتصال مستقیم به تلگرام را ندارد (احتمالاً ایران است یا مسدود شده).\n<i>تلاش برای فال‌بک لغو شد و اکانت‌ها متوقف شدند.</i>")
+                            except Exception: pass
 
+                if not fallback_used:
+                    # اگر فال‌بک مجاز نبود یا آی‌پی مسدود بود، اکانت به صف انتظار می‌رود
+                    logger.warning(f"Worker {account_id}: No healthy proxy available. Moving to WAITING_PROXY.")
+                    stmt_wait = (
+                        update(Account)
+                        .where(Account.id == account_id)
+                        .values(proxy_status="WAITING_PROXY", proxy_queue_joined_at=datetime.now(timezone.utc))
+                        .execution_options(synchronize_session=False)
+                    )
+                    await session.execute(stmt_wait)
+                    await session.commit()
+                    worker_pool.pop(account_id, None)
+                    return False
 
-    logger.error(f"Worker {account_id} failed to connect after {MAX_RETRIES} attempts. Waiting for reconnect loop.")
     worker_pool.pop(account_id, None)
+    if bot is not None and not _disconnect_alert_throttled(account_id):
+        try:
+            await notify_admins(bot, f"⚠️ <b>قطعی ورکر</b>\nارتباط ورکر <code>{account_id}</code> قطع شد.")
+        except Exception:
+            pass
+
     return False
 async def stop_all_workers() -> None:
     """Cleanly disconnects all active Pyrogram clients."""
     logger.info("Stopping all workers...")
     for account_id, client in list(worker_pool.items()):
         try:
+            if getattr(client, "in_memory", False):
+                await _persist_memory_session(client, account_id)
             if client.is_connected:
                 await client.stop()
             logger.info(f"Worker {account_id} disconnected safely.")
@@ -965,6 +1391,7 @@ async def stop_all_workers() -> None:
             
     logger.info("All workers have been stopped and removed from the pool.")
 
+
 # ==========================================
 # START SINGLE WORKER (پشتیبانی از لاگین دینامیک)
 # ==========================================
@@ -972,16 +1399,48 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
     if not account.session_string:
         return False
 
-    proxy_dict = parse_proxy_string(account.proxy_string) if account.proxy_string else None
+    stmt_settings = select(GlobalSettings).limit(1)
+    global_settings = await session.scalar(stmt_settings)
+    
+    use_proxy_for_sending = await get_use_proxy_for_sending(session)
 
-    # 🔴 اصلاح فاز ۴: گارد امنیتی برای جلوگیری از نشت آی‌پی سرور
-    # 🔒 فاز ۵: تنها استثنا، فال‌بک صریح FALLBACK_TO_DIRECT_IP=true است
-    if not proxy_dict and not direct_ip_fallback_enabled(account.id):
-        logger.critical(
-            f"CRITICAL: Cannot start Worker {account.id} - No valid proxy found! "
-            "Aborting dynamically started worker to prevent IP leak."
-        )
-        return False
+    if use_proxy_for_sending:
+        proxy_dict = parse_proxy_string(account.proxy_string) if account.proxy_string else None
+        if not proxy_dict:
+            # 1. بررسی شرط مجاز بودن فال‌بک و خالی بودن بودجه دایرکت
+            if direct_ip_fallback_enabled(account.id) and await direct_budget_ok(session):
+                logger.warning(
+                    f"Worker {account.id} has invalid/no proxy but fallback is allowed. "
+                    "Switching to direct connection."
+                )
+                # 2. ریست وضعیت پراکسی اکانت در دیتابیس و قرار دادن پراکسی کلاینت روی None
+                try:
+                    stmt = (
+                        update(Account)
+                        .where(Account.id == account.id)
+                        .values(proxy_string=None, proxy_status="NO_PROXY")
+                        .execution_options(synchronize_session=False)
+                    )
+                    await session.execute(stmt)
+                    await session.commit()
+                except Exception as e:
+                    logger.error(f"Failed to reset proxy state for worker {account.id}: {e}")
+                    await session.rollback()
+                    return False
+                    
+                proxy_dict = None
+            else:
+                # 3. عدم برقراری شروط فال‌بک
+                logger.critical(
+                    f"CRITICAL: Cannot start Worker {account.id} - No valid proxy found! "
+                    "Direct IP fallback is disabled or budget is full. Aborting dynamically started worker to prevent IP leak."
+                )
+                return False
+    else:
+        proxy_dict = None
+        if not await direct_budget_ok(session):
+            logger.warning(f"Cannot start Worker {account.id} dynamically - MAX_DIRECT_ACCOUNTS reached.")
+            return False
 
     # ساخت کلاینت از کارخانه‌ی واحد (همان منطق قبلی: API اختصاصی، Spoofing، CRM و «سین»)
     client = await build_worker_client(account, session, proxy_dict)
@@ -990,7 +1449,31 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
         return False
 
     try:
-        await client.start()
+        try:
+            await asyncio.wait_for(client.start(), timeout=45)
+        except asyncio.TimeoutError:
+            raise Exception("Timeout connecting to Telegram. Proxy or network might be dead.")
+        except sqlite3.DatabaseError as db_err:
+            session_file = SESSIONS_DIR / f"worker_acc_{account.id}.session"
+            if session_file.exists() and not getattr(client, "in_memory", False):
+                logger.critical(f"Worker {account.id} session file is corrupt. Deleting and rebuilding via memory bootstrap. Error: {db_err}")
+                try:
+                    session_file.unlink()
+                except Exception as unlink_err:
+                    logger.error(f"Failed to delete corrupt session file for {account.id}: {unlink_err}")
+                new_client = await build_worker_client(account, session, proxy_dict)
+                if new_client:
+                    client = new_client
+                    await client.start()
+                else:
+                    raise db_err
+            else:
+                raise
+
+        await warm_worker_cache(client, extra_peer_ids=config.FORCE_JOIN_CHANNEL_LIST or None)
+        if getattr(client, "in_memory", False):
+            await _persist_memory_session(client, account.id)
+
         worker_pool[account.id] = client
         logger.info(f"Dynamically started new Worker {account.id} with API {client.api_id}.")
 
@@ -1019,7 +1502,8 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
         stmt_settings = select(GlobalSettings).limit(1)
         global_settings = await session.scalar(stmt_settings)
         
-        # 🎭 مدیریت پیشرفته پروفایل‌ها: تنظیمات به randomize_profile پاس می‌شود
+        # 🎭 مدیریت پیشرفته پروفایل‌ها: آبجکت تنظیمات به randomize_profile پاس
+        # می‌شود؛ سوئیچ‌های مستقل نام/بیو داخل خود تابع اعمال می‌شوند.
         # باگ ۳: ذخیره reference قوی
         task_profile = asyncio.create_task(
             randomize_profile(client, account.id, settings=global_settings)
@@ -1045,4 +1529,41 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
             await client.stop()
         except Exception:
             pass
-        return False
+        return False 
+
+# ==========================================
+# DEEP CLEANUP: پاکسازی کامل اکانت حذف‌شده
+# ==========================================
+async def remove_account_from_system(account_id: int) -> None:
+    """
+    حذف کامل اکانت از استخر ورکرها (RAM) و پاک کردن فایل فیزیکی سشن (Ghost Session).
+    باید دقیقاً پس از حذف اکانت از دیتابیس فراخوانی شود.
+    """
+    logger.info(f"Deep cleaning account {account_id} from system...")
+    
+    # ۱. توقف کلاینت و اخراج از حافظه رم (worker_pool)
+    client = worker_pool.pop(account_id, None)
+    if client:
+        try:
+            if getattr(client, "is_connected", False):
+                await client.stop()
+            logger.info(f"Worker {account_id} stopped and removed from memory pool.")
+        except Exception as e:
+            logger.warning(f"Error stopping worker {account_id} during cleanup: {e}")
+    else:
+        logger.debug(f"Worker {account_id} was not active in the pool.")
+
+    # ۲. پاک کردن فایل‌های فیزیکی روح از روی هارد سرور
+    session_file = SESSIONS_DIR / f"worker_acc_{account_id}.session"
+    journal_file = SESSIONS_DIR / f"worker_acc_{account_id}.session-journal"
+    wal_file = SESSIONS_DIR / f"worker_acc_{account_id}.session-wal"
+    shm_file = SESSIONS_DIR / f"worker_acc_{account_id}.session-shm"
+    
+    for f_path in [session_file, journal_file, wal_file, shm_file]:
+        if f_path.exists():
+            try:
+                f_path.unlink()
+                logger.info(f"Deleted ghost session file: {f_path.name}")
+            except Exception as e:
+                logger.error(f"Failed to delete session file {f_path.name}: {e}")
+            

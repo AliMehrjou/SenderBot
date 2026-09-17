@@ -154,6 +154,7 @@ async def finish_adding_apis(callback: types.CallbackQuery, state: FSMContext) -
     )
 
 
+# REWRITTEN
 async def render_api_list(callback: types.CallbackQuery, session: AsyncSession, page: int = 1):
     """
     🗂 لیست APIها — 📄 فاز ۴:
@@ -227,7 +228,7 @@ async def render_api_list(callback: types.CallbackQuery, session: AsyncSession, 
     for api in apis:
         acc_count = acc_counts.get(api.id, 0)
         
-        masked_hash = html.escape(api.api_hash[:6]) + "••••••••" if api.api_hash else "نامشخص"
+        masked_hash = html.escape(api.api_hash[:4]) + "..." + html.escape(api.api_hash[-4:]) if api.api_hash else "نامشخص"
         status_display = "✅ فعال" if api.is_active else "❌ غیرفعال"
 
         text += (
@@ -235,14 +236,14 @@ async def render_api_list(callback: types.CallbackQuery, session: AsyncSession, 
             f"🔏 هش API: <code>{masked_hash}</code>\n"
             f"📍 وضعیت: {status_display}\n"
             f"👥 اکانت‌های متصل: {acc_count}\n"
-            f"🗑 برای حذف کامند زیر را بفرستید:\n"
-            f"<code>/DeleteApi_{api.id}</code>\n"
             "------------------------\n"
         )
 
+        btn_toggle_text = "🔴 غیرفعال کردن" if api.is_active else "🟢 فعال کردن"
+        builder.button(text=btn_toggle_text, callback_data=f"toggle_api_{api.id}_{page}/")
         builder.button(text=f"❌ حذف {api.api_id}", callback_data=f"del_api_{api.id}_{page}/")
 
-    # چیدمان دکمه‌های حذف دو ستونه
+    # چیدمان دکمه‌های هر API (دو ستونه: [تغییر وضعیت] [حذف])
     builder.adjust(2)
 
     # ── ناوبری صفحات (📄 فاز ۴: زیرساخت مشترک — فرمت api_page_{n}/ حفظ شده) ──
@@ -253,6 +254,7 @@ async def render_api_list(callback: types.CallbackQuery, session: AsyncSession, 
 
     # 🛡 فاز ۵: ویرایش امن به جای edit_text خام
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
 
 # --- File: api_handlers.py ---
 
@@ -276,6 +278,31 @@ async def list_apis_handler(callback: types.CallbackQuery, state: FSMContext, se
     # menu_list_api/ → صفحهٔ ۱ | api_page_N/ → N
     page = parse_page_from_callback(callback.data)
 
+    await render_api_list(callback, session, page)
+
+
+@router.callback_query(F.data.startswith("toggle_api_") & F.data.endswith("/"))
+async def toggle_api_status(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    parts = callback.data.replace("toggle_api_", "").replace("/", "").split("_")
+    if not parts[0].isdigit():
+        return await safe_callback_answer(callback, "⚠️ آیدی نامعتبر.", show_alert=True)
+        
+    api_db_id = int(parts[0])
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+    
+    try:
+        api_obj = await session.get(APIKey, api_db_id)
+        if api_obj:
+            api_obj.is_active = not api_obj.is_active
+            await session.commit()
+            status_text = "فعال" if api_obj.is_active else "غیرفعال"
+            await safe_callback_answer(callback, f"✅ وضعیت API به {status_text} تغییر یافت.")
+        else:
+            await safe_callback_answer(callback, "⚠️ این API یافت نشد.", show_alert=True)
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("API", e), get_main_menu_keyboard())
+        
     await render_api_list(callback, session, page)
 
 

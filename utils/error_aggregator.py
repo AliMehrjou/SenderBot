@@ -6,8 +6,21 @@ from workers.sender import _get_redis  # استفاده از کلاینت ردی
 
 logger = logging.getLogger(__name__)
 
+
 async def report_admin_error(error_text: str):
     """ثبت پیام خطا در بافر ردیس برای ارسال گروهی"""
+    
+    # 🛡 لیست سیاه خطاها: عباراتی که نمی‌خواهیم به ادمین گزارش شوند
+    ignored_errors = [
+        "query is too old and response timeout expired",
+        "query ID is invalid",
+        "message is not modified" # این هم یکی از خطاهای رایج و بی‌خطر تلگرام است
+    ]
+    
+    # اگر متن خطا شامل یکی از عبارات لیست سیاه بود، بی‌صدا خارج شو
+    if any(ignored in error_text for ignored in ignored_errors):
+        return
+
     try:
         redis = _get_redis()
         # کلید admin_errors:buffer به عنوان یک دیکشنری در ردیس عمل می‌کند
@@ -15,6 +28,7 @@ async def report_admin_error(error_text: str):
         await redis.hincrby("admin_errors:buffer", error_text, 1)
     except Exception as e:
         logger.error(f"Failed to buffer admin error: {e}")
+
 
 async def error_aggregator_loop(bot: Bot):
     """تسک پس‌زمینه: هر ۵ دقیقه خطاها را خوانده و یکجا به ادمین ارسال می‌کند"""

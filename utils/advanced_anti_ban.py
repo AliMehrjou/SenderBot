@@ -8,6 +8,9 @@ from pyrogram import Client
 from pyrogram.errors import PeerIdInvalid, UserRestricted
 from pyrogram.raw.functions.auth import ResetAuthorizations
 from pyrogram.errors import FreshResetAuthorisationForbidden
+import re
+from datetime import datetime, timezone
+from pyrogram.errors import YouBlockedUser
 
 # ایمپورت تابع اسپینتکس برای داینامیک کردن متن‌ها
 from utils.anti_ban import parse_spintax
@@ -19,19 +22,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# مخزن داده‌های هویتی
-FIRST_NAMES = ["علی", "محمد", "سارا", "زهرا", "رضا", "مریم", "امیر", "فاطمه", "مهدی", "نیلوفر"]
-LAST_NAMES = ["احمدی", "حسینی", "محمدی", "رضایی", "کریمی", "موسوی", "جعفری", "جلالی"]
-BIOS = [
-    "روزهای خوب در راهند 🌟",
-    "تلاش برای اهداف 💻",
-    "عاشق طبیعت 🌿",
-    "پشتکار و امید!",
-    "کارآفرین",
-    "Life is beautiful.",
-    "Carpe Diem ☀️",
-    "" 
-]
+import json
+
+# مسیردهی جدید: پیدا کردن پوشه json_files در کنار پوشه utils
+# مقدار __file__ مسیر همین فایل پایتون را نشان می‌دهد و دو بار dirname ما را به ریشه پروژه می‌رساند.
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+JSON_FILE_PATH = os.path.join(BASE_DIR, 'json_files', 'profiles.json')
+
+# مقادیر پیش‌فرض (در صورتی که فایل جیسون در دسترس نباشد یا پاک شده باشد)
+FIRST_NAMES = ["کاربر"]
+LAST_NAMES = [""]
+BIOS = [""]
+
+# استخراج داده‌ها از فایل JSON با پشتیبانی از UTF-8
+try:
+    with open(JSON_FILE_PATH, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+        FIRST_NAMES = data.get("first_names", FIRST_NAMES)
+        LAST_NAMES = data.get("last_names", LAST_NAMES)
+        BIOS = data.get("bios", BIOS)
+except FileNotFoundError:
+    logger.error(f"❌ فایل {JSON_FILE_PATH} پیدا نشد! از مقادیر پیش‌فرض استفاده می‌شود.")
+except json.JSONDecodeError:
+    logger.error("❌ فایل profiles.json مشکل سینتکسی دارد! از مقادیر پیش‌فرض استفاده می‌شود.")
+except Exception as e:
+    logger.error(f"❌ خطای ناشناخته در خواندن profiles.json: {e}")
 
 async def randomize_profile(
     client: Client,
@@ -113,10 +128,11 @@ async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage") 
     if not package or not package.photos:
         return
 
+    from pyrogram.errors import FloodWait, PhotoInvalid
     # --- مرحله ۱ و ۲: حذف عکس‌های قدیمی (به‌جز آخری) ---
     try:
-        photos = await client.get_profile_photos("me")
-        old_ids = [p.file_id for p in photos[:-1]]
+        photos = [p async for p in client.get_chat_photos("me")]
+        old_ids = [p.file_id for p in photos[:-1]] if photos else []
         if old_ids:
             await client.delete_profile_photos(old_ids)
             logger.info(
@@ -124,6 +140,9 @@ async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage") 
                 f"(package «{package.name}»)."
             )
             await asyncio.sleep(random.uniform(2, 5))
+    except FloodWait as e:
+        logger.warning(f"Worker {client.name} hit FloodWait ({e.value}s) during photo deletion.")
+        await asyncio.sleep(e.value)
     except Exception as e:
         logger.warning(f"Worker {client.name}: failed to delete old profile photos: {e}")
 
@@ -140,7 +159,7 @@ async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage") 
             logger.warning(
                 f"Worker {client.name}: failed to set profile photo (pos={photo.position}): {e}"
             )
-        await asyncio.sleep(random.uniform(4, 10))
+        await asyncio.sleep(random.uniform(2, 5))
 
     logger.info(
         f"Worker {client.name}: profile photo rotation for package «{package.name}» finished."
@@ -160,7 +179,7 @@ async def perform_warmup_cycle(client: Client, account_id: int) -> None:
             if dialog.unread_messages_count > 0:
                 await client.read_chat_history(dialog.chat.id)
                 read_count += 1
-                await asyncio.sleep(random.uniform(2, 6)) 
+                await asyncio.sleep(random.uniform(1, 3)) 
         
         # --- منطق فاز ۳: بیدار کردن اکانت‌های خام ---
         if dialogs_count == 0:
@@ -172,7 +191,7 @@ async def perform_warmup_cycle(client: Client, account_id: int) -> None:
             
             # مرحله اول: استارت ربات
             await client.send_message(target_bot, "/start")
-            await asyncio.sleep(random.uniform(3, 6))
+            await asyncio.sleep(random.uniform(2, 4))
             
             # مرحله دوم: یک سرچ یا تعامل ساده انسانی
             queries = ["cat", "hello", "smile", "car", "nature", "funny"]
@@ -186,40 +205,83 @@ async def perform_warmup_cycle(client: Client, account_id: int) -> None:
     except Exception as e:
         logger.debug(f"Worker user_{account_id}/ warm-up error: {e}")
 
-
-async def appeal_to_spambot(client: Client, account_id: int) -> None:
+async def check_spambot_status(client: Client, account_id: int) -> Optional[dict]:
     """
-    ارسال دستورات متوالی به ربات اسپم‌بات برای ثبت درخواست رفع محدودیت.
-    با استفاده از Spintax، متن ارسالی هر اکانت کاملاً یونیک خواهد بود.
+    بررسی وضعیت محدودیت اکانت از طریق SpamBot.
+    ارسال /start، خواندن پاسخ، فشردن دکمه inline (در صورت وجود) و استخراج تاریخ انقضا.
     """
     try:
+        try:
+            await client.unblock_user("spambot")
+        except Exception:
+            pass
+
         await client.send_message("spambot", "/start")
-        logger.info(f"Worker user_{account_id}/ sent /start to @spambot.")
-        await asyncio.sleep(random.uniform(3, 6))
+        await asyncio.sleep(2.5)
         
-        msg1 = parse_spintax("{This is a mistake|I think there is a mistake|It's a mistake|Please check this mistake}")
-        await client.send_message("spambot", msg1)
-        await asyncio.sleep(random.uniform(2, 4))
+        history = []
+        async for msg in client.get_chat_history("spambot", limit=2):
+            history.append(msg)
+            
+        if not history:
+            return None
+            
+        reply = history[0]
         
-        msg2 = parse_spintax("{Yes|Yeah|Yes please|Yes, it is}")
-        await client.send_message("spambot", msg2)
-        await asyncio.sleep(random.uniform(2, 4))
+        # اگر دکمه‌ای وجود دارد (مثلاً "This is a mistake") آن را فشار بده
+        # 🟢 رفع باگ کرش در برخورد با کیبورد معمولی (ReplyKeyboardMarkup) اسپم‌بات
+        if reply.reply_markup and getattr(reply.reply_markup, "inline_keyboard", None):
+            callback_data = reply.reply_markup.inline_keyboard[0][0].callback_data
+            if callback_data:
+                await client.request_callback_answer(
+                    chat_id="spambot",
+                    message_id=reply.id,
+                    callback_data=callback_data
+                )
+                await asyncio.sleep(2)
+                # رفرش کردن آخرین پیام بعد از تعامل
+                async for msg in client.get_chat_history("spambot", limit=1):
+                    reply = msg
         
-        msg3 = parse_spintax("{No! Never did that!|No, I didn't|I never did anything wrong|No|Never!}")
-        await client.send_message("spambot", msg3)
-        await asyncio.sleep(random.uniform(3, 5))
+        text = reply.text or ""
+        is_restricted = True
+        until_date = None
         
-        appeal_text = parse_spintax(
-            "{I think my account was restricted by mistake.|My account got limited for no reason.|Please remove the limitation.} "
-            "{I just send messages to my friends.|I only chat with my contacts.|I am a normal user.} "
-            "{Please fix this.|Please remove the limitation.|Thanks in advance.}"
-        )
-        await client.send_message("spambot", appeal_text)
-        
-        logger.info(f"Worker user_{account_id}/ successfully submitted unique SpamBot appeal.")
-        
+        if "Good news" in text or "free from any limitations" in text or "هیچ محدودیتی" in text:
+            is_restricted = False
+        else:
+            # پارس کردن تاریخ انقضا (فرمت معمول: until 15 Aug 2024, 15:33 UTC)
+            date_match = re.search(r"until (\d{1,2} [a-zA-Z]+ \d{4}, \d{2}:\d{2} UTC)", text)
+            if date_match:
+                try:
+                    until_date = datetime.strptime(date_match.group(1), "%d %b %Y, %H:%M %Z")
+                    until_date = until_date.replace(tzinfo=timezone.utc)
+                except Exception:
+                    pass
+                    
+        # اختیاری: ارسال Appeal اتوماتیک در صورت محدودیت و روشن بودن تنظیمات
+        from config import config
+        if is_restricted and getattr(config, "SPAMBOT_AUTO_APPEAL", False):
+            # ارسال متن رندومایز شده اسپینتکس
+            appeal_text = parse_spintax(
+        "{Dear administrator|Hello Telegram Support|Hi Support Team},\n"
+        "{There is some problem with my telegram account|My account has been limited unfairly|I am unable to send messages to non-contacts}.\n"
+        "{Someone reported me wrongly|I believe this is a false positive by the algorithm|I haven't done anything against the terms of service}.\n"
+        "{Would you please fix the problem|Please review and remove this limitation|Kindly check my account status}.\n"
+        "{I look forward to hearing from you|Thanks for your time|Best regards}."
+    )
+            await client.send_message("spambot", appeal_text)
+
+        logger.info(f"Worker user_{account_id}/ spambot check complete. Restricted: {is_restricted}")
+        return {
+            "text": text,
+            "restricted": is_restricted,
+            "until": until_date
+        }
     except Exception as e:
-        logger.debug(f"Worker user_{account_id}/ failed to contact @spambot: {e}")
+        logger.error(f"Spambot check failed for user_{account_id}/: {e}")
+        return None
+    
 
 async def terminate_other_sessions(client: Client) -> bool:
     """

@@ -27,19 +27,20 @@ from bot.handlers.order_handlers import router as order_router
 from bot.handlers.stats_handlers import router as stats_router
 from bot.handlers.extractor_handlers import router as extractor_router
 from config import config  # 🔐 فاز ۹ (SEC-7): منبع واحد BOT_TOKEN
+import utils.pyro_patches  # noqa: F401  (C-01 fix; must import before any Client)
 from database.engine import async_session, init_db
-from database.migrations import run_startup_migrations 
-from utils.crm_catcher import close_crm_redis  # 🧹 فاز ۹ (BUG-27): بستن Redis فیلتر/نرخ CRM در shutdown
+from database.migrations import run_startup_migrations
+from utils.crm_catcher import close_crm_redis  
 from bot.handlers.tools_handlers import router as tools_router
 from bot.middlewares.admin_auth import AdminMiddleware
 from bot.middlewares.database import DatabaseMiddleware
-from utils.health_checker import auto_health_check_loop, auto_reconnect_loop
+from utils.health_checker import auto_health_check_loop, auto_reconnect_loop, proxy_health_monitor_task
 from workers.session_manager import initialize_workers, start_all_workers, worker_pool, stop_all_workers
 from workers.task_queue import order_dispatcher_loop
-from workers.sender import close_sender_redis  # 🎭 بستن امن Redis شمارنده‌ی جهش متن
+from workers.sender import close_sender_redis  
 from bot.handlers.photo_handlers import router as photo_router
 from bot.handlers.admin_manage import router as admin_manage_router
-from bot.handlers.banner_handlers import router as banner_router  # 🎨 پنل مدیریت بنرها
+from bot.handlers.banner_handlers import router as banner_router  
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,11 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
     reconnect_task = asyncio.create_task(supervise("reconnect", lambda: auto_reconnect_loop(worker_pool, bot)))
     reconnect_task.add_done_callback(dispatcher_crash_handler)
     background_tasks.append(reconnect_task)
+    
+    # ۳. تسک پایش سلامت مداوم پروکسی‌ها بدون ایجاد اختلال در عملکرد دیسپچر
+    proxy_monitor_task = asyncio.create_task(supervise("proxy_health", lambda: proxy_health_monitor_task(bot)))
+    proxy_monitor_task.add_done_callback(dispatcher_crash_handler)
+    background_tasks.append(proxy_monitor_task)
     
     # ۱. اجرای تسک زباله‌روب فایل‌های موقت (محافظت هارد سرور)
     gc_task = asyncio.create_task(supervise("temp_gc", lambda: temp_file_gc_loop()))
@@ -258,8 +264,9 @@ async def main() -> None:
                 await event.update.callback_query.answer("⚠️ خطای داخلی رخ داد. لطفاً دوباره تلاش کنید.", show_alert=True)
             elif event.update.message:
                 await event.update.message.answer("⚠️ خطای داخلی رخ داد. لطفاً دوباره تلاش کنید.")
-        except Exception:
-            pass
+        except Exception as e:
+            # 🛡 رفع باگ: جلوگیری از قورت‌دادن استثنا و لاگ گرفتن از خطای تلگرام
+            logger.warning(f"Failed to send global error message to user: {e}", exc_info=True)
         return True
 
     # ثبت میدلورها

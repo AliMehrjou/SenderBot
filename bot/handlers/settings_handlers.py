@@ -11,17 +11,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from workers.session_manager import worker_pool, parse_proxy_string
 from config import config
-from database.models import GlobalSettings, Category, Account, Proxy
+from database.engine import async_session
+from database.models import GlobalSettings, Category, Account, Proxy, Admin
 from bot.states.settings_fsm import SettingsStates
 from bot.states.confirm_fsm import ConfirmStates
-from bot.keyboards.main_menu import get_main_menu_button
+from bot.keyboards.main_menu import (
+    get_main_menu_button,
+    get_progress_notify_button_text,
+    PROGRESS_NOTIFY_TOGGLE_CB,
+)
 
-# 🟣 فاز ۴ (رفع بن‌بست FSM): helper های قبلی
+from utils.health_checker import check_all_proxies
 from bot.keyboards.cancel import with_cancel_hint
 from utils.fsm_cleanup import cleanup_fsm_temp_files
 from utils.safe_edit import safe_edit_or_answer
-from workers.session_manager import worker_pool, parse_proxy_string
-# 🛡 فاز ۲ (مدیریت خطا): helper های فاز ۱ + اصلاحیه answer_callback_error
+import asyncio
+
 from utils.error_messages import report_db_error
 from utils.telegram_helpers import (
     answer_callback_error,
@@ -44,6 +49,7 @@ from utils.pagination import (
 logger = logging.getLogger(__name__)
 
 router = Router(name="settings_handlers_router")
+
 
 
 # ==========================================
@@ -98,9 +104,25 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
         )
 
     send_limit = settings.send_limit_per_run if settings else "N/A"
-    penalty = settings.spam_penalty_days if settings else "N/A"
     max_acc_api = settings.max_accounts_per_api if settings else "N/A"
-    cooldown = settings.cooldown_hours if settings else "N/A"
+    
+    # 🛡 نمایش مقادیر موثر (Effective Values) برای راستی‌آزمایی
+    raw_penalty = settings.spam_penalty_days if settings else 3
+    penalty = f"{raw_penalty} (مؤثر: {max(raw_penalty, 1)})" if raw_penalty < 1 else str(raw_penalty)
+    
+    raw_cooldown = settings.cooldown_hours if settings else 1
+    cooldown = f"{raw_cooldown} (مؤثر: {max(raw_cooldown, 1)})" if raw_cooldown < 1 else str(raw_cooldown)
+
+    # Phase 5 — per-admin live progress reporting preference (default: on)
+    progress_notify_on = True
+    try:
+        admin_row = await session.scalar(
+            select(Admin).where(Admin.telegram_id == callback.from_user.id)
+        )
+        if admin_row is not None:
+            progress_notify_on = bool(admin_row.progress_notify)
+    except Exception as e:
+        logger.warning(f"Settings menu: progress_notify lookup failed: {e}")
 
     daily_cap = config.DAILY_SEND_LIMIT_PER_ACCOUNT
     new_acc_days = config.NEW_ACCOUNT_DAYS
@@ -114,7 +136,9 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
     builder.button(text="تغییر جریمه اسپم", callback_data="settings_edit_penalty/")
     builder.button(text="تغییر ظرفیت ارسال", callback_data="settings_edit_limit/")
 
-    # --- دکمه‌های Toggle (خاموش/روشن) ---
+    # --- دکمه‌های سرعت و Toggle (خاموش/روشن) ---
+    builder.button(text="⚡ حالت سرعت استخراج", callback_data="settings_speed_mode/")
+    
     if settings:
         btn_2fa = "✅ 🔐 تنظیم پسورد دوم (2FA)" if settings.auto_set_2fa else "❌ 🔐 تنظیم پسورد دوم (2FA)"
         btn_term = "✅ 🚪 خروج از سایر نشست‌ها" if settings.terminate_sessions else "❌ 🚪 خروج از سایر نشست‌ها"
@@ -124,6 +148,15 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
         btn_bio = "✅ 📝 تنظیم بیو" if settings.auto_set_bio else "❌ 📝 تنظیم بیو"
         btn_photo = "✅ 🖼 تنظیم عکس پروفایل" if settings.auto_set_photo else "❌ 🖼 تنظیم عکس پروفایل"
         btn_access = "✅ 🌐 دسترسی عمومی به کد سفارش" if settings.public_order_access else "❌ 🌐 دسترسی عمومی به کد سفارش"
+        
+        # 🛡 رفع باگ: خواندن تنظیمات ضدبن هوشمند از Redis به دلیل عدم وجود ستون در جدول اصلی
+        anti_ban_active = True
+        try:
+            from workers.sender import _get_redis
+            ab_val = await _get_redis().get("settings:smart_anti_ban")
+            anti_ban_active = (ab_val is None or ab_val == "1")
+        except Exception: pass
+        btn_antiban = "✅ 🛡 محافظت هوشمند ضدبن" if anti_ban_active else "❌ 🛡 محافظت هوشمند ضدبن"
 
         builder.button(text=btn_2fa, callback_data="toggle_auto_set_2fa/")
         builder.button(text=btn_term, callback_data="toggle_terminate_sessions/")
@@ -131,21 +164,28 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
         builder.button(text=btn_bio, callback_data="toggle_auto_set_bio/")
         builder.button(text=btn_photo, callback_data="toggle_auto_set_photo/")
         builder.button(text=btn_access, callback_data="toggle_public_order_access/")
+        builder.button(text=btn_antiban, callback_data="toggle_smart_anti_ban/") # دکمه اضافه شد
+        builder.button(text="🌐 مدیریت پروکسی‌ها", callback_data="menu_proxies/")
+        builder.button(text="🩺 وضعیت سلامت اکانت‌ها", callback_data="menu_account_health_page_1/")
     # ------------------------------------
+
+    # Phase 5 — live progress reporting toggle (per-admin, always shown)
+    builder.button(
+        text=get_progress_notify_button_text(progress_notify_on),
+        callback_data=PROGRESS_NOTIFY_TOGGLE_CB,
+    )
 
     # دکمه‌های مدیریت
     builder.button(text="📁 افزودن دسته‌بندی جدید", callback_data="settings_add_cat/")
-    builder.button(text="🌐 افزودن لیست پراکسی", callback_data="settings_add_proxy/")
-    builder.button(text="🔄 دریافت خودکار پراکسی", callback_data="settings_auto_fetch_proxy/")
-    builder.button(text="🗑 پاکسازی پراکسی‌های مرده", callback_data="settings_flush_proxies/")
-
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
 
-    # چیدمان: ۲ ردیف عددی + ۳ ردیف سوئیچ (جفتی) + ردیف مدیریت + پاکسازی + منوی اصلی
-    builder.adjust(2, 2, 2, 2, 2, 2, 1, 1)
+    # چیدمان جدید با اضافه شدن دکمه مدیریت پروکسی
+    builder.adjust(2, 2, 1, 2, 2, 2, 2, 1, 1, 2)
 
+    speed_mode_fa = {"safe": "🔒 امن", "fast": "⚡ سریع", "turbo": "🚀 توربو"}.get(settings.extraction_speed_mode if settings else "safe", "🔒 امن")
     text = (
         "⚙️ <b>پنل تنظیمات پیشرفته سیستم</b>\n\n"
+        f"🔹 <b>حالت سرعت استخراج:</b> {speed_mode_fa}\n"
         f"🔹 <b>حداکثر اکانت روی هر API:</b> <code>{max_acc_api}</code> عدد\n"
         f"🔹 <b>ظرفیت ارسال هر ورکر:</b> <code>{send_limit}</code> پیام\n"
         f"🔹 <b>زمان استراحت هر اکانت:</b> <code>{cooldown}</code> ساعت\n"
@@ -156,6 +196,64 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
     )
 
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
+# ==========================================
+# Phase 5 — live progress reporting toggle (per-admin, callback-only, no FSM)
+# ==========================================
+@router.callback_query(F.data == PROGRESS_NOTIFY_TOGGLE_CB)
+async def toggle_progress_notify(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    """
+    Flips the CURRENT admin's progress_notify flag immediately. The change
+    applies to the NEXT task (the flag is read at reporter-creation time).
+    """
+    telegram_id = callback.from_user.id
+
+    try:
+        admin_row = await session.scalar(
+            select(Admin).where(Admin.telegram_id == telegram_id)
+        )
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(
+            callback, report_db_error("تنظیمات", e), get_main_menu_button()
+        )
+
+    current_value = bool(admin_row.progress_notify) if admin_row is not None else True
+    new_value = not current_value
+
+    try:
+        if admin_row is None:
+            # No admins-table row yet (typical for the primary ADMIN_ID which is
+            # configured via env only). Create one so the preference persists;
+            # only the primary admin may bootstrap a row this way — everyone
+            # else must already exist as a sub-admin to be able to toggle.
+            if int(config.ADMIN_ID or 0) != int(telegram_id):
+                return await callback.answer(
+                    "❌ این تنظیم فقط برای ادمین‌های ثبت‌شده قابل تغییر است.",
+                    show_alert=True,
+                )
+            session.add(Admin(telegram_id=telegram_id, progress_notify=new_value))
+        else:
+            admin_row.progress_notify = new_value
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(
+            callback, report_db_error("تنظیمات", e), get_main_menu_button()
+        )
+
+    status_text = "روشن" if new_value else "خاموش"
+    await safe_callback_answer(
+        callback,
+        f"✅ گزارش پیشرفت لحظه‌ای {status_text} شد — از وظیفهٔ بعدی اعمال می‌شود.",
+    )
+
+    # Re-render the settings menu so the button label updates immediately
+    await show_settings_menu(callback, state, session)
 
 
 # ==========================================
@@ -172,6 +270,7 @@ TOGGLE_FIELD_LABELS = {
     "auto_set_bio": "تنظیم بیو",
     "auto_set_photo": "تنظیم عکس پروفایل",
     "public_order_access": "دسترسی عمومی به کد سفارش",
+    "smart_anti_ban": "محافظت هوشمند ضدبن",
 }
 
 @router.callback_query(F.data.startswith("toggle_") & F.data.endswith("/"))
@@ -195,6 +294,21 @@ async def toggle_boolean_settings(callback: types.CallbackQuery, state: FSMConte
     # 🛡 گارد امنیتی: فقط فیلدهای تعریف‌شده در TOGGLE_FIELD_LABELS و موجود روی مدل
     # قابل toggle هستند تا کال‌بک جعلی (مثل toggle_id/) نتواند ستون‌های غیربولی
     # GlobalSettings را دستکاری کند.
+    # 🛡 رفع باگ: مدیریت مجزای smart_anti_ban روی Redis
+    if field_name == "smart_anti_ban":
+        try:
+            from workers.sender import _get_redis
+            redis = _get_redis()
+            ab_val = await redis.get("settings:smart_anti_ban")
+            is_active = (ab_val is None or ab_val == "1")
+            await redis.set("settings:smart_anti_ban", "0" if is_active else "1")
+            
+            status_text = "غیرفعال" if is_active else "فعال"
+            await safe_callback_answer(callback, f"✅ وضعیت «محافظت هوشمند ضدبن» به {status_text} تغییر یافت.")
+            return await show_settings_menu(callback, state, session)
+        except Exception as e:
+            return await answer_callback_error(callback, f"خطای ردیس: {e}", get_main_menu_button())
+
     if field_name not in TOGGLE_FIELD_LABELS or not hasattr(settings, field_name):
         return await callback.answer("❌ فیلد نامعتبر است.", show_alert=True)
 
@@ -219,6 +333,7 @@ async def toggle_boolean_settings(callback: types.CallbackQuery, state: FSMConte
     # پاس دادن state واقعی (show_settings_menu حالا با safe_callback_answer
     # شروع می‌شود، پس answer دوباره‌ای در کار نیست)
     await show_settings_menu(callback, state, session)
+
 
 
 # ==========================================
@@ -299,16 +414,156 @@ async def process_add_category(message: types.Message, state: FSMContext, sessio
 
 
 # ==========================================
-# ADD PROXIES FLOW
+# PROXY MANAGEMENT MENU & FLOW
 # ==========================================
-async def _fetch_existing_proxy_strings(session: AsyncSession, candidates: list[str]) -> set[str]:
-    """
-    🛡 فاز ۲: واکشی پراکسی‌های موجود در دیتابیس از میان لیست کاندیدها.
 
-    کوئری به صورت chunk اجرا می‌شود تا در دیتابیس‌هایی که محدودیت تعداد پارامتر
-    دارند (مثل SQLite با سقف ~۹۹۹ پارامتر)، لیست‌های بزرگ باعث خطای
-    "too many SQL variables" نشوند.
-    """
+@router.callback_query(F.data == "menu_proxies/")
+async def show_proxies_menu(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await safe_callback_answer(callback)
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+
+    try:
+        settings = await session.scalar(select(GlobalSettings).limit(1))
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("تنظیمات", e), get_main_menu_button())
+
+    use_sender_proxy = bool(getattr(settings, "use_proxy_for_sending", False)) if settings else False
+
+    builder = InlineKeyboardBuilder()
+    
+    # دکمه سوییچ وضعیت پروکسی ارسال
+    sender_proxy_status = "🟢 فعال" if use_sender_proxy else "⚪️ غیرفعال (مستقیم)"
+    builder.button(
+    text=f"وضعیت پروکسی ارسال: {sender_proxy_status}", 
+    callback_data="switch_sender_proxy/"
+    )
+    
+    builder.button(text="➕ افزودن پروکسی", callback_data="settings_add_proxy_start/")
+    builder.button(text="🗑 مدیریت و حذف پروکسی‌ها", callback_data="settings_manage_proxies/")
+    builder.button(text="🔄 بررسی مجدد سلامت پروکسی‌ها", callback_data="settings_recheck_proxies/")
+    builder.button(text="🧹 پاکسازی پراکسی‌های مرده", callback_data="settings_flush_proxies/")
+    builder.button(text="⚙️ بازگشت به تنظیمات", callback_data="menu_settings/")
+    builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
+
+    builder.adjust(1, 1, 1, 1, 1, 2)
+
+    text = (
+        "🌐 <b>پنل مدیریت پروکسی‌ها</b>\n\n"
+        "💡 <b>راهنمای تفکیک پروکسی‌ها:</b>\n"
+        "🔸 <b>پروکسی لاگین:</b> مخصوص فرآیند حساس ثبت و ورود اکانت‌ها (جلوگیری از بلاک شدن شماره در لحظه دریافت کد).\n"
+        "🔸 <b>پروکسی ارسال:</b> مخصوص ارسال پیام انبوه. شما می‌توانید انتخاب کنید ترافیک پیام‌ها مستقیماً (Direct) از سرور باشد یا از طریق پروکسی‌های این بخش عبور کند.\n\n"
+        "👇 <i>از منوی زیر برای مدیریت شبکه‌ی اتصال استفاده کنید:</i>"
+    )
+
+    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
+
+
+
+async def _background_proxy_check(wait_msg: types.Message, total: int):
+    # باز کردن یک اتصال کاملاً جدید و مستقل از میدل‌ور
+    async with async_session() as session:
+        try:
+            # اعمال تایم‌اوت ۵ دقیقه‌ای (۳۰۰ ثانیه) برای جلوگیری از گیر کردن تسک
+            await asyncio.wait_for(check_all_proxies(bot=wait_msg.bot), timeout=300.0)
+
+            # واکشی آمار بعد از اتمام بررسی بر اساس وضعیت جدید سلامت (Hysteresis)
+            healthy = await session.scalar(select(func.count(Proxy.id)).where(Proxy.health_state == 'HEALTHY', Proxy.is_active == True)) or 0
+            weak = await session.scalar(select(func.count(Proxy.id)).where(Proxy.health_state == 'WEAK', Proxy.is_active == True)) or 0
+            dead = await session.scalar(select(func.count(Proxy.id)).where(Proxy.health_state == 'DEAD')) or 0
+            inactive = await session.scalar(select(func.count(Proxy.id)).where(Proxy.is_active == False, Proxy.health_state != 'DEAD')) or 0
+
+            result_text = (
+                f"✅ <b>بررسی مجدد پایان یافت</b>\n\n"
+                f"🟢 سالم (عالی): <b>{healthy}</b>\n"
+                f"🟡 ضعیف (کُند): <b>{weak}</b>\n"
+                f"🔴 مرده (DEAD): <b>{dead}</b>\n"
+                f"⚪️ غیرفعال: <b>{inactive}</b>"
+            )
+            await safe_edit_message(wait_msg, result_text, reply_markup=get_settings_return_keyboard())
+
+        except asyncio.TimeoutError:
+            await safe_edit_message(
+                wait_msg, 
+                "❌ زمان بررسی بیش از حد طول کشید (Timeout). بررسی متوقف شد.", 
+                reply_markup=get_settings_return_keyboard()
+            )
+        except Exception as e:
+            # از آنجایی که سشن اختصاصی است، rollback مشکلی برای ربات ایجاد نمی‌کند
+            await session.rollback()
+            await safe_edit_message(
+                wait_msg, 
+                f"❌ خطای سیستمی:\n<code>{e}</code>", 
+                reply_markup=get_settings_return_keyboard()
+            )
+@router.callback_query(F.data == "settings_recheck_proxies/")
+async def recheck_proxies_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await safe_callback_answer(callback)
+
+    total = await session.scalar(select(func.count(Proxy.id))) or 0
+    if total == 0:
+        return await callback.message.answer(
+            "⚠️ هیچ پراکسی ثبت شده‌ای جهت بررسی وجود ندارد.",
+            reply_markup=get_settings_return_keyboard()
+        )
+
+    wait_msg = await send_loading_message(callback.message, "⏳ عملیات در پس‌زمینه آغاز شد. لطفاً منتظر بمانید...")
+
+    # تسک را در پس‌زمینه ایجاد می‌کنیم و هندلر را می‌بندیم
+    asyncio.create_task(
+        _background_proxy_check(wait_msg, total)
+    )
+
+@router.callback_query(F.data == "settings_add_proxy_start/")
+async def add_proxy_ask_type(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await safe_callback_answer(callback)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔐 پروکسی ورود (Login)", callback_data="add_proxy_type_login/")
+    builder.button(text="📤 پروکسی ارسال (Sender)", callback_data="add_proxy_type_sender/")
+    builder.button(text="🌐 برای هر دو (دوکاره)", callback_data="add_proxy_type_both/")
+    builder.button(text="🔙 بازگشت", callback_data="menu_proxies/")
+    builder.adjust(2, 1, 1)
+    
+    await safe_edit_or_answer(
+        callback.message,
+        "➕ <b>افزودن پروکسی جدید</b>\n\nلطفاً تعیین کنید این پروکسی برای کدام بخش استفاده می‌شود؟",
+        reply_markup=builder.as_markup()
+    )
+
+@router.callback_query(F.data.in_({"add_proxy_type_login/", "add_proxy_type_sender/", "add_proxy_type_both/"}))
+async def ask_for_proxies_input(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if "login" in callback.data:
+        proxy_type = "login"
+        type_fa = "ورود (Login)"
+    elif "sender" in callback.data:
+        proxy_type = "sender"
+        type_fa = "ارسال پیام (Sender)"
+    else:
+        proxy_type = "both"
+        type_fa = "هر دو (دوکاره)"
+    
+    await safe_callback_answer(callback)
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+
+    await state.update_data(target_proxy_type=proxy_type)
+    await state.set_state(SettingsStates.waiting_for_proxies)
+    
+    await safe_edit_or_answer(
+        callback.message,
+        with_cancel_hint(
+            f"🌐 <b>افزودن پروکسی برای بخش: {type_fa}</b>\n\n"
+            "لطفاً لیست پروکسی‌های خود را (هر کدام در یک خط) ارسال کنید.\n"
+            "<i>فرمت قابل قبول: socks5://user:pass@ip:port یا socks5://ip:port</i>"
+        ),
+        reply_markup=get_settings_cancel_keyboard()
+    )
+
+
+async def _fetch_existing_proxy_strings(session: AsyncSession, candidates: list[str]) -> set[str]:
     existing: set[str] = set()
     CHUNK_SIZE = 500
     for i in range(0, len(candidates), CHUNK_SIZE):
@@ -317,39 +572,25 @@ async def _fetch_existing_proxy_strings(session: AsyncSession, candidates: list[
         existing.update(await session.scalars(stmt))
     return existing
 
-
-@router.callback_query(F.data == "settings_add_proxy/")
-async def ask_for_proxies(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-
-    await cleanup_fsm_temp_files(state)
-    await state.clear()
-
-    await state.set_state(SettingsStates.waiting_for_proxies)
-    await safe_edit_or_answer(
-        callback.message,
-        with_cancel_hint(
-            "🌐 <b>افزودن پراکسی</b>\n\n"
-            "لطفاً لیست پراکسی‌های خود را (هر کدام در یک خط) ارسال کنید.\n"
-            "<i>فرمت قابل قبول: socks5://user:pass@ip:port یا socks5://ip:port</i>"
-        ),
-        reply_markup=get_settings_cancel_keyboard()
-    )
-
 @router.message(SettingsStates.waiting_for_proxies, F.text)
 async def process_new_proxies(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    raw_proxies = message.text.strip().split('\n')
+    data = await state.get_data()
+    proxy_type = data.get("target_proxy_type", "login")
+    
+    if proxy_type == "login":
+        type_fa = "لاگین"
+    elif proxy_type == "sender":
+        type_fa = "ارسال"
+    else:
+        type_fa = "دوکاره"
 
-    # ── ۱. اعتبارسنجی فرمت + حذف تکراری‌های داخل خود پیام ──
-    seen_in_message: set[str] = set()
-    valid_proxies: list[str] = []
-    invalid_count = 0
-    duplicate_in_message_count = 0
+    raw_proxies = message.text.strip().split('\n')
+    seen_in_message, valid_proxies = set(), []
+    invalid_count, duplicate_in_message_count = 0, 0
 
     for line in raw_proxies:
         proxy_str = line.strip()
-        if not proxy_str:
-            continue
+        if not proxy_str: continue
         if not parse_proxy_string(proxy_str):
             invalid_count += 1
             continue
@@ -359,58 +600,163 @@ async def process_new_proxies(message: types.Message, state: FSMContext, session
         seen_in_message.add(proxy_str)
         valid_proxies.append(proxy_str)
 
-    # ── ۲. هیچ پراکسی معتبری نیست → کاربر در state می‌ماند و لیست اصلاح‌شده
-    #        را دوباره می‌فرستد (به جای پایان فلو با پیام «۰ پراکسی اضافه شد»)
     if not valid_proxies:
-        parts = ["⚠️ <b>هیچ پراکسی معتبری در لیست ارسالی یافت نشد.</b>"]
-        if invalid_count > 0:
-            parts.append(f"🔸 تعداد <b>{invalid_count}</b> خط به دلیل فرمت نامعتبر رد شد (فقط socks4/socks5 مجاز است).")
-        if duplicate_in_message_count > 0:
-            parts.append(f"🔸 تعداد <b>{duplicate_in_message_count}</b> خط تکراری بود.")
-        parts.append("لطفاً لیست اصلاح‌شده را دوباره ارسال کنید.")
         return await message.answer(
-            with_cancel_hint("\n".join(parts)),
+            with_cancel_hint("⚠️ هیچ پروکسی معتبری یافت نشد. لیست اصلاح‌شده را ارسال کنید."),
             reply_markup=get_settings_cancel_keyboard()
         )
 
-    # ── ۳. درج در دیتابیس — 🛡 فاز ۲: یک commit اتمیک برای کل لیست.
-    #        نسخه قبلی خط‌به‌خط commit می‌کرد: خطای وسط لیست = ثبت نصفه‌کاره،
-    #        و پراکسی‌های تکراری بی‌صدا drop می‌شدند (بدون اطلاع به کاربر)
+    updated_to_both_count = 0
+
     try:
-        existing_set = await _fetch_existing_proxy_strings(session, valid_proxies)
+        # ۱. استخراج آبجکت‌های پراکسی تکراری از دیتابیس در دسته‌های ۵۰۰تایی (برای جلوگیری از طولانی شدن کوئری)
+        existing_proxies = []
+        CHUNK_SIZE = 500
+        for i in range(0, len(valid_proxies), CHUNK_SIZE):
+            chunk = valid_proxies[i:i + CHUNK_SIZE]
+            stmt = select(Proxy).where(Proxy.proxy_string.in_(chunk))
+            result = await session.scalars(stmt)
+            existing_proxies.extend(result.all())
+
+        # ۲. بررسی پراکسی‌های موجود و ارتقای نوع آن‌ها در صورت نیاز
+        existing_set = set()
+        for p in existing_proxies:
+            existing_set.add(p.proxy_string)
+            if p.usage_type != proxy_type and p.usage_type != "both":
+                p.usage_type = "both"
+                updated_to_both_count += 1
+
+        # ۳. یافتن پراکسی‌های کاملاً جدید
         new_proxies = [p for p in valid_proxies if p not in existing_set]
         duplicate_in_db_count = len(valid_proxies) - len(new_proxies)
 
+        # ۴. ثبت پراکسی‌های جدید در دیتابیس
         if new_proxies:
             session.add_all(
-                [Proxy(proxy_string=p, is_active=True, fail_count=0) for p in new_proxies]
+                [Proxy(proxy_string=p, is_active=True, fail_count=0, usage_type=proxy_type) for p in new_proxies]
             )
-            await session.commit()
+            
+        await session.commit()
+        
+        # بیدار کردن صف انتظار در صورت افزودن پروکسی جدید
+        from workers.session_manager import background_process_proxy_queue
+        asyncio.create_task(background_process_proxy_queue())
+
     except Exception as e:
         await session.rollback()
         await state.clear()
-        return await message.answer(
-            report_db_error("پراکسی‌ها", e),
-            reply_markup=get_settings_return_keyboard()
-        )
+        return await message.answer(report_db_error("پروکسی‌ها", e), reply_markup=get_settings_return_keyboard())
 
     await state.clear()
-
+    
     added_count = len(new_proxies)
-    response_parts = [f"✅ تعداد <b>{added_count}</b> پراکسی جدید و یونیک به استخر شبکه اضافه شد."]
-    if duplicate_in_db_count > 0:
-        response_parts.append(f"♻️ تعداد <b>{duplicate_in_db_count}</b> پراکسی از قبل در استخر موجود بود و دوباره ثبت نشد.")
-    if duplicate_in_message_count > 0:
-        response_parts.append(f"♻️ تعداد <b>{duplicate_in_message_count}</b> خط تکراری در خود لیست نادیده گرفته شد.")
+    response_parts = [f"✅ تعداد <b>{added_count}</b> پروکسی کاملاً جدید به استخر <b>{type_fa}</b> اضافه شد."]
+    
+    if updated_to_both_count > 0:
+        response_parts.append(f"🔄 تعداد <b>{updated_to_both_count}</b> پروکسی موجود، به وضعیت «دوکاره» ارتقا یافتند.")
+    
+    unchanged_duplicates = duplicate_in_db_count - updated_to_both_count
+    if unchanged_duplicates > 0:
+        response_parts.append(f"♻️ تعداد <b>{unchanged_duplicates}</b> پروکسی تکراری نادیده گرفته شد.")
+        
     if invalid_count > 0:
-        response_parts.append(f"⚠️ تعداد <b>{invalid_count}</b> پراکسی به دلیل فرمت نامعتبر (فقط socks4/socks5 مجاز است) رد شدند.")
+        response_parts.append(f"⚠️ تعداد <b>{invalid_count}</b> پروکسی نامعتبر رد شد.")
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="🌐 افزودن پراکسی دیگر", callback_data="settings_add_proxy/")
-    builder.button(text="⚙️ بازگشت به تنظیمات", callback_data="menu_settings/")
-    builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-    builder.adjust(1, 2)
+    builder.button(text="🌐 بازگشت به پنل پروکسی", callback_data="menu_proxies/")
+    builder.adjust(1)
     await message.answer("\n".join(response_parts), reply_markup=builder.as_markup())
+
+
+
+# ==========================================
+# MANAGE & DELETE PROXIES (GLASS MENU)
+# ==========================================
+
+@router.callback_query(F.data == "settings_manage_proxies/")
+async def manage_proxies_list(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    try:
+        # واکشی ۵۰ پروکسی آخر (محدود شده برای جلوگیری از خطای تلگرام در کیبورد اینلاین)
+        stmt = select(Proxy).order_by(Proxy.id.desc()).limit(50)
+        proxies = (await session.scalars(stmt)).all()
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("پروکسی‌ها", e), get_main_menu_button())
+
+    builder = InlineKeyboardBuilder()
+
+    if not proxies:
+        builder.button(text="🔙 بازگشت", callback_data="menu_proxies/")
+        return await safe_edit_or_answer(
+            callback.message,
+            "⚠️ هیچ پروکسی ثبت شده‌ای در دیتابیس وجود ندارد.",
+            reply_markup=builder.as_markup()
+        )
+
+    for p in proxies:
+        status_emoji = "🟢" if p.is_active else "🔴"
+        type_str = {"login": "لاگین", "sender": "ارسال", "both": "دوکاره"}.get(p.usage_type, "دوکاره")
+        # استخراج آی‌پی و پورت برای نمایش کوتاه‌تر
+        short_addr = p.proxy_string.split("@")[-1] if "@" in p.proxy_string else p.proxy_string.replace("socks5://", "")
+        
+        btn_text = f"{status_emoji} [{type_str}] {short_addr} ❌"
+        builder.button(text=btn_text, callback_data=f"del_proxy_{p.id}/")
+
+    builder.adjust(1) # هر پروکسی در یک سطر
+    builder.row(types.InlineKeyboardButton(text="🔙 بازگشت به منوی پروکسی", callback_data="menu_proxies/"))
+
+    text = "🗑 <b>لیست پروکسی‌ها</b>\n\nبرای حذف فوری، روی هر پروکسی کلیک کنید:"
+    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("del_proxy_") & F.data.endswith("/"))
+async def delete_proxy_inline_handler(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    proxy_id_str = callback.data.replace("del_proxy_", "").replace("/", "")
+    if not proxy_id_str.isdigit():
+        return await callback.answer("⚠️ شناسه نامعتبر.", show_alert=True)
+
+    try:
+        proxy = await session.scalar(select(Proxy).where(Proxy.id == int(proxy_id_str)))
+        if proxy:
+            # آزاد کردن اکانت‌های متصل قبل از حذف
+            unbind_stmt = (
+                update(Account)
+                .where(Account.proxy_string == proxy.proxy_string)
+                .values(
+                    proxy_string=None,
+                    proxy_status="WAITING_PROXY",
+                    proxy_queue_joined_at=func.now()
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await session.execute(unbind_stmt)
+            
+            await session.delete(proxy)
+            await session.commit()
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("پروکسی‌ها", e), get_main_menu_button())
+
+    await callback.answer("✅ پروکسی با موفقیت حذف شد.", show_alert=False)
+    await manage_proxies_list(callback, session)
+
+
+@router.callback_query(F.data == "switch_sender_proxy/")
+async def toggle_sender_proxy_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    try:
+        settings = await session.scalar(select(GlobalSettings).limit(1))
+        if not settings:
+            return await callback.answer("⚠️ تنظیمات یافت نشد.", show_alert=True)
+            
+        current_val = bool(getattr(settings, "use_proxy_for_sending", False))
+        settings.use_proxy_for_sending = not current_val
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("تنظیمات", e), get_main_menu_button())
+
+    await safe_callback_answer(callback, "✅ این تنظیم از ری‌استارت بعدی روی همه ورکرها اعمال می‌شود", show_alert=True)
+    await show_proxies_menu(callback, state, session)
 
 
 # ==========================================
@@ -510,10 +856,9 @@ async def process_max_accounts_api(message: types.Message, state: FSMContext, se
         reply_markup=get_settings_return_keyboard()
     )
 
-
 @router.message(SettingsStates.waiting_for_cooldown_hours, F.text)
 async def process_cooldown_hours(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text.isdecimal():
+    if not message.text.lstrip('-').isdecimal():
         return await message.answer(
             with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
             reply_markup=get_settings_cancel_keyboard()
@@ -521,9 +866,10 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
 
     new_value = int(message.text)
 
-    if not (0 <= new_value <= 720):
+    # 🛡 اعتبارسنجی سمت سرور: جلوگیری قطعی از مقدار ۰ یا منفی
+    if not (1 <= new_value <= 720):
         return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۰ تا ۷۲۰ باشد."),
+            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۱ تا ۷۲۰ ساعت باشد (مقدار ۰ غیرمجاز است)."),
             reply_markup=get_settings_cancel_keyboard()
         )
 
@@ -544,19 +890,15 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
         )
 
     await state.clear()
-    success_text = f"✅ زمان استراحت دوره‌ای اکانت‌ها به <b>{new_value} ساعت</b> تغییر یافت."
-    if new_value == 0:
-        success_text += "\n⚠️ مقدار ۰ یعنی استراحت دوره‌ای بین chunkها خاموش می‌شود."
-        
     await message.answer(
-        success_text,
+        f"✅ زمان استراحت دوره‌ای اکانت‌ها به <b>{new_value} ساعت</b> تغییر یافت.",
         reply_markup=get_settings_return_keyboard()
     )
 
 
 @router.message(SettingsStates.waiting_for_spam_penalty, F.text)
 async def process_spam_penalty(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text.isdecimal():
+    if not message.text.lstrip('-').isdecimal():
         return await message.answer(
             with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
             reply_markup=get_settings_cancel_keyboard()
@@ -564,9 +906,10 @@ async def process_spam_penalty(message: types.Message, state: FSMContext, sessio
 
     new_value = int(message.text)
 
-    if not (0 <= new_value <= 30):
+    # 🛡 اعتبارسنجی سمت سرور: حداقل ۱ روز اجباری است
+    if not (1 <= new_value <= 30):
         return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۰ تا ۳۰ باشد."),
+            with_cancel_hint("⚠️ مقدار وارد شده باید حداقل ۱ و حداکثر ۳۰ روز باشد."),
             reply_markup=get_settings_cancel_keyboard()
         )
 
@@ -587,16 +930,11 @@ async def process_spam_penalty(message: types.Message, state: FSMContext, sessio
         )
 
     await state.clear()
-    success_text = f"✅ مدت زمان جریمه اسپم به <b>{new_value} روز</b> تغییر یافت."
-    if new_value == 0:
-        success_text += "\n⚠️ مقدار ۰ یعنی جریمهٔ FloodWait عملاً غیرفعال می‌شود."
-        
     await message.answer(
-        success_text,
+        f"✅ مدت زمان جریمه اسپم به <b>{new_value} روز</b> تغییر یافت.",
         reply_markup=get_settings_return_keyboard()
     )
-
-
+    
 # ==========================================
 # REPORTS & MANAGEMENT: CATEGORIES LIST
 # (📄 فاز ۲: صفحه‌بندی استاندارد + دکمه‌های «✏️ ویرایش» و «🗑 حذف»)
@@ -1348,49 +1686,57 @@ async def delete_category_command(message: types.Message, state: FSMContext, ses
 async def flush_dead_proxies(session: AsyncSession) -> int:
     """
     منطق بک‌اند برای پاکسازی پراکسی‌های مرده از دیتابیس.
-    پراکسی‌هایی که غیرفعال شده‌اند یا بیش از ۵ بار خطا داشته‌اند را حذف می‌کند.
-
-    🛡 فاز ۲: در نسخه قبلی خطای دیتابیس را می‌بلعید و ۰ برمی‌گرداند — و هندلر
-    هم ۰ را با پیام «سیستم بهینه است» ترجمه می‌کرد؛ یعنی قطعِ کامل دیتابیس
-    به کاربر پیام «موفقیت» می‌داد! حالا بعد از rollback استثنا دوباره raise
-    می‌شود تا هندلر پیام درست را نمایش دهد.
-
-    Raises:
-        Exception: خطای دیتابیس (بعد از rollback مجدداً raise می‌شود)
+    پراکسی‌هایی که به وضعیت DEAD درآمده‌اند را حذف می‌کند.
+    اکانت‌های متصل به آن‌ها در همان تراکنش آزاد می‌شوند و وارد صف می‌گردند.
     """
-    stmt = delete(Proxy).where(
-        or_(
-            Proxy.is_active == False,
-            Proxy.fail_count >= 5
-        )
-    )
-
     try:
+        # ۱. واکشی پراکسی‌های مرده برای آزاد کردن اکانت‌ها
+        dead_proxies_stmt = select(Proxy.proxy_string).where(Proxy.health_state == 'DEAD')
+        dead_proxy_strings = (await session.scalars(dead_proxies_stmt)).all()
+        
+        if dead_proxy_strings:
+            unbind_stmt = (
+                update(Account)
+                .where(Account.proxy_string.in_(dead_proxy_strings))
+                .values(
+                    proxy_string=None,
+                    proxy_status="WAITING_PROXY",
+                    proxy_queue_joined_at=func.now()
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await session.execute(unbind_stmt)
+        
+        # ۲. حذف پراکسی‌های مرده
+        stmt = delete(Proxy).where(Proxy.health_state == 'DEAD')
         result = await session.execute(stmt)
         await session.commit()
+        
+        deleted_count = result.rowcount
+        logger.info(f"Proxy Garbage Collector: Flushed {deleted_count} DEAD proxies from database.")
+        
+        # بیدار کردن صف انتظار در صورت پاکسازی
+        if deleted_count > 0:
+            try:
+                from workers.session_manager import background_process_proxy_queue
+                import asyncio
+                asyncio.create_task(background_process_proxy_queue())
+            except ImportError:
+                pass
+                
+        return deleted_count
     except Exception:
         await session.rollback()
         raise
 
-    deleted_count = result.rowcount
-    logger.info(f"Proxy Garbage Collector: Flushed {deleted_count} dead proxies from database.")
-    return deleted_count
-
-# ==========================================
-# FLUSH PROXIES HANDLER
-# ==========================================
 @router.callback_query(F.data == "settings_flush_proxies/")
 async def flush_proxies_callback(callback: types.CallbackQuery, session: AsyncSession) -> None:
     await safe_callback_answer(callback)
-
-    # 🛡 فاز ۲: به جای toastِ گذرا، پیام انتظار واقعی (قید پروژه: همهٔ عملیات‌های
-    # طولانی loading message دارند) که در پایان به نتیجه ویرایش می‌شود
     wait_msg = await send_loading_message(callback.message, "⏳ در حال اسکن و پاکسازی پراکسی‌های مرده...")
 
     try:
         deleted_count = await flush_dead_proxies(session)
     except Exception as e:
-        # rollback داخل flush_dead_proxies انجام شده است
         return await safe_edit_message(
             wait_msg,
             report_db_error("پراکسی‌ها", e),
@@ -1401,7 +1747,7 @@ async def flush_proxies_callback(callback: types.CallbackQuery, session: AsyncSe
         await safe_edit_message(
             wait_msg,
             f"✅ <b>عملیات پاکسازی با موفقیت انجام شد!</b>\n\n"
-            f"تعداد <b>{deleted_count}</b> پراکسی مرده (قطع شده یا دارای بیش از ۵ خطا) از دیتابیس حذف گردید تا حجم سیستم بهینه‌سازی شود.",
+            f"تعداد <b>{deleted_count}</b> پراکسی مرده (DEAD) از دیتابیس حذف گردید تا حجم سیستم بهینه‌سازی شود.",
             reply_markup=get_settings_return_keyboard()
         )
     else:
@@ -1410,75 +1756,241 @@ async def flush_proxies_callback(callback: types.CallbackQuery, session: AsyncSe
             "✅ <b>سیستم بهینه است.</b>\n\nهیچ پراکسی مرده‌ای در دیتابیس یافت نشد.",
             reply_markup=get_settings_return_keyboard()
         )
-
-import aiohttp # حتماً این ایمپورت را به بالای فایل اضافه کنید
-
-@router.callback_query(F.data == "settings_auto_fetch_proxy/")
-async def auto_fetch_proxies_handler(callback: types.CallbackQuery, session: AsyncSession) -> None:
+# ==========================================
+# EXTRACTION SPEED MODE MENU
+# ==========================================
+@router.callback_query(F.data == "settings_speed_mode/")
+async def show_speed_mode_menu(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     await safe_callback_answer(callback)
-    
-    # نمایش پیام انتظار به کاربر
-    wait_msg = await send_loading_message(callback.message, "⏳ در حال برقراری ارتباط با API و دریافت پراکسی‌ها...")
+    await state.clear()
 
     try:
-        # ۱. دریافت پراکسی‌ها از API به صورت غیرهمگام
-        async with aiohttp.ClientSession() as http_session:
-            async with http_session.get(
-                "https://databay.com/api/v1/proxy-list",
-                params={"ssl": "strict", "protocol": "socks5", "format": "json"},
-                timeout=10
-            ) as resp:
-                if resp.status != 200:
-                    raise Exception(f"API HTTP Error: {resp.status}")
-                data = await resp.json()
-                proxies_data = data.get("data", [])
-
-        # ۲. تبدیل ریسپانس API به فرمت استاندارد ربات (socks5://ip:port)
-        valid_proxies = []
-        for p in proxies_data:
-            proxy_str = f"{p['protocol']}://{p['ip']}:{p['port']}"
-            valid_proxies.append(proxy_str)
-
-        if not valid_proxies:
-            return await safe_edit_message(
-                wait_msg,
-                "⚠️ هیچ پراکسی معتبری از سمت API دریافت نشد.",
-                reply_markup=get_settings_return_keyboard()
-            )
-
-        # ۳. بررسی تکراری نبودن و ثبت در دیتابیس (مشابه منطق ثبت دستی)
-        existing_set = await _fetch_existing_proxy_strings(session, valid_proxies)
-        new_proxies = [p for p in valid_proxies if p not in existing_set]
-        duplicate_count = len(valid_proxies) - len(new_proxies)
-
-        if new_proxies:
-            session.add_all(
-                [Proxy(proxy_string=p, is_active=True, fail_count=0) for p in new_proxies]
-            )
-            await session.commit()
-
-        # ۴. نمایش نتیجه نهایی
-        added_count = len(new_proxies)
-        text = (
-            f"✅ <b>دریافت خودکار با موفقیت انجام شد!</b>\n\n"
-            f"🌐 کل پراکسی‌های دریافتی از API: <b>{len(valid_proxies)}</b> عدد\n"
-            f"➕ پراکسی‌های جدید ثبت شده: <b>{added_count}</b> عدد\n"
-            f"♻️ تکراری (از قبل موجود): <b>{duplicate_count}</b> عدد\n"
-        )
-        await safe_edit_message(wait_msg, text, reply_markup=get_settings_return_keyboard())
-
-    except asyncio.TimeoutError:
-        await session.rollback()
-        await safe_edit_message(
-            wait_msg,
-            "❌ خطا: ارتباط با API بیش از حد طول کشید (Timeout).",
-            reply_markup=get_settings_return_keyboard()
-        )
+        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
+        current_mode = settings.extraction_speed_mode if settings else "safe"
+        residency = getattr(settings, "worker_residency", "ephemeral") if settings else "ephemeral"
     except Exception as e:
         await session.rollback()
-        await safe_edit_message(
-            wait_msg,
-            f"❌ خطای پیش‌بینی نشده در دریافت پراکسی:\n<code>{str(e)}</code>",
-            reply_markup=get_settings_return_keyboard()
-        )
+        return await answer_callback_error(callback, report_db_error("تنظیمات", e), get_main_menu_button())
 
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔒 امن (پیش‌فرض)" + (" ✅" if current_mode=="safe" else ""), callback_data="set_speed_mode_safe/")
+    builder.button(text="⚡ سریع (~5x)" + (" ✅" if current_mode=="fast" else ""), callback_data="set_speed_mode_fast/")
+    builder.button(text="🚀 توربو (Extreme)" + (" ✅" if current_mode=="turbo" else ""), callback_data="set_speed_mode_turbo/")
+    
+    residency_text = "✅ 🏘 عضویت ورکرها: ساکن" if residency == "resident" else "❌ 🏘 عضویت ورکرها: لحظه‌ای"
+    
+    # استفاده از کال‌بک کاملاً متمایز
+    builder.button(text=residency_text, callback_data="set_residency_mode/")
+    
+    builder.button(text="⚙️ بازگشت به تنظیمات", callback_data="menu_settings/")
+    builder.adjust(1, 1, 1, 1, 1)
+
+    text = (
+        "⚡ <b>تنظیمات پروفایل سرعت استخراج</b>\n\n"
+        "سرعت رفتار ربات را برای جوین و اسکن اعضا انتخاب کنید:\n"
+        "▫️ <b>امن:</b> وقفه طولانی، بدون ریسک\n"
+        "▫️ <b>سریع:</b> کاهش تأخیرها، سرعت بالا در استخراج موازی\n"
+        "▫️ <b>توربو:</b> حداقل تأخیر ممکن!\n\n"
+        "🏘 <b>عضویت ورکرها (لحظه‌ای/ساکن):</b> در حالت ساکن، ورکرها از گروه‌های پرتکرار مشتری خارج نمی‌شوند تا در سفارشات بعدی بدون نیاز به تأیید مجدد ادمین، بلافاصله استخراج را آغاز کنند."
+    )
+    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data == "set_residency_mode/")
+async def toggle_worker_residency_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    try:
+        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
+        if not settings:
+            return await callback.answer("⚠️ تنظیمات یافت نشد.", show_alert=True)
+            
+        current_val = getattr(settings, "worker_residency", "ephemeral")
+        new_val = "resident" if current_val == "ephemeral" else "ephemeral"
+        
+        settings.worker_residency = new_val
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("تنظیمات", e), get_main_menu_button())
+
+    mode_fa = "ساکن" if new_val == "resident" else "لحظه‌ای"
+    await safe_callback_answer(callback, f"✅ حالت عضویت به «{mode_fa}» تغییر یافت.")
+    await show_speed_mode_menu(callback, state, session)
+
+
+@router.callback_query(F.data == "switch_worker_residency/")
+async def switch_worker_residency_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    try:
+        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
+        if not settings:
+            return await callback.answer("⚠️ تنظیمات یافت نشد.", show_alert=True)
+            
+        current_val = getattr(settings, "worker_residency", "ephemeral")
+        new_val = "resident" if current_val == "ephemeral" else "ephemeral"
+        
+        settings.worker_residency = new_val
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("تنظیمات", e), get_main_menu_button())
+
+    mode_fa = "ساکن" if new_val == "resident" else "لحظه‌ای"
+    await safe_callback_answer(callback, f"✅ حالت عضویت به «{mode_fa}» تغییر یافت.")
+    await show_speed_mode_menu(callback, state, session)
+
+
+@router.callback_query(F.data == "toggle_worker_residency/")
+async def toggle_worker_residency(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    try:
+        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
+        if not settings:
+            return await callback.answer("⚠️ تنظیمات یافت نشد.", show_alert=True)
+            
+        new_val = "resident" if settings.worker_residency == "ephemeral" else "ephemeral"
+        settings.worker_residency = new_val
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("تنظیمات", e), get_main_menu_button())
+
+    mode_fa = "ساکن" if new_val == "resident" else "لحظه‌ای"
+    await safe_callback_answer(callback, f"✅ حالت عضویت به «{mode_fa}» تغییر یافت.")
+    await show_speed_mode_menu(callback, state, session)
+
+@router.callback_query(F.data == "set_speed_mode_turbo/")
+async def confirm_turbo_mode(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await safe_callback_answer(callback)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ فعال‌سازی توربو", callback_data="confirm_turbo_enable/")
+    builder.button(text="❌ انصراف", callback_data="settings_speed_mode/")
+    builder.adjust(2)
+    text = (
+        "⚠️ <b>هشدار فعال‌سازی حالت توربو</b>\n\n"
+        "حالت توربو فشار شدیدی به تلگرام می‌آورد. لطفاً موارد زیر را در نظر بگیرید:\n"
+        "• میکرو-تأخیرها برای جوین و استخراج به حداقل ممکن می‌رسند.\n"
+        "• مدار قطع‌کن خودکار (Circuit Breaker) فعال می‌شود.\n"
+        "• با ۲ مسدودی (FloodWait بزرگ) در ۱۰ دقیقه، سیستم به حالت سریع برمی‌گردد.\n\n"
+        "آیا با علم به ریسک‌های احتمالی ادامه می‌دهید؟"
+    )
+    await safe_edit_message(callback.message, text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("set_speed_mode_") | (F.data == "confirm_turbo_enable/"))
+async def apply_speed_mode(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    mode = "turbo" if callback.data == "confirm_turbo_enable/" else callback.data.replace("set_speed_mode_", "").replace("/", "")
+    if mode not in ["safe", "fast", "turbo"]:
+        return await safe_callback_answer(callback, "❌ حالت نامعتبر است.", show_alert=True)
+
+    try:
+        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
+        if not settings:
+            return await callback.answer("⚠️ تنظیمات یافت نشد.", show_alert=True)
+            
+        settings.extraction_speed_mode = mode
+        if mode == "turbo":
+            settings.turbo_risk_acknowledged = True
+            
+        await session.commit()
+        
+        from workers.sender import _get_redis
+        await _get_redis().delete("settings:speed_mode")
+        
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(callback, report_db_error("تنظیمات", e), get_main_menu_button())
+
+    mode_fa = {"safe": "🔒 امن", "fast": "⚡ سریع", "turbo": "🚀 توربو"}[mode]
+    await safe_callback_answer(callback, f"✅ پروفایل سرعت به «{mode_fa}» تغییر یافت.")
+    await show_speed_mode_menu(callback, state, session)
+
+# ==========================================
+# 🩺 سیستم مانیتورینگ دیداری سلامت اکانت‌ها
+# ==========================================
+from datetime import datetime, timezone
+
+@router.callback_query(F.data.startswith("menu_account_health_page_"))
+async def account_health_dashboard(callback: types.CallbackQuery, session: AsyncSession):
+    await safe_callback_answer(callback)
+    page = parse_page_from_callback(callback.data)
+    
+    try:
+        total_count = await session.scalar(select(func.count(Account.id))) or 0
+        total_pages = calculate_total_pages(total_count)
+        page = clamp_page(page, total_pages)
+        offset = get_page_offset(page)
+
+        accounts = (await session.scalars(
+            select(Account).order_by(Account.id.asc()).offset(offset).limit(PAGINATION_SIZE)
+        )).all()
+    except Exception as e:
+        return await answer_callback_error(callback, report_db_error("اکانت‌ها", e), get_main_menu_button())
+
+    builder = InlineKeyboardBuilder()
+    
+    text = (
+        "🩺 <b>مانیتورینگ سلامت اکانت‌ها</b>\n"
+        f"تعداد کل: <b>{total_count}</b> اکانت | صفحه <b>{page}</b> از <b>{total_pages}</b>\n\n"
+    )
+
+    now = datetime.now(timezone.utc)
+
+    for acc in accounts:
+        # تشخیص وضعیت اکانت
+        is_cooldown = acc.expected_return_time and acc.expected_return_time > now
+        
+        if getattr(acc, "session_invalid", False):
+            emoji_status = "⚪️" 
+            status_text = "نامعتبر/خروج"
+        elif getattr(acc, "spam_restricted", False):
+            emoji_status = "🔴"
+            status_text = "محدود/اسپم"
+        elif is_cooldown:
+            emoji_status = "🟡"
+            rem_time = acc.expected_return_time - now
+            hours, remainder = divmod(int(rem_time.total_seconds()), 3600)
+            mins, _ = divmod(remainder, 60)
+            status_text = f"استراحت ({hours}h:{mins}m)"
+        else:
+            emoji_status = "🟢"
+            status_text = "سالم و فعال"
+
+        text += f"{emoji_status} <code>{acc.phone_number}</code> - {status_text}\n"
+        builder.button(text=f"{emoji_status} {acc.phone_number}", callback_data=f"acc_health_{acc.id}/")
+
+    builder.adjust(2)
+    add_pagination_nav_row(builder, page, total_pages, callback_prefix="menu_account_health_")
+    
+    builder.row(types.InlineKeyboardButton(text="⚙️ بازگشت به تنظیمات", callback_data="menu_settings/"))
+    
+    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("acc_health_") & F.data.endswith("/"))
+async def account_health_detail(callback: types.CallbackQuery, session: AsyncSession):
+    await safe_callback_answer(callback)
+    acc_id = int(callback.data.replace("acc_health_", "").replace("/", ""))
+    
+    acc = await session.get(Account, acc_id)
+    if not acc:
+        return await callback.message.answer("⚠️ اکانت یافت نشد.")
+
+    now = datetime.now(timezone.utc)
+    is_cooldown = acc.expected_return_time and acc.expected_return_time > now
+    
+    builder = InlineKeyboardBuilder()
+    if is_cooldown:
+        builder.button(text="🔄 لغو دستی استراحت", callback_data=f"reset_cooldown_{acc.id}/")
+    else:
+        builder.button(text="⏸ اعمال استراحت ۲۴ ساعته", callback_data=f"force_cooldown_{acc.id}/")
+        
+    builder.button(text="🔙 بازگشت به لیست", callback_data="menu_account_health_page_1/")
+    builder.adjust(1)
+
+    status_str = "🟢 فعال" if not getattr(acc, "spam_restricted", False) else "🔴 اسپم"
+    text = (
+        f"👤 <b>جزئیات سلامت اکانت</b>\n\n"
+        f"📱 شماره: <code>{acc.phone_number}</code>\n"
+        f"وضعیت فعلی: {status_str}\n"
+        f"استراحت فعال: {'بله' if is_cooldown else 'خیر'}\n"
+    )
+    
+    await safe_edit_message(callback.message, text, reply_markup=builder.as_markup())
