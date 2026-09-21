@@ -101,7 +101,6 @@ def get_photo_panel_keyboard() -> types.InlineKeyboardMarkup:
     builder.button(text="📋 لیست پکیج‌ها", callback_data="photo_pkg_list/")
     builder.button(text="🔗 اتصال پکیج به اکانت", callback_data="photo_pkg_assign/")
     builder.button(text="⚡️ تخصیص خودکار", callback_data="photo_pkg_auto/")
-    builder.button(text="🚀 اعمال فوری روی همه", callback_data="photo_pkg_apply_all/")
     builder.adjust(2, 2, 1)
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
     return builder.as_markup()
@@ -823,31 +822,6 @@ async def photo_pkg_text_entry(message: types.Message, state: FSMContext) -> Non
 async def photo_pkg_text_entry_forbidden(message: types.Message) -> None:
     await message.answer("⛔️ شما دسترسی ندارید.")
 
-@router.callback_query(F.data == "photo_pkg_apply_all/", IsAdmin())
-async def apply_all_assigned_photos(callback: types.CallbackQuery) -> None:
-    await callback.answer("⏳ در حال اعمال عکس‌ها روی ورکرهای آنلاین...")
-    from workers.session_manager import worker_pool, apply_photo_package_now
-    
-    success, offline, failed = 0, 0, 0
-    for account_id in list(worker_pool.keys()):
-        try:
-            applied = await apply_photo_package_now(account_id)
-            if applied:
-                success += 1
-            else:
-                failed += 1
-        except Exception:
-            offline += 1
-            
-    await safe_edit_or_answer(
-        callback.message,
-        f"🚀 <b>گزارش اعمال فوری عکس‌ها</b>\n\n"
-        f"✅ موفقیت‌آمیز: {success}\n"
-        f"⚠️ ناموفق (بدون پکیج/خطا): {failed}\n"
-        f"💤 ورکرهای آفلاین: {offline}\n\n"
-        f"توجه: این عملیات فقط روی اکانت‌های آنلاین و دارای پکیج متصل اعمال می‌شود.",
-        reply_markup=get_photo_panel_keyboard()
-    )
 
 # ==========================================
 # ✏️ EDIT PACKAGE (Rename & Replace Photo)

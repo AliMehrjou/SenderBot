@@ -324,10 +324,42 @@ async def _start_create_order_flow(
                 available_workers = len(valid_account_ids) # Fallback
         
     if available_workers <= 0:
+        nearest_recovery = None
+        reasons_msg = ""
+        if connected_ids:
+            try:
+                stmt_all_connected = select(Account).where(Account.id.in_(connected_ids), Account.is_banned == False)
+                all_connected = (await session.scalars(stmt_all_connected)).all()
+                redis = _get_redis()
+                db_wait_accounts, redis_wait_accounts = 0, 0
+                now_utc = datetime.now(timezone.utc)
+                for acc in all_connected:
+                    recovery_time = None
+                    if acc.flood_wait_until and acc.flood_wait_until.replace(tzinfo=timezone.utc) > now_utc:
+                        recovery_time = acc.flood_wait_until.replace(tzinfo=timezone.utc)
+                        db_wait_accounts += 1
+                    elif acc.restricted_until and acc.restricted_until.replace(tzinfo=timezone.utc) > now_utc:
+                        recovery_time = acc.restricted_until.replace(tzinfo=timezone.utc)
+                        db_wait_accounts += 1
+                    else:
+                        ttl = await redis.ttl(f"chunk_cooldown:{acc.id}")
+                        if ttl and ttl > 0:
+                            recovery_time = now_utc + timedelta(seconds=ttl)
+                            redis_wait_accounts += 1
+                    if recovery_time and (nearest_recovery is None or recovery_time < nearest_recovery):
+                        nearest_recovery = recovery_time
+                reasons_msg = f"\n\n📊 <b>آمار ورکرها:</b>\n▫️ کل ورکرهای سالم متصل: <b>{len(all_connected)}</b>\n▫️ در لیمیت تلگرامی (DB): <b>{db_wait_accounts}</b>\n▫️ در استراحت استراتژیک (Redis): <b>{redis_wait_accounts}</b>"
+                if nearest_recovery:
+                    wait_mins = max(1, int((nearest_recovery - now_utc).total_seconds() / 60))
+                    reasons_msg += f"\n\n⏳ <b>نزدیک‌ترین زمان بازگشت:</b> حدود {wait_mins} دقیقه دیگر"
+            except Exception:
+                pass
+
         err_text = (
             "❌ <b>امکان ثبت سفارش وجود ندارد</b>\n\n"
             "در حال حاضر هیچ اکانتِ آماده ارسالی در سیستم یافت نشد.\n"
-            "(تمام ورکرها ممکن است در حال استراحت دوره‌ای باشند، یا مسدود و دارای محدودیت تلگرامی باشند)\n\n"
+            "(تمام ورکرها ممکن است در حال استراحت دوره‌ای باشند، یا مسدود و دارای محدودیت تلگرامی باشند)"
+            f"{reasons_msg}\n\n"
             "<i>لطفاً اکانت جدیدی اضافه کنید یا منتظر پایان استراحت اکانت‌های فعلی بمانید.</i>"
         )
         if callback is not None:
@@ -2650,7 +2682,8 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
         use_banner_pool=use_banner_pool,
         source_channel_id=source_channel_id,
         source_message_ids=source_message_ids_str,
-        is_approved=False
+        is_approved=False,
+        user_id=message.from_user.id
     )
 
     if len(messages) > 0:
@@ -2760,11 +2793,11 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
     )
     
     try:
-        await message.bot.send_message(
-            chat_id=config.ADMIN_ID,
+        from utils.admin_broadcast import broadcast_to_admins_with_keyboard
+        await broadcast_to_admins_with_keyboard(
+            bot=message.bot,
             text=admin_summary,
-            reply_markup=builder.as_markup(),
-            disable_web_page_preview=True
+            keyboard=builder.as_markup()
         )
     except Exception as e:
         logger.error(f"Failed to send approval request to admin for order {new_order.id}: {e}")

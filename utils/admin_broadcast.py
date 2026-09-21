@@ -52,6 +52,16 @@ async def _get_all_admin_ids() -> List[int]:
     return ids_list
 
 
+async def invalidate_admin_cache() -> None:
+    """بی‌اعتبارسازی کش ادمین‌ها در ردیس پس از افزودن/حذف ادمین"""
+    redis = _get_redis()
+    cache_key = "cached_admin_ids"
+    try:
+        await redis.delete(cache_key)
+    except Exception as e:
+        logger.warning(f"Failed to invalidate admin cache in Redis: {e}")
+
+
 async def broadcast_to_admins(
     bot: Bot, 
     text: str, 

@@ -21,6 +21,34 @@ def _role_cache_ttl() -> int:
         ttl = 120
     return max(60, min(ttl, 300))
 
+async def is_sub_admin_cached(telegram_id: int, session) -> bool:
+    now = time.monotonic()
+    cached = _role_cache.get(telegram_id)
+    if cached is not None:
+        is_admin_flag, ts = cached
+        ttl = _role_cache_ttl() if is_admin_flag else 30
+        if (now - ts) < ttl:
+            return is_admin_flag
+
+    if session is None:
+        return False
+
+    try:
+        stmt = select(Admin.telegram_id).where(Admin.telegram_id == telegram_id)
+        result = await session.execute(stmt)
+        is_admin = result.scalar_one_or_none() is not None
+    except Exception:
+        if cached is not None:
+            return cached[0]
+        return False
+
+    _role_cache[telegram_id] = (is_admin, now)
+    if len(_role_cache) > 1024:
+        ttl_pos = _role_cache_ttl()
+        for uid in [k for k, (role, ts) in _role_cache.items() if now - ts >= (ttl_pos if role else 30)]:
+            _role_cache.pop(uid, None)
+    return is_admin
+
 class AdminMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -46,7 +74,8 @@ class AdminMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         now = time.monotonic()
-        cooldown = max(0, int(getattr(config, "ADMIN_REJECT_REPLY_COOLDOWN", 3600)))
+        cooldown = max(0, int(getattr(config, "ADMIN_REJECT_REPLY_COOLDOWN", 60)))
+        cooldown = min(cooldown, 60)
         if now - _last_reject_at.get(user.id, 0.0) >= cooldown:
             _last_reject_at[user.id] = now
             if isinstance(event, Message):
@@ -64,29 +93,7 @@ class AdminMiddleware(BaseMiddleware):
         return
 
     async def _is_sub_admin(self, telegram_id: int, session) -> bool:
-        now = time.monotonic()
-        cached = _role_cache.get(telegram_id)
-        if cached is not None and (now - cached[1]) < _role_cache_ttl():
-            return cached[0]
-
-        if session is None:
-            return False
-
-        try:
-            stmt = select(Admin.telegram_id).where(Admin.telegram_id == telegram_id)
-            result = await session.execute(stmt)
-            is_admin = result.scalar_one_or_none() is not None
-        except Exception:
-            if cached is not None:
-                return cached[0]
-            return False
-
-        _role_cache[telegram_id] = (is_admin, now)
-        if len(_role_cache) > 1024:
-            ttl = _role_cache_ttl()
-            for uid in [k for k, (_, ts) in _role_cache.items() if now - ts >= ttl]:
-                _role_cache.pop(uid, None)
-        return is_admin
+        return await is_sub_admin_cached(telegram_id, session)
 
     async def _public_order_access_enabled(self, session) -> bool:
         global _public_access_cache

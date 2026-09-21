@@ -825,18 +825,18 @@ async def execute_bulk_send(
         if account_row:
             if account_row.status != AccountStatus.active:
                 await _report(status=f"اکانت فعال نیست (وضعیت: {account_row.status.value}) — بازگشت تارگت‌ها…", account=account_tag)
-                return targets
+                return targets, "account_inactive"
 
             if account_row.is_banned:
                 await _report(status="اکانت مسدود است — بازگشت تارگت‌ها به صف…", account=account_tag)
-                return targets
+                return targets, "account_banned"
                 
             flooded = account_row.flood_wait_until and account_row.flood_wait_until.replace(tzinfo=timezone.utc) > now_utc
             restricted = account_row.restricted_until and account_row.restricted_until.replace(tzinfo=timezone.utc) > now_utc
             
             if flooded or restricted:
                 await _report(status="اکانت دارای محدودیت زمانی است — بازگشت تارگت‌ها به صف…", account=account_tag)
-                return targets
+                return targets, "account_limited"
 
             spambot_enabled = getattr(config, "PREFLIGHT_SPAMBOT_CHECK_ENABLED", True)
             cache_hours = getattr(config, "PREFLIGHT_SPAMBOT_CACHE_HOURS", 4)
@@ -859,14 +859,14 @@ async def execute_bulk_send(
                         account_row.restricted_until = status["until"]
                         await session.commit()
                         await _report(status="⚠️ اکانت Shadow-ban (محدود) است — بازگشت تارگت‌ها...", account=account_tag)
-                        return targets
+                        return targets, "account_limited"
                     elif status["restricted"]:
                         account_row.is_banned = True
                         await session.commit()
                         from workers.sender import change_account_status
                         await change_account_status(session, account_db_id, AccountStatus.blocked, "SpamBot Restriction", status["text"])
                         await _report(status="⛔️ اکانت بن دائم است — بازگشت تارگت‌ها...", account=account_tag)
-                        return targets
+                        return targets, "account_banned"
                         
                     await session.commit()
     except Exception as e:
@@ -894,13 +894,19 @@ async def execute_bulk_send(
                 ),
                 account=account_tag,
             )
-            return targets
+            return targets, "source_access_denied"
         
         if src_chat_id and src_chat_id != order.source_channel_id:
             try:
                 order.source_channel_id = src_chat_id
             except Exception:
                 pass
+                
+    if (order.media_path and not os.path.exists(order.media_path)) or \
+       (order.media_2_path and not os.path.exists(order.media_2_path)) or \
+       (order.media_3_path and not os.path.exists(order.media_3_path)):
+        await _report(status="⛔️ فایل مدیای سفارش یافت نشد (احتمالاً پاک شده) — بازگشت تارگت‌ها…", account=account_tag)
+        return targets, "media_missing"
 
     unsent: List[str] = []
     sent_in_chunk = 0
@@ -948,11 +954,12 @@ async def execute_bulk_send(
     async def _send_stage_message(target: str, text: Optional[str], media_path: Optional[str], media_type: Optional[str], button_text: Optional[str], button_url: Optional[str]):
         real_target = int(target) if target.lstrip("-").isdigit() else target
         markup = _reply_markup(button_text, button_url)
+        parsed_text = parse_spintax(text) if text else ""
         if media_path and os.path.exists(media_path):
             if str(media_type or "").lower() == "video":
-                return await client.send_video(chat_id=real_target, video=str(media_path), caption=text or "", reply_markup=markup)
-            return await client.send_photo(chat_id=real_target, photo=str(media_path), caption=text or "", reply_markup=markup)
-        return await client.send_message(chat_id=real_target, text=text or "", reply_markup=markup, disable_web_page_preview=True)
+                return await client.send_video(chat_id=real_target, video=str(media_path), caption=parsed_text, reply_markup=markup)
+            return await client.send_photo(chat_id=real_target, photo=str(media_path), caption=parsed_text, reply_markup=markup)
+        return await client.send_message(chat_id=real_target, text=parsed_text, reply_markup=markup, disable_web_page_preview=True)
 
     stop_reason: Optional[str] = None
 
@@ -1225,6 +1232,8 @@ async def execute_bulk_send(
                 status="success", error_message=log_msg
             ))
             
+            _spawn_crm_mark(target)
+            
             if account_row:
                 account_row.consecutive_errors = 0
                 
@@ -1277,7 +1286,7 @@ async def execute_bulk_send(
                 await _bump_daily()
                 await incr_hourly_sent_count(account_db_id)
             else:
-                unsent.extend(targets[position+1:])
+                unsent.extend(targets[position:])
                 
             dismiss_seen_event(client, peer_id)
             break

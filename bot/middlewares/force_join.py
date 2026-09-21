@@ -38,6 +38,7 @@ from aiogram.types import (
 from config import config
 from utils.telegram_helpers import safe_callback_answer
 from workers.sender import _get_redis  # shared async Redis client (BUG-04 registry client)
+from bot.middlewares.admin_auth import is_sub_admin_cached
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,7 @@ class ForceJoinMiddleware(BaseMiddleware):
         if user is None or bot is None:
             return await handler(event, data)
 
-        if user.id == config.ADMIN_ID:
+        if user.id == config.ADMIN_ID or await is_sub_admin_cached(user.id, data.get("session")):
             return await handler(event, data)
 
         channels = config.FORCE_JOIN_CHANNEL_LIST
@@ -270,3 +271,18 @@ class ForceJoinMiddleware(BaseMiddleware):
             show_alert=True,
         )
         return None
+
+    async def _reject(self, event: TelegramObject, user_id: int, channels: list) -> None:
+        """ارسال اخطار عضویت اجباری برای کاربرانی که عضو نیستند"""
+        text = _join_required_text(channels)
+        markup = build_force_join_keyboard(channels)
+
+        if isinstance(event, Message):
+            await event.answer(text, reply_markup=markup, disable_web_page_preview=True)
+        elif isinstance(event, CallbackQuery):
+            await safe_callback_answer(event, "❌ برای استفاده از ربات، عضویت در کانال‌ها الزامی است.", show_alert=True)
+            if getattr(event, "message", None):
+                try:
+                    await event.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+                except Exception:
+                    pass

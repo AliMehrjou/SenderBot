@@ -248,6 +248,26 @@ async def run_startup_migrations() -> None:
             await session.rollback()
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
+        # +++ ارتقای ستون‌های Orders به LONGTEXT برای جلوگیری از خطای Data too long (رانش طرح) +++
+        try:
+            col_type_sql = """
+            SELECT COLUMN_NAME, DATA_TYPE 
+            FROM information_schema.COLUMNS 
+            WHERE TABLE_SCHEMA = DATABASE() 
+              AND TABLE_NAME = 'orders' 
+              AND COLUMN_NAME IN ('target_data', 'inflight_data')
+            """
+            col_types = (await session.execute(text(col_type_sql))).fetchall()
+            for c_name, d_type in col_types:
+                if d_type.upper() == 'TEXT':
+                    logger.info(f"DEP-2: ارتقای ستون {c_name} به LONGTEXT...")
+                    await session.execute(text(f"ALTER TABLE orders MODIFY COLUMN {c_name} LONGTEXT"))
+            await session.commit()
+        except Exception as exc:
+            logger.warning("DEP-2: ارتقای سایز ستون‌های Order به LONGTEXT ناموفق بود: %s", exc)
+            await session.rollback()
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
         # +++ فاز اختیاری: استراتژی ورکر ساکن +++
         try:
             exists = await session.scalar(
@@ -281,6 +301,54 @@ async def run_startup_migrations() -> None:
             logger.warning("Phase 3 Settings Migration failed: %s", exc)
             await session.rollback()
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        
+        # +++ فاز ۴: اصلاح پیش‌فرض auto_set_photo در سطح دیتابیس +++
+        try:
+            await session.execute(text("ALTER TABLE global_settings ALTER COLUMN auto_set_photo SET DEFAULT 1"))
+            await session.commit()
+            logger.info("DEP-1: Default value for auto_set_photo updated to 1 in database schema.")
+        except Exception as exc:
+            logger.warning("DEP-1: Migration for auto_set_photo DEFAULT failed: %s", exc)
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        # +++ فاز ۷: یکدست‌سازی مبنای زمانی دیتابیس به UTC (Historical Data Shift) +++
+        try:
+            tz_mig_exists = await session.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() "
+                    "AND table_name = 'global_settings' AND column_name = 'tz_utc_migrated'"
+                )
+            )
+            if not tz_mig_exists:
+                # Sanity Check: بررسی می‌کنیم آیا دیتابیس از قبل تهران‌محور بوده است یا خیر.
+                # فرض بر این است که اگر رکوردی داشته باشیم که created_at آن در آینده (نسبت به UTC) باشد، یعنی با تایم‌زون محلی ذخیره شده است.
+                future_dates = await session.scalar(
+                    text("SELECT COUNT(*) FROM orders WHERE created_at > UTC_TIMESTAMP() + INTERVAL 30 MINUTE")
+                )
+                
+                if future_dates and future_dates > 0:
+                    logger.info("DEP-7: دیتابیس تهران‌محور تشخیص داده شد. شیفت به UTC (-3:30)...")
+                    for table_name in ['accounts', 'orders', 'order_logs', 'worker_events']:
+                        await session.execute(text(f"UPDATE {table_name} SET created_at = DATE_SUB(created_at, INTERVAL 210 MINUTE) WHERE created_at IS NOT NULL"))
+                    
+                    try:
+                        await session.execute(text("UPDATE order_joins SET created_at = DATE_SUB(created_at, INTERVAL 210 MINUTE) WHERE created_at IS NOT NULL"))
+                    except Exception:
+                        pass
+                    
+                    logger.info("DEP-7: Historical timestamps shifted to UTC successfully.")
+                else:
+                    logger.warning("DEP-7: داده‌ها تهران‌محور نیستند (خالی یا از قبل UTC). شیفت زمانی لغو شد.")
+                
+                # پرچم idempotent: ایجاد فیلد برای جلوگیری از تکرار مجدد بررسی
+                await session.execute(text("ALTER TABLE global_settings ADD COLUMN tz_utc_migrated TINYINT(1) NOT NULL DEFAULT 1"))
+                await session.commit()
+        except Exception as exc:
+            logger.warning("DEP-7: Timezone migration failed: %s", exc)
+            await session.rollback()
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
         idx_ol_check = """
         SELECT COUNT(1) FROM information_schema.STATISTICS
         WHERE TABLE_SCHEMA = DATABASE()

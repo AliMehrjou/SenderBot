@@ -47,6 +47,7 @@ from workers.sender import (
     _daily_key,
     daily_cap_reached,
     effective_daily_limit,
+    _hourly_key,
     execute_bulk_send,
     is_global_slowdown,
     is_in_cooldown,
@@ -77,7 +78,7 @@ async def _send_hold_message(session: AsyncSession, bot: Bot, order_id: int) -> 
         return
         
     order = await session.scalar(select(Order).where(Order.id == order_id))
-    if not order or not order.user_id:
+    if not order:
         return
         
     builder = InlineKeyboardBuilder()
@@ -91,10 +92,17 @@ async def _send_hold_message(session: AsyncSession, bot: Bot, order_id: int) -> 
         f"پروکسی‌های سالم به پایان رسیده‌اند و سفارش شما موقتاً در وضعیت هولد قرار گرفت.\n"
         f"لطفاً از ادمین بخواهید پروکسی جدید اضافه کند، یا یکی از گزینه‌های زیر را انتخاب کنید:"
     )
-    try:
-        await bot.send_message(chat_id=order.user_id, text=text, reply_markup=builder.as_markup())
-    except Exception as e:
-        logger.warning(f"Could not send hold message for Order #{order_id}: {e}")
+    
+    if order.user_id:
+        try:
+            await bot.send_message(chat_id=order.user_id, text=text, reply_markup=builder.as_markup())
+        except Exception as e:
+            logger.warning(f"Could not send hold message for Order #{order_id}: {e}")
+    else:
+        try:
+            await broadcast_to_admins_with_keyboard(bot=bot, text=text, keyboard=builder.as_markup())
+        except Exception as e:
+            logger.warning(f"Could not broadcast hold message for Order #{order_id}: {e}")
 
 
 async def _mark_source_membership(account_id: int, source_channel_id: int) -> None:
@@ -218,7 +226,7 @@ async def _record_order_join(
             row.chat_id = chat_id
         return
 
-    if joined_now or status_code == "pending_approval":
+    if joined_now or status_code in ("pending_approval", "already_member", "success"):
         session.add(OrderJoin(
             order_id=order_id,
             account_id=account_db_id,
@@ -232,6 +240,9 @@ _LEAVE_SWEEP_INTERVAL_SECONDS = 60.0
 _LEAVE_SWEEP_BATCH = 20
 _leave_sweep_running: bool = False
 _last_leave_sweep_at: float = 0.0
+
+_leave_sweep_fails: Dict[int, int] = {}
+_stuck_leave_ids: set = set()
 
 async def _notify_owner(bot: Bot, session_maker: async_sessionmaker[AsyncSession], order_id: int, text: str):
     """ارسال نوتیفیکیشن Push به مالک سفارش (در صورت وجود)."""
@@ -305,15 +316,15 @@ async def leave_sweep_terminal_orders(
     """
     try:
         async with session_maker() as session:
+            query = select(OrderJoin).join(Order, OrderJoin.order_id == Order.id).where(
+                OrderJoin.leave_done == False,  # noqa: E712
+                Order.status.in_([OrderStatus.completed, OrderStatus.error]),
+            )
+            if _stuck_leave_ids:
+                query = query.where(OrderJoin.id.notin_(list(_stuck_leave_ids)))
+                
             rows = (await session.scalars(
-                select(OrderJoin)
-                .join(Order, OrderJoin.order_id == Order.id)
-                .where(
-                    OrderJoin.leave_done == False,  # noqa: E712
-                    Order.status.in_([OrderStatus.completed, OrderStatus.error]),
-                )
-                .order_by(OrderJoin.id.asc())
-                .limit(_LEAVE_SWEEP_BATCH)
+                query.order_by(OrderJoin.id.asc()).limit(_LEAVE_SWEEP_BATCH)
             )).all()
     except Exception as e:
         logger.warning(f"Leave-sweep: DB query failed: {e}")
@@ -423,11 +434,17 @@ async def _leave_one_order_join(
                 f"(Order #{order_join.order_id}) without leave."
             )
             await _mark_join_done(session_maker, order_join.id)
+            _leave_sweep_fails.pop(order_join.id, None)
+            _stuck_leave_ids.discard(order_join.id)
         else:
             logger.warning(
                 f"Leave-sweep: worker user_{order_join.account_id}/ offline; join row stays "
                 f"for next sweep (Order #{order_join.order_id})."
             )
+            _leave_sweep_fails[order_join.id] = _leave_sweep_fails.get(order_join.id, 0) + 1
+            if _leave_sweep_fails[order_join.id] >= 10:
+                _stuck_leave_ids.add(order_join.id)
+                logger.warning(f"Leave-sweep: Join row {order_join.id} is stuck offline. Skipping for future sweeps.")
         return
 
     left = False
@@ -443,6 +460,9 @@ async def _leave_one_order_join(
             f"Leave-sweep: FloodWait {e.value}s on leave for user_{order_join.account_id}/; "
             f"row stays for next sweep."
         )
+        _leave_sweep_fails[order_join.id] = _leave_sweep_fails.get(order_join.id, 0) + 1
+        if _leave_sweep_fails[order_join.id] >= 10:
+            _stuck_leave_ids.add(order_join.id)
         return
     except (UserNotParticipant, ChannelPrivate):
         # قبلاً خارج/کیک شده یا چت دیگر در دسترس نیست — نتیجه همان است: بستن ردیف
@@ -456,10 +476,15 @@ async def _leave_one_order_join(
             f"Leave-sweep: leave_chat failed for user_{order_join.account_id}/ on "
             f"{order_join.chat_id}: {e} — row stays for next sweep."
         )
+        _leave_sweep_fails[order_join.id] = _leave_sweep_fails.get(order_join.id, 0) + 1
+        if _leave_sweep_fails[order_join.id] >= 10:
+            _stuck_leave_ids.add(order_join.id)
         return
 
     if left:
         await _mark_join_done(session_maker, order_join.id)
+        _leave_sweep_fails.pop(order_join.id, None)
+        _stuck_leave_ids.discard(order_join.id)
 
 
 async def _mark_join_done(session_maker: async_sessionmaker[AsyncSession], join_id: int) -> None:
@@ -487,9 +512,9 @@ async def _acquire_busy(account_db_id: int) -> bool:
     key = f"busy_worker:{account_db_id}"
     
     # استفاده از SET NX (فقط در صورتی که وجود نداشته باشد ست می‌شود)
-    # انقضای ۲ ساعته (7200 ثانیه) به عنوان سپر ایمنی برای جلوگیری از قفل ماندن ابدی در صورت کرش شدید پروسه
+    # انقضای ۳۰ دقیقه‌ای (1800 ثانیه) به عنوان سپر ایمنی برای جلوگیری از قفل ماندن ابدی در صورت کرش شدید پروسه
     try:
-        is_acquired = await redis.set(key, "1", nx=True, ex=7200)
+        is_acquired = await redis.set(key, "1", nx=True, ex=1800)
         return bool(is_acquired)
     except Exception as e:
         logger.error(f"Redis lock acquisition failed for account {account_db_id}: {e}")
@@ -657,6 +682,7 @@ async def extractor_task_wrapper(
 
     async def _progress_cb(count: int, scanned: int = 0) -> bool:
         nonlocal total_estimate
+        fallback_active = False
         # 🟢 سیگنال توقف: چک کردن اینکه آیا ادمین دکمه توقف را زده است یا خیر
         try:
             from workers.sender import is_order_killed
@@ -665,6 +691,10 @@ async def extractor_task_wrapper(
                 
             async with session_maker() as prog_session:
                 async with prog_session.begin():
+                    current_order = await prog_session.scalar(select(Order).where(Order.id == order.id))
+                    if current_order and current_order.reject_reason == "fallback_messages":
+                        fallback_active = True
+
                     await prog_session.execute(
                         update(Order).where(Order.id == order.id)
                         .values(extracted_count=int(count))
@@ -680,7 +710,7 @@ async def extractor_task_wrapper(
                 pass
             
         if reporter is not None:
-            if order.filter_type == "messages":
+            if order.filter_type == "messages" or fallback_active:
                 await reporter.update(
                     done=scanned,
                     total=5000,
@@ -724,6 +754,7 @@ async def extractor_task_wrapper(
     # 🔄 اجرای استخراج — موازی یا تک‌کلاینت (ارسال order_id برای R4)
     # ============================================================
     slice_stats = ""
+    no_username_total = 0
     if is_parallel:
         parallel_result = await extract_members_parallel(
             clients,
@@ -739,6 +770,7 @@ async def extractor_task_wrapper(
         file_path = parallel_result.get("file_path")
         join_records = list(parallel_result.get("join_records") or [])
         limit_records = list(parallel_result.get("limit_records") or [])
+        no_username_total = parallel_result.get("no_username_count", 0)
         
         # استخراج دیتای شفاف برای ریپورت (B4)
         total_slices = parallel_result.get("total_slices", 0)
@@ -747,7 +779,7 @@ async def extractor_task_wrapper(
             coverage = int((total_slices - failed_slices) / total_slices * 100)
             slice_stats = f"\nپوشش استخراج: {coverage}٪ ({total_slices - failed_slices} ورکر موفق از {total_slices})"
     else:
-        status_code, file_path, join_chat_id, joined_now = await extract_active_users(
+        status_code, file_path, join_chat_id, joined_now, no_username_total = await extract_active_users(
             clients[0], group_link, filter_type=order.filter_type, progress_cb=progress_cb,
             chat_id_hint=chat_id_hint, 
             order_id=order.id,
@@ -839,44 +871,52 @@ async def extractor_task_wrapper(
                 order.filter_type = "messages"
             
             try:
-                await broadcast_to_admins(
-                    bot,
-                    text=(
-                        f"⚠️ <b>تغییر استراتژی استخراج</b>\n\n"
-                        f"سفارش: <code>{order.tracking_code or order.id}</code>\n"
-                        f"<i>استراتژی به‌خاطر مخفی‌بودن اعضا از users به messages تغییر کرد.</i>"
-                    )
+                notify_msg = (
+                    f"⚠️ <b>تغییر استراتژی استخراج</b>\n\n"
+                    f"سفارش: <code>{order.tracking_code or order.id}</code>\n"
+                    f"<i>به‌خاطر مخفی‌بودن اعضای گروه، ربات به‌طور خودکار استراتژی را به «فرستندگان پیام» تغییر داد.</i>"
                 )
+                await broadcast_to_admins(bot, text=notify_msg)
+                
+                # 🟢 ارسال پیام مستقیم (نوتیفیکیشن) به کاربری که سفارش را ثبت کرده است
+                await _notify_owner(bot, session_maker, order.id, notify_msg)
+                
             except Exception as e:
-                logger.error(f"Failed to broadcast strategy change: {e}")
+                logger.error(f"Failed to broadcast/notify strategy change: {e}")
                 
             if reporter is not None:
                 await reporter.update(
                     status="⚠️ لیست مخفی بود. تغییر استراتژی به «فرستندگان پیام»…",
                 )
                 
-            # اجرای مجدد با فیلتر messages
-            if is_parallel:
-                parallel_result = await extract_members_parallel(
-                    clients, group_link, filter_type="messages",
-                    progress_cb=progress_cb, total_estimate=total_estimate,
-                )
-                status_code = parallel_result.get("status_code") or "error"
-                file_path = parallel_result.get("file_path")
-                join_records = list(parallel_result.get("join_records") or [])
-                limit_records = list(parallel_result.get("limit_records") or [])
-            else:
-                status_code, file_path, join_chat_id, joined_now = await extract_active_users(
-                    clients[0], group_link, filter_type="messages", progress_cb=progress_cb
-                )
-                join_records = [{
-                    "index": 0, "join_chat_id": join_chat_id, "joined_now": joined_now, "status": status_code,
+            # 🟢 اجرای مجدد با فیلتر messages 
+            # (استخراج پیام‌ها فقط در حالت تک-ورکر پشتیبانی می‌شود، پس همیشه از کلاینت اصلی استفاده می‌کنیم)
+            status_code, file_path, join_chat_id, joined_now, no_username_total = await extract_active_users(
+                clients[0], group_link, filter_type="messages", progress_cb=progress_cb, speed_profile=profile
+            )
+            
+            new_joins = [{
+                "index": 0, "join_chat_id": join_chat_id, "joined_now": joined_now, "status": status_code,
+            }]
+            
+            limit_records = []
+            if status_code.startswith("limit:"):
+                parts = status_code.split(":")
+                limit_records = [{
+                    "index": 0, "limit_type": parts[1] if len(parts) > 1 else "unknown", "wait_seconds": int(parts[2]) if len(parts) > 2 else 0,
                 }]
-                if status_code.startswith("limit:"):
-                    parts = status_code.split(":")
-                    limit_records = [{
-                        "index": 0, "limit_type": parts[1] if len(parts) > 1 else "unknown", "wait_seconds": int(parts[2]) if len(parts) > 2 else 0,
-                    }]
+            
+            # 🟢 ادغام رکوردهای جوین اجرای اول و دوم برای جلوگیری از پاک شدن joinهای واقعی
+            join_dict = {r.get("index", -1): r for r in join_records}
+            for nr in new_joins:
+                idx = nr.get("index", -1)
+                if idx in join_dict:
+                    if join_dict[idx].get("joined_now"):
+                        nr["joined_now"] = True
+                    if not nr.get("join_chat_id") and join_dict[idx].get("join_chat_id"):
+                        nr["join_chat_id"] = join_dict[idx]["join_chat_id"]
+                join_dict[idx] = nr
+            join_records = list(join_dict.values())
             
             # ثبت مجدد محدودیت‌ها در صورت نیاز
             if limit_records:
@@ -911,6 +951,13 @@ async def extractor_task_wrapper(
                         reject_reason="members_hidden"
                     )
                 )
+                session.add(OrderLog(
+                    order_id=order.id,
+                    account_id=primary_id,
+                    target=group_link,
+                    status="error",
+                    error_message="لیست اعضا مخفی بود و فال‌بک خودکار غیرفعال است. منتظر تصمیم ادمین."
+                ))
                 await session.commit()
     
             fallback_text = (
@@ -924,6 +971,7 @@ async def extractor_task_wrapper(
             builder.button(text="🔄 ثبت سفارش جدید با messages", callback_data=f"new_extract_messages_{order.id}/")
             
             try:
+                from utils.admin_broadcast import broadcast_to_admins_with_keyboard
                 await broadcast_to_admins_with_keyboard(
                     bot,
                     text=f"سفارش استخراج <code>{order.tracking_code or order.id}</code> متوقف شد.\n\n{fallback_text}",
@@ -977,7 +1025,7 @@ async def extractor_task_wrapper(
                     status="error",
                     error_message=(
                         f"Pending approval retry limit reached "
-                        f"({config.PENDING_APPROVAL_RETRY_LIMIT} cycles)."
+                        f"({profile.approval_retry_limit} cycles)."
                     ),
                 ))
                 await session.commit()
@@ -996,7 +1044,7 @@ async def extractor_task_wrapper(
                 if reporter is not None:
                     await reporter.fail(
                         "⛔️ <b>سفارش استخراج متوقف شد</b>\n\n"
-                        f"درخواست عضویت گروه خصوصی پس از {config.PENDING_APPROVAL_RETRY_LIMIT} چرخه هنوز تأیید نشد."
+                        f"درخواست عضویت گروه خصوصی پس از {profile.approval_retry_limit} چرخه هنوز تأیید نشد."
                     )
                     _pop_progress_reporter("extract", order.id)
 
@@ -1018,7 +1066,7 @@ async def extractor_task_wrapper(
                     f"گروه <b>{group_link}</b> خصوصی (ریکوئستی) است.\n"
                     f"ورکر: <b>{worker_label_text}</b>\n\n"
                     f"<i>ربات منتظر تایید ادمینِ گروه می‌ماند. لطفاً در گروه تأیید کنید.</i>\n\n"
-                    f"🕐 تلاش فعلی: <b>{new_retry_count} از {config.PENDING_APPROVAL_RETRY_LIMIT}</b>"
+                    f"🕐 تلاش فعلی: <b>{new_retry_count} از {profile.approval_retry_limit}</b>"
                 )
                 await broadcast_to_admins(bot, text=notify_text)
                 await _notify_owner(bot, session_maker, order.id, notify_text)
@@ -1047,7 +1095,8 @@ async def extractor_task_wrapper(
 
         log_entry = OrderLog(order_id=order.id, account_id=primary_id, target=group_link)
         
-        if status_code in ("success", "partial_success", "success_fallback") and file_path and os.path.exists(file_path):
+        # 🟢 اضافه شدن stopped به لیست وضعیت‌های موفق که فایل در آنها حفظ می‌شود
+        if status_code in ("success", "partial_success", "success_fallback", "stopped") and file_path and os.path.exists(file_path):
             log_entry.status = status_code 
 
             permanent_path = f"exports/extract_order_{order.id}.txt"
@@ -1092,11 +1141,13 @@ async def extractor_task_wrapper(
                 try:
                     document = FSInputFile(file_path)
                     
+                    no_user_note = f"⚠️ {no_username_total} کاربر بدون یوزرنیم نادیده گرفته شد.\n" if no_username_total > 0 else ""
                     caption_text = (
                         f"✅ <b>عملیات استخراج تکمیل شد</b>\n\n"
                         f"سفارش: <code>{order.tracking_code}</code>\n"
                         f"تارگت: {group_link}\n"
                         f"{engine_note}{slice_stats}\n"
+                        f"{no_user_note}"
                     )
                     if status_code == "partial_success":
                         warning_text = (
@@ -1109,6 +1160,9 @@ async def extractor_task_wrapper(
                                 "ادمین‌بودن اکانت قابل استخراج است.\n"
                             )
                         caption_text = warning_text + caption_text
+                    # 🟢 پیام ادمین برای زمانی که وسط کار لغو شده
+                    elif status_code == "stopped":
+                        caption_text = "🛑 عملیات استخراج توسط ادمین در میانه راه لغو شد، اما فایل استخراج‌شده تا این لحظه معتبر است.\n" + caption_text
                         
                     await bot.send_document(
                         chat_id=admin_id,
@@ -1127,20 +1181,32 @@ async def extractor_task_wrapper(
                     pass
 
             if reporter is not None:
-                outcome_label = "ناقص" if status_code == "partial_success" else "کامل"
-                partial_note = (
-                    "\n⚠️ بخشی از اسکن با خطا/FloodWait متوقف شد اما داده‌ها معتبرند."
-                    if status_code == "partial_success" else ""
-                )
+                # 🟢 مدیریت گرافیکِ گزارش زنده کاربر برای حالت لغو
+                if status_code == "stopped":
+                    outcome_label = "متوقف شده"
+                    partial_note = "\n🛑 اسکن در میانه راه توسط شما لغو شد."
+                    title_msg = "🛑 <b>عملیات استخراج متوقف شد</b>"
+                elif status_code == "partial_success":
+                    outcome_label = "ناقص"
+                    partial_note = "\n⚠️ بخشی از اسکن با خطا/FloodWait متوقف شد اما داده‌ها معتبرند."
+                    title_msg = "✅ <b>عملیات استخراج تکمیل شد</b>"
+                else:
+                    outcome_label = "کامل"
+                    partial_note = ""
+                    title_msg = "✅ <b>عملیات استخراج تکمیل شد</b>"
+
                 engine_note_owner = (
                     f"⚙️ حالت اجرا: استخراج موازی ({len(clients)} ورکر)\n"
                     if is_parallel else "⚙️ حالت اجرا: تک‌ورکر\n"
                 )
+                no_user_note_reporter = f"⚠️ {no_username_total} کاربر بدون یوزرنیم نادیده گرفته شد.\n" if no_username_total > 0 else ""
+                
                 await reporter.finish(
-                    f"✅ <b>عملیات استخراج تکمیل شد</b>\n\n"
+                    f"{title_msg}\n\n"
                     f"👤 تعداد عضو استخراج‌شده: <b>{extracted_count}</b>\n"
                     f"🏷 نوع نتیجه: <b>{outcome_label}</b>{partial_note}\n"
                     f"{engine_note_owner}{slice_stats}\n"
+                    f"{no_user_note_reporter}"
                     f"📄 فایل نتیجه در پیام بعدی برای شما ارسال شد.",
                     document_path=permanent_path,
                 )
@@ -1180,6 +1246,38 @@ async def extractor_task_wrapper(
                 except Exception as e:
                     logger.error(f"Failed to send silent reject note: {e}")
                 stop_reason = "rejected"
+            elif status_code == "fallback_empty":
+                log_entry.status = "success"
+                log_entry.error_message = _get_resolver_error_message("empty_fallback_result")
+                try:
+                    async with session_maker() as session:
+                        await session.execute(
+                            update(Order).where(Order.id == order.id).values(
+                                status=OrderStatus.completed,
+                                reject_reason="fallback_empty",
+                                extracted_count=0
+                            )
+                        )
+                        await session.commit()
+                except Exception as e:
+                    logger.error(f"Failed to set fallback_empty state for Order #{order.id}: {e}")
+                
+                await broadcast_to_admins(
+                    bot,
+                    text=(
+                        f"⚠️ <b>فال‌بک بدون نتیجه</b>\n\n"
+                        f"سفارش: <code>{order.tracking_code}</code>\n"
+                        f"تارگت: <b>{group_link}</b>\n\n"
+                        f"<i>{_get_resolver_error_message('empty_fallback_result')}</i>"
+                    )
+                )
+                if reporter is not None:
+                    await reporter.finish(
+                        f"⚠️ <b>استخراج به پایان رسید (بدون نتیجه)</b>\n\n"
+                        f"{_get_resolver_error_message('empty_fallback_result')}"
+                    )
+                    _pop_progress_reporter("extract", order.id)
+                stop_reason = "fallback_empty"
             elif status_code == "proxy_connection_error":
                 log_entry.error_message = "خطای اتصال پروکسی یا شبکه."
                 stop_reason = "proxy_connection_error"
@@ -1204,7 +1302,8 @@ async def extractor_task_wrapper(
                 "این تارگت یک کانال است و ورکر ادمین آن نیست؛ استخراج آیدی از کانال ممکن نیست."
                 if status_code == "error_not_admin"
                 else ("درخواست ورود به گروه رد شد (یا ربات بلاک شده است)." if status_code == "rejected" 
-                else ("ارتباط با پروکسی یا شبکه قطع شد." if status_code == "proxy_connection_error" else "استخراج اعضا ناموفق بود یا دسترسی وجود ندارد."))
+                else ("ارتباط با پروکسی یا شبکه قطع شد." if status_code == "proxy_connection_error" 
+                else ("عملیات قبل از یافتن کاربری توسط شما لغو شد." if status_code == "stopped" else "استخراج اعضا ناموفق بود یا دسترسی وجود ندارد.")))
             )
             await reporter.fail(
                 f"⛔️ <b>استخراج ناموفق بود</b>\n\n{fail_reason}"
@@ -1292,6 +1391,20 @@ async def link_send_resolver_wrapper(
     admin_notify_text: Optional[str] = None
     media_paths_to_clean: List[str] = []
 
+    # 🟢 دریافت پروفایل سرعت از دیتابیس برای تزریق به موتور رزولور
+    speed_profile = None
+    try:
+        async with session_maker() as session:
+            order = await session.scalar(select(Order).where(Order.id == order_id))
+            speed_mode = order.speed_mode if order else "safe"
+        from utils.speed_profile import get_speed_profile
+        speed_profile = await get_speed_profile(speed_mode)
+    except Exception:
+        pass
+    if not speed_profile:
+        from utils.speed_profile import SAFE_PROFILE
+        speed_profile = SAFE_PROFILE
+
     # Phase 5 — shared live-progress reporter (send-order link-resolution phase).
     reporter = await _get_or_start_reporter(
         bot=bot,
@@ -1364,10 +1477,12 @@ async def link_send_resolver_wrapper(
                             if row: chat_id_hint = row
                     except Exception: pass
 
+                    # 🟢 تزریق speed_profile در فراخوانی استخراج اعضا
                     status_code, members, join_chat_id, joined_now = await extract_members_for_sending(
                         client, link, filter_type=filter_type, progress_cb=link_progress_cb,
                         chat_id_hint=chat_id_hint, 
-                        order_id=order_id
+                        order_id=order_id,
+                        speed_profile=speed_profile
                     )
                     
                     if status_code == "members_hidden" and config.EXTRACT_AUTO_FALLBACK_TO_MESSAGES:
@@ -1377,8 +1492,9 @@ async def link_send_resolver_wrapper(
                                 status=f"⚠️ لیست مخفی بود. تغییر استراتژی به «فرستندگان پیام» ({link_index} از {len(links)})…",
                                 account=f"user_{account_db_id}/"
                             )
-                        fb_status, fb_file, _, _ = await extract_active_users(
-                            client, link, filter_type="messages", progress_cb=None
+                        # 🟢 تزریق speed_profile در مسیر fallback پیام‌ها
+                        fb_status, fb_file, _, _, _ = await extract_active_users(
+                            client, link, filter_type="messages", progress_cb=None, speed_profile=speed_profile
                         )
                         
                         # 🟢 رفع باگ قبلی: پاس دادن ارور پروکسی در مسیر Fallback جهت فعال‌شدن سوییچ
@@ -1557,9 +1673,8 @@ async def link_send_resolver_wrapper(
 
                 if status_code == "pending_approval":
                     order.retry_count = (order.retry_count or 0) + 1
-                    wait_mins = int(getattr(config, "JOIN_REQUEST_TIMEOUT_SECONDS", 240)) // 60
 
-                    if order.retry_count >= config.PENDING_APPROVAL_RETRY_LIMIT:
+                    if order.retry_count >= speed_profile.approval_retry_limit:
                         order.status = OrderStatus.error
                         order.scheduled_for = None
                         # ⚠️ target_data پاک نمی‌شود
@@ -1576,7 +1691,7 @@ async def link_send_resolver_wrapper(
                             account_id=account_db_id,
                             target=group_link,
                             status="error",
-                            error_message=f"Pending approval retry limit reached ({config.PENDING_APPROVAL_RETRY_LIMIT} cycles).",
+                            error_message=f"Pending approval retry limit reached ({speed_profile.approval_retry_limit} cycles).",
                         ))
 
                         admin_notify_text = (
@@ -1590,10 +1705,10 @@ async def link_send_resolver_wrapper(
                         reporter_action = (
                             "fail",
                             f"⛔️ <b>سفارش متوقف شد</b>\n\nدرخواست عضویت گروه خصوصی پس از "
-                            f"{config.PENDING_APPROVAL_RETRY_LIMIT} چرخه هنوز تأیید نشد.",
+                            f"{speed_profile.approval_retry_limit} چرخه هنوز تأیید نشد.",
                         )
                     else:
-                        next_check = datetime.now(timezone.utc) + timedelta(seconds=int(getattr(config, "JOIN_REQUEST_TIMEOUT_SECONDS", 240)))
+                        next_check = datetime.now(timezone.utc) + timedelta(seconds=speed_profile.approval_cycle_seconds)
                         order.scheduled_for = next_check
                         order.status = OrderStatus.pending
                         if order.retry_count == 1 or order.retry_count % 5 == 0:
@@ -1604,7 +1719,7 @@ async def link_send_resolver_wrapper(
                                 f"گروه <b>{html.escape(group_link)}</b> خصوصی (ریکوئستی) است.\n"
                                 f"ورکر: <b>{worker_label_text}</b>\n\n"
                                 f"<i>ربات منتظر تایید ادمینِ گروه می‌ماند. لطفاً در گروه تأیید کنید.</i>\n\n"
-                                f"🕐 تلاش فعلی: <b>{order.retry_count} از {config.PENDING_APPROVAL_RETRY_LIMIT}</b>"
+                                f"🕐 تلاش فعلی: <b>{order.retry_count} از {speed_profile.approval_retry_limit}</b>"
                             )
                             await _notify_owner(bot, session_maker, order.id, admin_notify_text)
                         else:
@@ -1683,6 +1798,7 @@ async def link_send_resolver_wrapper(
                     order.filter_type = None
                     order.status = OrderStatus.pending
                     order.scheduled_for = None
+                    order.retry_count = 0  # 👈 اضافه شدن این خط برای ریست کردن تلاش‌ها و آزادسازی اکانت
 
                     logger.info(f"Order #{order_id}: link resolved to {len(members)} sendable targets. Re-queued for dispatch.")
 
@@ -1825,18 +1941,20 @@ async def worker_task_wrapper(
             stop_reason = "crash"
 
         finally:
-            cooldown_hours = 24 
-            try:
-                settings_row = await session.scalar(select(GlobalSettings).limit(1))
-                if settings_row and settings_row.cooldown_hours:
-                    cooldown_hours = settings_row.cooldown_hours
-            except Exception: pass
-            
-            await mark_chunk_cooldown(account_db_id, cooldown_hours)
-            if reporter is not None:
-                await reporter.update(
-                    status=f"اکانت user_{account_db_id}/ وارد استراحت دوره‌ای شد ({cooldown_hours} ساعت)."
-                )
+            # اعمال کول‌داون فقط در صورتی که حداقل یک پیام ارسال شده باشد
+            if unsent_targets is None or len(unsent_targets) < len(targets):
+                cooldown_hours = 24 
+                try:
+                    settings_row = await session.scalar(select(GlobalSettings).limit(1))
+                    if settings_row and settings_row.cooldown_hours:
+                        cooldown_hours = settings_row.cooldown_hours
+                except Exception: pass
+                
+                await mark_chunk_cooldown(account_db_id, cooldown_hours)
+                if reporter is not None:
+                    await reporter.update(
+                        status=f"اکانت user_{account_db_id}/ وارد استراحت دوره‌ای شد ({cooldown_hours} ساعت)."
+                    )
 
         return unsent_targets, stop_reason
 
@@ -1862,6 +1980,8 @@ async def background_order_execution(
     try:
         unsent_targets: Optional[List[str]] = None
         stop_reason: Optional[str] = None
+        proxy_retries = 0
+        max_proxy_retries = 3
         
         while True:
             async with session_maker() as session:
@@ -1889,6 +2009,23 @@ async def background_order_execution(
 
             # 🔴 سوییچ واکنشی (Reactive Failover - فاز ۴ اصلاح‌شده)
             if stop_reason == "proxy_connection_error" and unsent_targets:
+                proxy_retries += 1
+                if proxy_retries > max_proxy_retries:
+                    logger.error(f"Order #{order_id}: Max proxy retries ({max_proxy_retries}) reached. Halting.")
+                    async with session_maker() as session:
+                        db_order = await session.get(Order, order_id)
+                        if db_order:
+                            db_order.status = OrderStatus.error
+                            db_order.reject_reason = "پروکسی سالم یافت نشد"
+                            db_order.scheduled_for = None
+                            session.add(OrderLog(order_id=order_id, target="System", status="error", error_message="Max proxy retries reached."))
+                            await session.commit()
+                    task_type = "extract" if order and _is_extract_order(order) else "order"
+                    if reporter := _progress_reporters.get(f"{task_type}:{order_id}"):
+                        await reporter.fail("⛔️ <b>توقف سفارش</b>\n\nپروکسی سالم یافت نشد و سقف تلاش مجدد به پایان رسید.")
+                        _pop_progress_reporter(task_type, order_id)
+                    break
+
                 async with session_maker() as session:
                     # 🛡 رفع باگ: بررسی اینکه آیا اکانت واقعاً در حال استفاده از پروکسی بوده یا دایرکت است
                     acc = await session.get(Account, primary_id)
@@ -2001,7 +2138,7 @@ async def background_order_execution(
                             if int(await redis.get(_daily_key(acc.id)) or 0) >= effective_daily_limit(acc.created_at): continue
                             
                             if await _acquire_busy(acc.id):
-                                await redis.set(f"last_dispatched:{acc.id}", time.time())
+                                await redis.set(f"last_dispatched:{acc.id}", time.time(), ex=172800)
                                 await _release_busy(primary_id)
                                 primary_id = acc.id
                                 account_ids[0] = acc.id
@@ -2018,27 +2155,60 @@ async def background_order_execution(
                 if new_worker_found:
                     continue
                 else:
-                    unsent_targets = []
-                    error_msg = "تمام اکانت‌های ارسال به لیمیت/استراحت رسیده‌اند و ورکر جایگزینی وجود ندارد."
+                    min_wait_seconds = 1800  # مقدار پیش‌فرض امن خارج از کانتکست دیتابیس
                     async with session_maker() as session:
-                        await session.execute(
-                            update(Order)
-                            .where(Order.id == order_id)
-                            .values(
-                                status=OrderStatus.error, 
-                                scheduled_for=None,
-                                reject_reason="No available workers (All hit limits or resting)"
-                            )
-                        )
-                        from workers.task_queue import _send_export_file
-                        _spawn_background_task(_send_export_file(session_maker, bot, order_id, error_msg))
-                        await session.commit()
+                        db_order = await session.get(Order, order_id)
+                        if db_order:
+                            merged = [t for t in unsent_targets if t.strip()] + [t for t in (db_order.target_data or "").split("\n") if t.strip()]
+                            db_order.target_data = "\n".join(merged)
+                            db_order.status = OrderStatus.pending
+                            
+                            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+                            connected_ids = [aid for aid, c in list(worker_pool.items()) if getattr(c, "is_connected", False)]
+                            if connected_ids:
+                                stmt_accs = select(Account).where(Account.id.in_(connected_ids), Account.is_banned == False)
+                                valid_accs = (await session.scalars(stmt_accs)).all()
+                                redis = _get_redis()
+                                for vacc in valid_accs:
+                                    if vacc.flood_wait_until and vacc.flood_wait_until > now_naive:
+                                        wait = (vacc.flood_wait_until - now_naive).total_seconds()
+                                        if wait < min_wait_seconds: min_wait_seconds = wait
+                                    ttl = await redis.ttl(f"chunk_cooldown:{vacc.id}")
+                                    if ttl and 0 < ttl < min_wait_seconds:
+                                        min_wait_seconds = ttl
+                            db_order.scheduled_for = datetime.now(timezone.utc) + timedelta(seconds=min_wait_seconds + 10)
+                            await session.commit()
                     
                     reporter = _progress_reporters.get(f"order:{order_id}")
                     if reporter:
-                        await reporter.fail(f"⛔️ <b>سفارش متوقف شد</b>\n\n{error_msg}")
-                        _pop_progress_reporter("order", order_id)
+                        await reporter.update(status=f"⏳ تمام اکانت‌ها موقتاً در استراحت/لیمیت هستند. سفارش متوقف نشد و برای حدود {int(min_wait_seconds/60)} دقیقه دیگر به تعویق افتاد...")
                     break
+
+            elif stop_reason == "media_missing":
+                async with session_maker() as session:
+                    db_order = await session.get(Order, order_id)
+                    if db_order:
+                        db_order.status = OrderStatus.error
+                        db_order.scheduled_for = None
+                        session.add(OrderLog(
+                            order_id=db_order.id, 
+                            target="System", 
+                            status="error",
+                            error_message="فایل مدیای سفارش یافت نشد (احتمالاً پاک شده) — سفارش قابل اجرا نیست"
+                        ))
+                        await session.commit()
+                        unsent_targets = []
+                        
+                reporter = _progress_reporters.get(f"order:{order_id}")
+                if reporter:
+                    await reporter.fail("⛔️ <b>توقف سفارش</b>\n\nفایل مدیای سفارش یافت نشد (احتمالاً پاک شده است). سفارش قابل اجرا نیست.")
+                
+                try:
+                    from utils.admin_broadcast import broadcast_to_admins
+                    await broadcast_to_admins(bot, text=f"⛔️ <b>توقف سفارش</b>\n\nسفارش <code>{order_id}</code> به دلیل یافت نشدن فایل مدیا در دیسک متوقف شد.")
+                except Exception:
+                    pass
+                break
 
             # 🔴 خطاهای سخت استخراج (مثل ادمین نبودن در کانال یا ریجکت شدن ریکوئست)
             elif _is_extract_order(order) and stop_reason in ("error", "error_not_admin", "rejected"):
@@ -2061,7 +2231,11 @@ async def background_order_execution(
                     try:
                         redis = _get_redis()
                         chunks_count = await redis.incr(f"worker_chunks:{primary_id}")
+                        if chunks_count == 1:
+                            await redis.expire(f"worker_chunks:{primary_id}", 86400)
                         last_rot_str = await redis.get(f"worker_last_rot:{primary_id}")
+                        if not last_rot_str:
+                            await redis.set(f"worker_last_rot:{primary_id}", time.time(), ex=86400)
                         last_rot = float(last_rot_str) if last_rot_str else time.time()
                         mins_elapsed = (time.time() - last_rot) / 60.0
                         
@@ -2095,7 +2269,30 @@ async def background_order_execution(
             bot=bot,
             chunk_targets=targets,
         )
-
+    except Exception as e:
+        logger.error(f"Critical error in background_order_execution for Order #{order_id}: {e}", exc_info=True)
+        try:
+            async with session_maker() as session:
+                await session.execute(
+                    update(Order).where(Order.id == order_id).values(
+                        status=OrderStatus.error, 
+                        scheduled_for=None, 
+                        reject_reason="خطای داخلی اجرا"
+                    )
+                )
+                session.add(OrderLog(
+                    order_id=order_id, 
+                    target="System", 
+                    status="error",
+                    error_message=f"Internal execution error: {e}"
+                ))
+                await session.commit()
+            task_type = "extract" if order and _is_extract_order(order) else "order"
+            if reporter := _progress_reporters.get(f"{task_type}:{order_id}"):
+                await reporter.fail(f"⛔️ <b>توقف سفارش</b>\n\nخطای داخلی در اجرای پردازش رخ داد.")
+                _pop_progress_reporter(task_type, order_id)
+        except Exception as fallback_err:
+            logger.error(f"Failed to set error status for Order #{order_id} in exception handler: {fallback_err}")
     finally:
         for acc_id in account_ids:
             await _release_busy(acc_id)
@@ -2204,10 +2401,10 @@ _progress_reporters_lock = asyncio.Lock()
 async def _resolve_progress_owner_chat_id(
     session_maker: async_sessionmaker[AsyncSession],
     order_id: int,
-) -> Optional[int]:
+) -> Union[int, List[int], None]:
     """
     Phase 5/New — Resolve owner chat id from Order.user_id.
-    Fallback to ADMIN_ID for old orders (or if user_id is empty).
+    Fallback to all admins for old orders (or if user_id is empty).
     """
     owner_tg_id = None
     try:
@@ -2218,28 +2415,21 @@ async def _resolve_progress_owner_chat_id(
     except Exception as e:
         logger.warning(f"Failed to fetch order owner for #{order_id}: {e}")
 
-    # Fallback to ADMIN_ID 
+    # Fallback to all admins
     if not owner_tg_id:
-        try:
-            owner_tg_id = int(getattr(config, "ADMIN_ID", 0) or 0)
-        except (TypeError, ValueError):
-            return None
-            
-        if owner_tg_id <= 0:
-            return None
-
+        admin_ids = []
+        if getattr(config, "ADMIN_ID", None) and int(config.ADMIN_ID) != 0:
+            admin_ids.append(int(config.ADMIN_ID))
+        
         try:
             async with session_maker() as session:
-                admin_row = await session.scalar(
-                    select(Admin).where(Admin.telegram_id == owner_tg_id)
-                )
-                if admin_row is not None and not bool(
-                    getattr(admin_row, "progress_notify", True)
-                ):
-                    return None
+                sub_admins = (await session.scalars(select(Admin.telegram_id))).all()
+                admin_ids.extend(int(aid) for aid in sub_admins)
         except Exception as e:
-            logger.warning(f"ProgressReporter: admin lookup failed ({e}); defaulting to enabled.")
+            logger.warning(f"ProgressReporter: sub-admin lookup failed: {e}")
             
+        return list(set(admin_ids)) if admin_ids else None
+        
     return owner_tg_id
 
 
@@ -2270,6 +2460,17 @@ async def _get_or_start_reporter(
             if owner_chat_id is None:
                 return None
 
+            # 🟣 بررسی فلگ progress_notify کاربر صاحب سفارش جهت خفه‌کردن (Mute) آپدیت‌های زنده
+            notify_enabled = True
+            try:
+                async with session_maker() as session:
+                    if isinstance(owner_chat_id, int):
+                        admin_row = await session.scalar(select(Admin).where(Admin.telegram_id == owner_chat_id))
+                        if admin_row is not None and not admin_row.progress_notify:
+                            notify_enabled = False
+            except Exception as e:
+                logger.warning(f"Failed to check progress_notify for {owner_chat_id}: {e}")
+
             tracking_code = None
             try:
                 async with session_maker() as session:
@@ -2289,6 +2490,32 @@ async def _get_or_start_reporter(
                 task_id=order_id,
                 title=f"کد پیگیری {code} | {target_hint}",
             )
+            
+            if not notify_enabled:
+                # 🟣 خفه‌کردن متدهای زنده؛ ارسال مستقل پیام/فایل نهایی بدون نیاز به Message ID قبلی
+                async def silent_noop(*args, **kwargs): pass
+                
+                async def silent_finish(text: str, document_path: str = None, **kwargs):
+                    try:
+                        if document_path and os.path.exists(document_path):
+                            from aiogram.types import FSInputFile
+                            await bot.send_document(chat_id=owner_chat_id, document=FSInputFile(document_path), caption=text)
+                        else:
+                            await bot.send_message(chat_id=owner_chat_id, text=text)
+                    except Exception as e:
+                        logger.warning(f"Silent finish failed for Order #{order_id}: {e}")
+                        
+                async def silent_fail(text: str, **kwargs):
+                    try:
+                        await bot.send_message(chat_id=owner_chat_id, text=text)
+                    except Exception as e:
+                        logger.warning(f"Silent fail failed for Order #{order_id}: {e}")
+                        
+                reporter.start = silent_noop
+                reporter.update = silent_noop
+                reporter.finish = silent_finish
+                reporter.fail = silent_fail
+
             await reporter.start()  # guarded internally — never raises
             _progress_reporters[key] = reporter
             return reporter
@@ -2436,6 +2663,7 @@ async def _send_export_file(session_maker: async_sessionmaker[AsyncSession], bot
     except Exception as e:
         logger.error(f"Failed to auto-send export file for order {order_id}: {e}")
 
+
 async def _finalize_chunk(
     order_id: int,
     unsent_targets: List[str],
@@ -2448,219 +2676,231 @@ async def _finalize_chunk(
     media_paths_to_clean: List[str] = []
 
     # 🟢 فاز ۵: استفاده مستقیم از کانتکست منیجر کلاس قفل توزیع‌شده (Stateless)
-    async with DistributedFinalizeLock(order_id):
-        try:
-            async with session_maker() as session:
-                async with session.begin():
-                    order = await session.scalar(
-                        select(Order).where(Order.id == order_id)
-                    )
-                    if order is None:
-                        logger.warning(
-                            f"Finalize: Order #{order_id} was deleted - nothing to requeue."
+    try:
+        async with DistributedFinalizeLock(order_id):
+            try:
+                async with session_maker() as session:
+                    async with session.begin():
+                        order = await session.scalar(
+                            select(Order).where(Order.id == order_id)
                         )
-                        return
+                        if order is None:
+                            logger.warning(
+                                f"Finalize: Order #{order_id} was deleted - nothing to requeue."
+                            )
+                            return
 
-                    # بازگرداندن تارگت‌های ناموفق/ارسال‌نشده به صف انتظار حتی در حالت هولد
-                    if unsent_targets and order.status in (
-                        OrderStatus.running, OrderStatus.pending, OrderStatus.on_hold_proxy
-                    ):
-                        current = [
+                        # بازگرداندن تارگت‌های ناموفق/ارسال‌نشده به صف انتظار حتی در حالت هولد (Idempotent Deduplication)
+                        if unsent_targets and order.status in (
+                            OrderStatus.running, OrderStatus.pending, OrderStatus.on_hold_proxy
+                        ):
+                            current = [
+                                t.strip() for t in (order.target_data or "").split("\n") if t.strip()
+                            ]
+                            
+                            seen = set(current)
+                            for t in unsent_targets:
+                                clean_t = t.strip()
+                                if clean_t and clean_t not in seen:
+                                    current.append(clean_t)
+                                    seen.add(clean_t)
+                                        
+                            order.target_data = "\n".join(current)
+
+                        if order.status not in (OrderStatus.running, OrderStatus.on_hold_proxy):
+                            return
+
+                        # 🛡 فاز ۲ (B3): پاک کردن تارگت‌های پردازش‌شده‌ی این chunk از دفترکل در-جریان
+                        if order.inflight_data and chunk_targets:
+                            try:
+                                inflight = json.loads(order.inflight_data)
+                                chunk_set = set(chunk_targets)
+                                new_inflight = [t for t in inflight if t not in chunk_set]
+                                order.inflight_data = json.dumps(new_inflight) if new_inflight else None
+                            except Exception as e:
+                                logger.warning(
+                                    f"Finalize: corrupt inflight ledger for Order #{order_id} cleared ({e})"
+                                )
+                                order.inflight_data = None
+
+                        # اگر هنوز chunkهای دیگری برای این سفارش باز هستند، خارج می‌شویم
+                        if remaining_inflight > 0:
+                            return
+
+                        leftover = [
                             t for t in (order.target_data or "").split("\n") if t.strip()
                         ]
-                        merged = current + [t for t in unsent_targets if t.strip()]
-                        order.target_data = "\n".join(merged)
 
-                    if order.status not in (OrderStatus.running, OrderStatus.on_hold_proxy):
-                        return
+                        # 🟢 فاز ۴: توقف فرآیند فاینالایز در صورتی که سفارش هولد شده است
+                        if order.status == OrderStatus.on_hold_proxy:
+                            return
 
-                    # 🛡 فاز ۲ (B3): پاک کردن تارگت‌های پردازش‌شده‌ی این chunk از دفترکل در-جریان
-                    if order.inflight_data and chunk_targets:
+                        # استخراج تعداد ارسال‌های موفق تا این لحظه جهت بررسی پیشرفت سفارش
+                        success_count = 0
                         try:
-                            inflight = json.loads(order.inflight_data)
-                            chunk_set = set(chunk_targets)
-                            new_inflight = [t for t in inflight if t not in chunk_set]
-                            order.inflight_data = json.dumps(new_inflight) if new_inflight else None
+                            success_count = (
+                                await session.scalar(
+                                    select(func.count())
+                                    .select_from(OrderLog)
+                                    .where(
+                                        OrderLog.order_id == order_id,
+                                        OrderLog.status == "success",
+                                    )
+                                )
+                                or 0
+                            )
                         except Exception as e:
-                            logger.warning(
-                                f"Finalize: corrupt inflight ledger for Order #{order_id} cleared ({e})"
-                            )
-                            order.inflight_data = None
+                            logger.warning(f"Finalize: success-count query failed for Order #{order_id}: {e}")
 
-                    # اگر هنوز chunkهای دیگری برای این سفارش باز هستند، خارج می‌شویم
-                    if remaining_inflight > 0:
-                        return
-
-                    leftover = [
-                        t for t in (order.target_data or "").split("\n") if t.strip()
-                    ]
-
-                    # 🟢 فاز ۴: توقف فرآیند فاینالایز در صورتی که سفارش هولد شده است
-                    if order.status == OrderStatus.on_hold_proxy:
-                        return
-
-                    # استخراج تعداد ارسال‌های موفق تا این لحظه جهت بررسی پیشرفت سفارش
-                    success_count = 0
-                    try:
-                        success_count = (
-                            await session.scalar(
-                                select(func.count())
-                                .select_from(OrderLog)
-                                .where(
-                                    OrderLog.order_id == order_id,
-                                    OrderLog.status == "success",
-                                )
-                            )
-                            or 0
+                        _spawn_background_task(
+                            _report_order_terminal(order_id, session_maker, success_count)
                         )
-                    except Exception as e:
-                        logger.warning(f"Finalize: success-count query failed for Order #{order_id}: {e}")
 
-                    _spawn_background_task(
-                        _report_order_terminal(order_id, session_maker, success_count)
-                    )
-
-                    # --- سناریوی اول: سفارش همچنان تارگت دارد ---
-                    if leftover:
-                        order.status = OrderStatus.pending
-                        sched = order.scheduled_for
-                        
-                        if sched is not None and sched.tzinfo is None:
-                            sched = sched.replace(tzinfo=timezone.utc)
+                        # --- سناریوی اول: سفارش همچنان تارگت دارد ---
+                        if leftover:
+                            order.status = OrderStatus.pending
+                            sched = order.scheduled_for
                             
-                        # اگر تعویق قبلی (مانند عضویت گروه) نداشتیم یا گذشته بود:
-                        if not (sched and sched > datetime.now(timezone.utc)):
-                            order.scheduled_for = None
-                            
-                            # 🛡 فاز ۲ (B9): استراتژی Backoff برای سفارشات بدون پیشرفت
-                            if success_count == 0:
-                                order.fail_streak = (order.fail_streak or 0) + 1
+                            if sched is not None and sched.tzinfo is None:
+                                sched = sched.replace(tzinfo=timezone.utc)
                                 
-                                if order.fail_streak >= 8:
-                                    # توقف کامل پس از ۸ چرخه شکست متوالی
-                                    order.status = OrderStatus.error
-                                    order.scheduled_for = None
-                                    # ⚠️ تغییر: target_data پاک نمی‌شود تا دیتا از دست نرود
-                                    order.inflight_data = None
+                            # اگر تعویق قبلی (مانند عضویت گروه) نداشتیم یا گذشته بود:
+                            if not (sched and sched > datetime.now(timezone.utc)):
+                                order.scheduled_for = None
+                                
+                                # 🛡 فاز ۲ (B9): استراتژی Backoff برای سفارشات بدون پیشرفت
+                                if success_count == 0:
+                                    order.fail_streak = (order.fail_streak or 0) + 1
                                     
-                                    session.add(OrderLog(
-                                        order_id=order.id, 
-                                        target="System", 
-                                        status="error",
-                                        error_message="Zero-progress retry limit reached (8 cycles)"
-                                    ))
-                                    display_code = (
-                                        order.tracking_code if order.tracking_code else f"ID-{order.id}"
-                                    )
-                                    admin_notify_text = (
-                                        f"⛔️ <b>توقف سفارش به دلیل شکست‌های پیاپی</b>\n\n"
-                                        f"سفارش: <code>{display_code}</code>\n"
-                                        f"پس از ۸ چرخه تلاش هیچ ارسالی موفق نبود (احتمالاً تمام تارگت‌ها مسدود/ربات هستند یا فایل مدیا نامعتبر است).\n"
-                                        f"<i>سفارش متوقف شد.</i>"
-                                    )
-                                else:
-                                    # تعویق نمایی (۵، ۱۰، ۲۰، ۴۰ دقیقه ... تا حداکثر ۶ ساعت)
-                                    backoff_minutes = min(5 * (2 ** (order.fail_streak - 1)), 360)
-                                    order.scheduled_for = datetime.now(timezone.utc) + timedelta(minutes=backoff_minutes)
-                        return
+                                    if order.fail_streak >= 8:
+                                        # توقف کامل پس از ۸ چرخه شکست متوالی
+                                        order.status = OrderStatus.error
+                                        order.scheduled_for = None
+                                        # ⚠️ تغییر: target_data پاک نمی‌شود تا دیتا از دست نرود
+                                        order.inflight_data = None
+                                        
+                                        session.add(OrderLog(
+                                            order_id=order.id, 
+                                            target="System", 
+                                            status="error",
+                                            error_message="Zero-progress retry limit reached (8 cycles)"
+                                        ))
+                                        display_code = (
+                                            order.tracking_code if order.tracking_code else f"ID-{order.id}"
+                                        )
+                                        admin_notify_text = (
+                                            f"⛔️ <b>توقف سفارش به دلیل شکست‌های پیاپی</b>\n\n"
+                                            f"سفارش: <code>{display_code}</code>\n"
+                                            f"پس از ۸ چرخه تلاش هیچ ارسالی موفق نبود (احتمالاً تمام تارگت‌ها مسدود/ربات هستند یا فایل مدیا نامعتبر است).\n"
+                                            f"<i>سفارش متوقف شد.</i>"
+                                        )
+                                    else:
+                                        # تعویق نمایی (۵، ۱۰، ۲۰، ۴۰ دقیقه ... تا حداکثر ۶ ساعت)
+                                        backoff_minutes = min(5 * (2 ** (order.fail_streak - 1)), 360)
+                                        order.scheduled_for = datetime.now(timezone.utc) + timedelta(minutes=backoff_minutes)
+                            return
 
-                    # --- سناریوی دوم: سفارش به پایان رسیده است ---
-                    order.status = OrderStatus.completed
-                    order.scheduled_for = None
-                    order.inflight_data = None
-                    order.fail_streak = 0
+                        # --- سناریوی دوم: سفارش به پایان رسیده است ---
+                        order.status = OrderStatus.completed
+                        order.scheduled_for = None
+                        order.inflight_data = None
+                        order.fail_streak = 0
 
-                    error_count = 0
-                    try:
-                        error_count = (
-                            await session.scalar(
-                                select(func.count())
-                                .select_from(OrderLog)
-                                .where(
-                                    OrderLog.order_id == order_id,
-                                    OrderLog.status == "error",
+                        error_count = 0
+                        try:
+                            error_count = (
+                                await session.scalar(
+                                    select(func.count())
+                                    .select_from(OrderLog)
+                                    .where(
+                                        OrderLog.order_id == order_id,
+                                        OrderLog.status == "error",
+                                    )
                                 )
+                                or 0
                             )
-                            or 0
-                        )
-                    except Exception as stat_err:
-                        logger.warning(
-                            f"Finalize: stats query for error_count failed for Order #{order_id}: {stat_err}"
-                        )
+                        except Exception as stat_err:
+                            logger.warning(
+                                f"Finalize: stats query for error_count failed for Order #{order_id}: {stat_err}"
+                            )
 
-                    display_code = (
-                        order.tracking_code if order.tracking_code else f"ID-{order.id}"
+                        display_code = (
+                            order.tracking_code if order.tracking_code else f"ID-{order.id}"
+                        )
+                        
+                        if not _is_extract_order(order):
+                            admin_notify_text = (
+                                "✅ <b>سفارش با موفقیت تکمیل شد!</b>\n\n"
+                                f"سفارش: <code>{display_code}</code>\n\n"
+                                "📊 <b>گزارش نهایی:</b>\n"
+                                f"▫️ عملیات موفق: <code>{success_count}</code>\n"
+                                f"▫️ عملیات ناموفق: <code>{error_count}</code>\n\n"
+                                "<i>همه‌ی تارگت‌های صف پردازش شدند.</i>"
+                            )
+                            _spawn_background_task(_send_export_file(session_maker, bot, order_id, "سفارش با موفقیت به پایان رسید."))
+                        else:
+                            admin_notify_text = None
+
+                        media_paths_to_clean = [
+                            p for p in (order.media_path, order.media_2_path, order.media_3_path)
+                            if p and isinstance(p, str) and not p.startswith("exports/")
+                        ]
+                        
+                        if not _is_extract_order(order):
+                            order.media_path = None
+                            order.media_2_path = None
+                            order.media_3_path = None
+                        else:
+                            media_paths_to_clean.clear()
+
+            except Exception as e:
+                logger.error(f"Finalize failed for Order #{order_id}: {e}", exc_info=True)
+                try:
+                    async with session_maker() as fallback_session:
+                        async with fallback_session.begin():
+                            await fallback_session.execute(
+                                update(Order)
+                                .where(Order.id == order_id)
+                                .values(status=OrderStatus.pending)
+                            )
+                    await broadcast_to_admins(
+                        bot,
+                        text=(
+                            f"⚠️ <b>خطا در تکمیل سفارش</b>\n\n"
+                            f"سفارش <code>#{order_id}</code> به دلیل خطای سیستمی بسته نشد و "
+                            f"به حالت Pending بازگشت.\n<i>جزئیات در لاگ سرور ثبت شد.</i>"
+                        )
                     )
-                    
-                    if not _is_extract_order(order):
-                        admin_notify_text = (
-                            "✅ <b>سفارش با موفقیت تکمیل شد!</b>\n\n"
-                            f"سفارش: <code>{display_code}</code>\n\n"
-                            "📊 <b>گزارش نهایی:</b>\n"
-                            f"▫️ عملیات موفق: <code>{success_count}</code>\n"
-                            f"▫️ عملیات ناموفق: <code>{error_count}</code>\n\n"
-                            "<i>همه‌ی تارگت‌های صف پردازش شدند.</i>"
-                        )
-                        _spawn_background_task(_send_export_file(session_maker, bot, order_id, "سفارش با موفقیت به پایان رسید."))
-                    else:
-                        admin_notify_text = None
+                except Exception as fb_err:
+                    logger.error(f"Best-effort fallback failed for Order #{order_id}: {fb_err}")
+                return
 
-                    media_paths_to_clean = [
-                        p for p in (order.media_path, order.media_2_path, order.media_3_path)
-                        if p and isinstance(p, str) and not p.startswith("exports/")
-                    ]
-                    
-                    if not _is_extract_order(order):
-                        order.media_path = None
-                        order.media_2_path = None
-                        order.media_3_path = None
-                    else:
-                        media_paths_to_clean.clear()
-
-        except Exception as e:
-            logger.error(f"Finalize failed for Order #{order_id}: {e}", exc_info=True)
-            try:
-                async with session_maker() as fallback_session:
-                    async with fallback_session.begin():
-                        await fallback_session.execute(
-                            update(Order)
-                            .where(Order.id == order_id)
-                            .values(status=OrderStatus.pending)
-                        )
-                await broadcast_to_admins(
-                    bot,
-                    text=(
-                        f"⚠️ <b>خطا در تکمیل سفارش</b>\n\n"
-                        f"سفارش <code>#{order_id}</code> به دلیل خطای سیستمی بسته نشد و "
-                        f"به حالت Pending بازگشت.\n<i>جزئیات در لاگ سرور ثبت شد.</i>"
-                    )
-                )
-            except Exception as fb_err:
-                logger.error(f"Best-effort fallback failed for Order #{order_id}: {fb_err}")
-            return
-
-    if admin_notify_text:
-        await broadcast_to_admins(bot, admin_notify_text)
-            
-    for path in media_paths_to_clean:
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-                logger.info(
-                    f"Garbage Collection: Deleted media {path} "
-                    f"for completed Order #{order_id}."
-                )
-            except Exception:
-                pass
+        if admin_notify_text:
+            await broadcast_to_admins(bot, admin_notify_text)
                 
-    _banner_warned_orders.discard(order_id)
+        for path in media_paths_to_clean:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    logger.info(
+                        f"Garbage Collection: Deleted media {path} "
+                        f"for completed Order #{order_id}."
+                    )
+                except Exception:
+                    pass
+                    
+        _banner_warned_orders.discard(order_id)
+
+    except Exception as lock_err:
+        logger.error(f"Failed to process _finalize_chunk for Order #{order_id}: {lock_err}", exc_info=True)
+
 async def order_dispatcher_loop(
     session_maker: async_sessionmaker[AsyncSession], 
     worker_pool: Dict[int, Client],
     bot: Bot
 ) -> None:
     try:
-        extract_parallel_max_workers = max(1, int(getattr(config, "EXTRACT_PARALLEL_MAX_WORKERS", 3)))
+        extract_parallel_max_workers = 1
     except (TypeError, ValueError):
         extract_parallel_max_workers = 3
     # 🔄 مهلتِ حداکثریِ تخمین تعداد اعضا (ثانیه) — حلقه‌ی دیسپچ گیر نمی‌کند
@@ -2873,7 +3113,7 @@ async def order_dispatcher_loop(
                     if warmed_up_accs:
                         redis = _get_redis()
                         pipe = redis.pipeline()
-                        from workers.sender import _hourly_key
+                        
                         for acc in warmed_up_accs:
                             pipe.exists(f"busy_worker:{acc.id}")
                             pipe.exists(f"chunk_cooldown:{acc.id}")
@@ -3002,7 +3242,11 @@ async def order_dispatcher_loop(
                         reserved_acc_ids = list((await session.scalars(
                             select(OrderJoin.account_id)
                             .join(Order, OrderJoin.order_id == Order.id)
-                            .where(Order.status == OrderStatus.pending, Order.retry_count > 0)
+                            .where(
+                                Order.status == OrderStatus.pending, 
+                                Order.retry_count > 0,
+                                Order.id != order.id  # 👈 اضافه شدن این شرط برای جلوگیری از قفل شدن اکانت توسط سفارش جاری (Self-blocking)
+                            )
                         )).all())
                     except Exception: pass
 
@@ -3145,7 +3389,7 @@ async def order_dispatcher_loop(
                                 if p.get("daily_sent", 0) >= acc_daily_limit: continue
 
                                 if await _acquire_busy(acc.id):
-                                    await _get_redis().set(f"last_dispatched:{acc.id}", time.time())
+                                    await _get_redis().set(f"last_dispatched:{acc.id}", time.time(), ex=172800)
                                     picked_acc_id = acc.id
                                     picked_client = worker_pool[acc.id]
                                     break
@@ -3169,7 +3413,8 @@ async def order_dispatcher_loop(
 
                                 try:
                                     go_parallel = False
-                                    if order.filter_type in _PARALLEL_SAFE_FILTERS:
+                                    is_valid_parallel = (order.filter_type in _PARALLEL_SAFE_FILTERS) or (isinstance(order.filter_type, str) and order.filter_type.startswith("{"))
+                                    if is_valid_parallel:
                                         if order_profile.extract_parallel_min_members == 0:
                                             go_parallel = True
                                         elif total_estimate and int(total_estimate) > order_profile.extract_parallel_min_members:
@@ -3189,7 +3434,7 @@ async def order_dispatcher_loop(
                                         if p.get("daily_sent", 0) >= acc_daily_limit: continue
 
                                         if await _acquire_busy(acc.id):
-                                            await _get_redis().set(f"last_dispatched:{acc.id}", time.time())
+                                            await _get_redis().set(f"last_dispatched:{acc.id}", time.time(), ex=172800)
                                             parallel_acc_ids.append(acc.id)
                                             parallel_clients.append(worker_pool[acc.id])
                                             busy_account_ids.append(acc.id)
@@ -3270,7 +3515,7 @@ async def order_dispatcher_loop(
                                 if p.get("daily_sent", 0) >= acc_daily_limit: continue
 
                                 if await _acquire_busy(acc.id):
-                                    await _get_redis().set(f"last_dispatched:{acc.id}", time.time())
+                                    await _get_redis().set(f"last_dispatched:{acc.id}", time.time(), ex=172800)
                                     picked_acc_id = acc.id
                                     picked_client = worker_pool[acc.id]
                                     break
@@ -3333,7 +3578,7 @@ async def order_dispatcher_loop(
                                 if not await _acquire_busy(acc.id):
                                     continue
                                     
-                                await _get_redis().set(f"last_dispatched:{acc.id}", time.time())
+                                await _get_redis().set(f"last_dispatched:{acc.id}", time.time(), ex=172800)
                                 
                                 chunk_limit = acc_daily_limit
                                 if send_limit_per_run and send_limit_per_run > 0:
@@ -3388,98 +3633,117 @@ async def order_dispatcher_loop(
                 dispatched_anything = bool(send_jobs or extract_jobs or resolver_jobs)
                 
                 if not dispatched_anything and not empty_target_notify_code:
-                    # 🛡 فاز ۱ (F8): تمایز دقیق وضعیت Busy از Cooldown موقت برای جلوگیری از لغو مخرب
-                    is_any_actively_busy = any(redis_prechecks.get(acc.id, {}).get("is_busy") for acc in eligible_accounts)
-                    is_any_in_cooldown = any(redis_prechecks.get(acc.id, {}).get("is_cooldown") for acc in eligible_accounts)
-                    
-                    if len(connected_ids) > 0 and not is_any_actively_busy and accounts_delayed_by_warmup == 0:
-                        
-                        if is_any_in_cooldown:
-                            # لغو ممنوع: حداقل یک اکانت صرفاً در Cooldown (استراحت) است. سفارش تا پایان استراحت Defer می‌شود.
+                    # --- آیتم ۱: بازنویسی بلوک تصمیم‌گیری/لغو دیسپچر ---
+                    # (الف) تازه‌سازی بلادرنگ وضعیت اکانت‌ها از ردیس قبل از تصمیمِ لغو
+                    fresh_prechecks = {}
+                    if eligible_accounts:
+                        try:
                             redis = _get_redis()
-                            min_ttl = 3600 # پیش‌فرض ۱ ساعت پشتیبان
+                            pipe = redis.pipeline()
                             
-                            # استخراج کوتاه‌ترین زمان باقی‌مانده استراحت
                             for acc in eligible_accounts:
-                                if redis_prechecks.get(acc.id, {}).get("is_cooldown"):
-                                    try:
-                                        ttl = await redis.ttl(f"chunk_cooldown:{acc.id}")
-                                        if ttl and 0 < ttl < min_ttl:
-                                            min_ttl = ttl
-                                    except Exception:
-                                        pass
-                                        
-                            next_check = datetime.now(timezone.utc) + timedelta(seconds=min_ttl + 10)
-                            await session.execute(
-                                update(Order)
-                                .where(Order.id == order.id)
-                                .values(status=OrderStatus.pending, scheduled_for=next_check)
-                                .execution_options(synchronize_session=False)
-                            )
-                            await session.commit()
-                            
-                            if reporter := _progress_reporters.get(f"order:{order.id}"):
-                                try:
-                                    await reporter.update(status=f"⏳ اکانت‌ها در استراحت موقت هستند. از سرگیری حدود {int(min_ttl/60)} دقیقه دیگر...")
-                                except Exception:
-                                    pass
-                            continue
+                                pipe.exists(f"busy_worker:{acc.id}")
+                                pipe.exists(f"chunk_cooldown:{acc.id}")
+                                pipe.get(_daily_key(acc.id)) 
+                            results = await pipe.execute()
+                            idx = 0
+                            for acc in eligible_accounts:
+                                fresh_prechecks[acc.id] = {
+                                    "is_busy": bool(results[idx]),
+                                    "is_cooldown": bool(results[idx+1]),
+                                    "daily_sent": int(results[idx+2] or 0),
+                                }
+                                idx += 3
+                        except Exception as e:
+                            logger.error(f"Failed to fetch fresh redis states for cancellation decision: {e}")
+                            # در صورت خطای موقت ردیس، فرض می‌کنیم اکانت‌ها مشغولند تا لغو مخرب رخ ندهد
+                            for acc in eligible_accounts:
+                                fresh_prechecks[acc.id] = {"is_busy": True, "is_cooldown": False, "daily_sent": 0}
 
-                        # لغو اجتناب‌ناپذیر: هیچ اکانتی مشغول نیست و هیچ‌کدام در Cooldown موقت نیستند (لیمت روزانه/مسدودی دائم)
+                    # (ب) بررسی دقیق شرایط: آیا اصلاً اکانتی هست که بتواند در آینده این سفارش را انجام دهد؟
+                    has_future_capacity = False
+                    min_wait_ttl = None
+                    
+                    if len(connected_ids) > 0:
+                        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+                        for acc in eligible_accounts:
+                            state = fresh_prechecks.get(acc.id, {})
+                            acc_daily_limit = effective_daily_limit(acc.created_at)
+                            
+                            if state.get("is_busy") or state.get("is_cooldown") or state.get("daily_sent", 0) < acc_daily_limit or acc.id in reserved_acc_ids:
+                                has_future_capacity = True
+                                
+                            # محاسبه زمان حدودی انتظار
+                            if acc.flood_wait_until and acc.flood_wait_until > now_naive:
+                                ttl = (acc.flood_wait_until - now_naive).total_seconds()
+                                if min_wait_ttl is None or ttl < min_wait_ttl: min_wait_ttl = ttl
+                            elif acc.restricted_until and acc.restricted_until > now_naive:
+                                ttl = (acc.restricted_until - now_naive).total_seconds()
+                                if min_wait_ttl is None or ttl < min_wait_ttl: min_wait_ttl = ttl
+                            else:
+                                try:
+                                    redis = _get_redis()
+                                    ttl = await redis.ttl(f"chunk_cooldown:{acc.id}")
+                                    if ttl and ttl > 0:
+                                        if min_wait_ttl is None or ttl < min_wait_ttl: min_wait_ttl = ttl
+                                except Exception: pass
+                                
+                    if accounts_delayed_by_warmup > 0:
+                        has_future_capacity = True
+
+                    # اگر اکانت سالمی در این لحظه وجود ندارد (چه موقت، چه دائم)، سفارش را می‌بندیم
+                    if not eligible_accounts:
+                        # دریافت آمار ارسال‌های موفق تا این لحظه
                         success_count = (
                             await session.scalar(
                                 select(func.count())
                                 .select_from(OrderLog)
-                                .where(
-                                    OrderLog.order_id == order.id,
-                                    OrderLog.status == "success",
-                                )
+                                .where(OrderLog.order_id == order.id, OrderLog.status == "success")
                             )
                             or 0
                         )
                         
+                        # پیام پایان کار برای کاربر و ادمین
                         if success_count > 0:
-                            error_msg = f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count})، اما در ادامه ربات به محدودیت تعداد اکانت رسید و متوقف شد. لیست تارگت‌های باقی‌مانده حفظ شده است."
+                            finish_msg = f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). به دلیل اتمام ورکرهای سالم و در دسترس، سفارش با موفقیتِ جزئی پایان یافت."
                         else:
-                            error_msg = "سفارش به علت نبود اکانت دارای ظرفیت و سالم لغو شد. لیست تارگت‌ها جهت از سرگیری در آینده حفظ شده است."
+                            finish_msg = "هیچ ورکر سالمی برای انجام این سفارش در دسترس نبود و سفارش لغو شد."
                         
-                        # ⚠️ باگ فیکس: target_data هرگز برابر با "" نمی‌شود تا تارگت‌ها از بین نروند.
+                        # بستن سفارش با وضعیت Completed (یا error بسته به ترجیح شما)
+                        final_status = OrderStatus.completed if success_count > 0 else OrderStatus.error
+                        
                         await session.execute(
                             update(Order)
                             .where(Order.id == order.id)
                             .values(
-                                status=OrderStatus.error, 
+                                status=final_status, 
                                 scheduled_for=None, 
-                                reject_reason="All accounts exhausted (Limits, Daily Caps)"
+                                reject_reason="اتمام ورکرهای سالم در لحظه"
                             )
                             .execution_options(synchronize_session=False)
                         )
-                        session.add(OrderLog(
-                            order_id=order.id, 
-                            target="System", 
-                            status="error",
-                            error_message="All accounts exhausted. Targets preserved."
-                        ))
+                        session.add(OrderLog(order_id=order.id, target="System", status=final_status, error_message=finish_msg))
                         await session.commit()
                         
+                        # ارسال فایل خروجی به کاربر
                         if not _is_extract_order(order):
-                            _spawn_background_task(_send_export_file(session_maker, bot, order.id, error_msg))
+                            _spawn_background_task(_send_export_file(session_maker, bot, order.id, finish_msg))
                             
-                        if reporter := _progress_reporters.get(f"order:{order.id}"):
-                            await reporter.fail(f"⛔️ <b>لغو خودکار سفارش</b>\n\n{error_msg}")
-                            _pop_progress_reporter("order", order.id)
+                        # بروزرسانی داشبورد زنده کاربر
+                        task_type = "extract" if _is_extract_order(order) else "order"
+                        if reporter := _progress_reporters.get(f"{task_type}:{order.id}"):
+                            if final_status == OrderStatus.completed:
+                                await reporter.finish(f"✅ <b>پایان سفارش</b>\n\n{finish_msg}")
+                            else:
+                                await reporter.fail(f"⛔️ <b>لغو سفارش</b>\n\n{finish_msg}")
+                            _pop_progress_reporter(task_type, order.id)
                             
+                        # اطلاع به ادمین اصلی
                         await broadcast_to_admins(
                             bot,
-                            text=f"⛔️ <b>توقف سفارش (حفظ تارگت‌ها)</b>\n\nسفارش: <code>{order_tracking_code}</code>\n{error_msg}"
+                            text=f"🏁 <b>پایان سفارش به دلیل اتمام منابع</b>\n\nسفارش: <code>{order_tracking_code}</code>\n{finish_msg}"
                         )
                         continue
-                    else:
-                        if reporter := _progress_reporters.get(f"order:{order.id}"):
-                            try:
-                                await reporter.update(status="⏳ در انتظار آزاد شدن اکانت (اکانت‌های مناسب درگیر انجام سفارشات دیگر هستند)…")
-                            except Exception:
-                                pass
 
                 for _client, _acc_id, _chunk in send_jobs:
                     tasks_to_launch.append(
@@ -3541,7 +3805,10 @@ async def order_dispatcher_loop(
         if tasks_to_launch:
             async def _launch_batch(coroutines):
                 tasks = [asyncio.create_task(coro) for coro in coroutines]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, Exception):
+                        logger.error(f"Unhandled exception in background task: {res}", exc_info=res)
             
             _spawn_background_task(_launch_batch(tasks_to_launch))
 
@@ -3556,18 +3823,42 @@ from pathlib import Path
 # 🧹 فاز ۳: زباله‌روب خودکار فایل‌های موقت (Garbage Collector)
 # ==========================================
 
+# workers/task_queue.py
+# بازنویسی کامل تابع
 async def temp_file_gc_loop(cleanup_interval_hours: int = 12, max_age_hours: int = 24):
     """
-    تسک پس‌زمینه برای پاکسازی فایل‌های قدیمی در پوشه‌های downloads و exports
-    این تسک به صورت مستقل در کنار دیسپچر اجرا می‌شود.
+    🧹 فاز ۳: زباله‌روب خودکار با محافظت از فایل‌های ارجاع‌داده‌شده (تارگت‌های منتظر یا خروجی استخراج)
     """
     directories_to_clean = ["downloads", "exports"]
     max_age_seconds = max_age_hours * 3600
 
     logger.info(f"Temp File Garbage Collector started. Running every {cleanup_interval_hours} hours.")
 
+    from database.engine import async_session
+    from database.models import Order
+
     while True:
         try:
+            protected_files = set()
+            try:
+                async with async_session() as session:
+                    # استخراج فایل‌های متصل به سفارش‌های فعال (نیاز به مدیا) یا سفارش‌های extract (خروجی دانلود)
+                    stmt = select(Order.media_path, Order.media_2_path, Order.media_3_path).where(
+                        or_(
+                            Order.status.notin_(["completed", "error"]),
+                            Order.order_type == "extract"
+                        )
+                    )
+                    rows = (await session.execute(stmt)).all()
+                    for r in rows:
+                        if r[0]: protected_files.add(os.path.abspath(r[0]))
+                        if r[1]: protected_files.add(os.path.abspath(r[1]))
+                        if r[2]: protected_files.add(os.path.abspath(r[2]))
+            except Exception as e:
+                logger.error(f"GC: Failed to fetch protected files from DB: {e}")
+                await asyncio.sleep(600)
+                continue
+
             now = time.time()
             deleted_count = 0
 
@@ -3579,6 +3870,10 @@ async def temp_file_gc_loop(cleanup_interval_hours: int = 12, max_age_hours: int
                 for file_path in dir_path.iterdir():
                     if not file_path.is_file() or file_path.name == ".gitkeep":
                         continue
+
+                    abs_path = os.path.abspath(file_path)
+                    if abs_path in protected_files:
+                        continue  # 🛡 محافظت از قربانی شدن فایل ارجاع‌دار
 
                     file_mtime = file_path.stat().st_mtime
                     if (now - file_mtime) > max_age_seconds:
@@ -3594,5 +3889,5 @@ async def temp_file_gc_loop(cleanup_interval_hours: int = 12, max_age_hours: int
         except Exception as e:
             logger.error(f"Error in Temp File GC Loop: {e}", exc_info=True)
 
-        # خواب تا سیکل بعدی پاکسازی
         await asyncio.sleep(cleanup_interval_hours * 3600)
+

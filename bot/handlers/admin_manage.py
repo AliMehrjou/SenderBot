@@ -1,5 +1,6 @@
 import logging
 from typing import Optional
+from functools import wraps
 
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
@@ -8,7 +9,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
-from database.models import Admin
+from database.models import Admin, Account, AccountStatus
 from bot.states.admin_fsm import AdminManageStates, AdminMessageStates
 from bot.states.confirm_fsm import ConfirmStates
 from config import config
@@ -38,8 +39,23 @@ from utils.pagination import (
     parse_page_from_callback,
 )
 
+from bot.middlewares.admin_auth import _role_cache
+
 logger = logging.getLogger(__name__)
 router = Router(name="admin_manage_router")
+
+
+# ==========================================
+# دکوریتور کنترل دسترسی ادمین اصلی
+# ==========================================
+def main_admin_only(func):
+    # 🔓 با توجه به درخواست یکسان‌سازی سطح دسترسی ادمین اصلی و فرعی،
+    # این دکوریتور دیگر دسترسی ادمین‌های فرعی را مسدود نمی‌کند.
+    # (امنیت پایه توسط AdminMiddleware در لایه‌های قبلی تامین شده است)
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        return await func(*args, **kwargs)
+    return wrapper
 
 
 # ==========================================
@@ -68,18 +84,13 @@ def get_admin_add_finish_keyboard():
     builder.adjust(2, 1)
     return builder.as_markup()
 
+
 # ==========================================
 # ADD ADMIN FLOW
 # ==========================================
 @router.callback_query(F.data == "menu_add_admin/")
+@main_admin_only
 async def add_admin_start(callback: types.CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(
-            callback,
-            "⛔️ فقط ادمین اصلی سیستم مجاز به مدیریت ادمین‌های فرعی است.",
-            show_alert=True
-        )
-
     await safe_callback_answer(callback)
 
     await cleanup_fsm_temp_files(state)
@@ -95,7 +106,9 @@ async def add_admin_start(callback: types.CallbackQuery, state: FSMContext) -> N
         reply_markup=get_admin_add_cancel_keyboard()
     )
 
+
 @router.message(AdminManageStates.waiting_for_admin_id, F.text)
+@main_admin_only
 async def process_admin_id(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
     admin_id_text = message.text.strip()
 
@@ -132,6 +145,25 @@ async def process_admin_id(message: types.Message, state: FSMContext, session: A
             reply_markup=get_admin_add_cancel_keyboard()
         )
 
+    # Invalidation فوری کش نقش ادمین و لیست ادمین‌ها
+    _role_cache.pop(new_admin_id, None)
+    try:
+        from bot.middlewares.admin_auth import clear_negative_cache
+        clear_negative_cache(new_admin_id)
+    except ImportError:
+        pass
+    from utils.admin_broadcast import invalidate_admin_cache
+    await invalidate_admin_cache()
+
+    # اطلاع‌رسانی به ادمین اصلی
+    try:
+        await message.bot.send_message(
+            chat_id=config.ADMIN_ID,
+            text=f"ℹ️ <b>اطلاعیه سیستم:</b>\nادمین جدید با آیدی <code>{new_admin_id}</code> اضافه شد و هم‌اکنون دسترسی فعال است."
+        )
+    except Exception:
+        pass
+
     await state.clear()
     await message.answer(
         f"🎉 <b>ادمین جدید با موفقیت اضافه شد!</b>\n\n"
@@ -145,7 +177,6 @@ async def process_admin_id(message: types.Message, state: FSMContext, session: A
 # LIST & DELETE ADMINS FLOW
 # (📄 فاز ۱: صفحه‌بندی استاندارد ۱۰ ادمین در هر صفحه + 🔄 بروزرسانی)
 # ==========================================
-# REWRITTEN
 async def render_admins_list(
     callback: types.CallbackQuery,
     session: AsyncSession,
@@ -218,11 +249,10 @@ async def render_admins_list(
 
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
 
-@router.callback_query(F.data == "menu_list_admins/")
-async def list_admins_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
 
+@router.callback_query(F.data == "menu_list_admins/")
+@main_admin_only
+async def list_admins_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     await safe_callback_answer(callback)
 
     await cleanup_fsm_temp_files(state)
@@ -234,14 +264,10 @@ async def list_admins_handler(callback: types.CallbackQuery, state: FSMContext, 
 
 # ==========================================
 # 📄 فاز ۱: ناوبری صفحات + 🔄 بروزرسانی لیست ادمین‌ها
-# دکمهٔ «بروزرسانی» دقیقاً همان کال‌بک صفحهٔ فعلی را صدا می‌زند،
-# بنابراین این هندلر هم «صفحه بعد/قبل» و هم «بروزرسانی» را پوشش می‌دهد.
 # ==========================================
 @router.callback_query(F.data.startswith("list_admins_page_"))
+@main_admin_only
 async def list_admins_paginated_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-
     await safe_callback_answer(callback)
 
     page = parse_page_from_callback(callback.data)
@@ -252,10 +278,8 @@ async def list_admins_paginated_handler(callback: types.CallbackQuery, state: FS
 # 🟤 فاز ۵ — هندلر سازگاری برای دکمه‌های تأیید قدیمی
 # ==========================================
 @router.callback_query(F.data.startswith("del_admin_confirm_") & F.data.endswith("/"))
+@main_admin_only
 async def legacy_admin_confirm_button_compat(callback: types.CallbackQuery) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-
     await safe_callback_answer(
         callback,
         "⚠️ این دکمه متعلق به نسخه قدیمی ربات است. لطفاً از لیست ادمین‌ها مجدداً اقدام کنید.",
@@ -287,13 +311,10 @@ def build_admin_delete_confirmation_keyboard(admin_db_id: int) -> types.InlineKe
 
 # ==========================================
 # 🟤 فاز ۵ — مرحله ۱: DELETE ADMIN (نمایش تأیید)
-# (📄 فاز ۱: ذخیره صفحهٔ فعلی برای بازگشت بعد از حذف/انصراف)
 # ==========================================
 @router.callback_query(F.data.startswith("del_admin_") & F.data.endswith("/"))
+@main_admin_only
 async def ask_delete_admin_confirmation(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-
     admin_id_str = callback.data.replace("del_admin_", "").replace("/", "")
     if not admin_id_str.isdigit():
         return await safe_callback_answer(callback, "⚠️ آیدی نامعتبر.", show_alert=True)
@@ -311,7 +332,6 @@ async def ask_delete_admin_confirmation(callback: types.CallbackQuery, state: FS
 
     if not admin_obj:
         await safe_callback_answer(callback, "⚠️ این ادمین قبلاً حذف شده است.", show_alert=True)
-        # 📄 فاز ۱: رفرش لیست از همان صفحه‌ای که کاربر در آن بوده
         fsm_data = await state.get_data()
         return await render_admins_list(
             callback, session, state=state,
@@ -320,8 +340,6 @@ async def ask_delete_admin_confirmation(callback: types.CallbackQuery, state: FS
 
     await safe_callback_answer(callback)
 
-    # 🟤 ذخیره اطلاعات عملیات در انتظار تأیید در FSM (الگوی استاندارد)
-    # 📄 فاز ۱: return_page هم ذخیره می‌شود تا بعد از حذف به همان صفحه برگردیم
     fsm_data = await state.get_data()
     await state.update_data(
         confirm_action="delete_admin",
@@ -330,23 +348,17 @@ async def ask_delete_admin_confirmation(callback: types.CallbackQuery, state: FS
     )
     await state.set_state(ConfirmStates.waiting_for_confirmation)
 
-    # 🛡 فاز ۵: ویرایش امن (fallback به answer تا دکمه‌های تأیید همیشه در دسترس بمانند)
     await safe_edit_message(
         callback.message,
         build_admin_delete_confirmation_text(admin_obj),
         reply_markup=build_admin_delete_confirmation_keyboard(admin_db_id)
     )
-
-
 # ==========================================
 # 🟤 فاز ۵ — مرحله ۲ (اجرای واقعی)
-# (📄 فاز ۱: بازگشت به همان صفحهٔ قبلی بعد از حذف)
 # ==========================================
 @router.callback_query(F.data.startswith("confirm_delete_admin_") & F.data.endswith("/"))
+@main_admin_only
 async def confirm_delete_admin_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-
     # 🔒 بررسی امنیتی state
     current_state = await state.get_state()
     fsm_data = await state.get_data()
@@ -391,6 +403,11 @@ async def confirm_delete_admin_handler(callback: types.CallbackQuery, state: FSM
         return await render_admins_list(callback, session, state=state, page=return_page)
 
     try:
+        # Invalidation کش بلافاصله بعد از حذف موفق
+        _role_cache.pop(admin_obj.telegram_id, None)
+        from utils.admin_broadcast import invalidate_admin_cache
+        await invalidate_admin_cache()
+        
         await session.delete(admin_obj)
         await session.commit()
     except Exception as e:
@@ -410,13 +427,10 @@ async def confirm_delete_admin_handler(callback: types.CallbackQuery, state: FSM
 
 # ==========================================
 # 🟤 فاز ۵ — انصراف از حذف ادمین
-# (📄 فاز ۱: بازگشت به همان صفحهٔ قبلی)
 # ==========================================
 @router.callback_query(F.data == "cancel_confirm_delete_admin/")
+@main_admin_only
 async def cancel_delete_admin_confirmation(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-
     fsm_data = await state.get_data()
     return_page = fsm_data.get("return_page", 1)
 
@@ -428,16 +442,12 @@ async def cancel_delete_admin_confirmation(callback: types.CallbackQuery, state:
     return await render_admins_list(callback, session, state=state, page=return_page)
 
 
-# NEW
 # ==========================================
 # SEND MESSAGE TO ADMINS FLOW
 # ==========================================
-
 @router.callback_query(F.data == "menu_admin_message/")
+@main_admin_only
 async def admin_message_menu(callback: types.CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     await safe_callback_answer(callback)
     await state.set_state(AdminMessageStates.waiting_for_recipient_selection)
     
@@ -454,10 +464,8 @@ async def admin_message_menu(callback: types.CallbackQuery, state: FSMContext) -
     )
 
 @router.callback_query(AdminMessageStates.waiting_for_recipient_selection, F.data == "msg_admin_all/")
+@main_admin_only
 async def admin_message_all(callback: types.CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     await safe_callback_answer(callback)
     await state.update_data(recipient="all")
     await state.set_state(AdminMessageStates.waiting_for_message_content)
@@ -525,27 +533,21 @@ async def render_message_admins_list(callback: types.CallbackQuery, session: Asy
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
 
 @router.callback_query(AdminMessageStates.waiting_for_recipient_selection, F.data == "msg_admin_specific/")
+@main_admin_only
 async def admin_message_specific(callback: types.CallbackQuery, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     await safe_callback_answer(callback)
     await render_message_admins_list(callback, session, page=1)
 
 @router.callback_query(AdminMessageStates.waiting_for_recipient_selection, F.data.startswith("msg_list_admins_page_"))
+@main_admin_only
 async def msg_list_admins_paginated(callback: types.CallbackQuery, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     await safe_callback_answer(callback)
     page = parse_page_from_callback(callback.data)
     await render_message_admins_list(callback, session, page=page)
 
 @router.callback_query(AdminMessageStates.waiting_for_recipient_selection, F.data.startswith("msg_admin_") & F.data.endswith("/"))
+@main_admin_only
 async def select_specific_admin_for_msg(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     if callback.data in ("msg_admin_all/", "msg_admin_specific/"):
         return
         
@@ -576,13 +578,16 @@ async def select_specific_admin_for_msg(callback: types.CallbackQuery, state: FS
         reply_markup=builder.as_markup()
     )
 
-@router.message(AdminMessageStates.waiting_for_message_content, F.text)
+
+# فیلتر F.text حذف شده تا هر نوع پیامی (عکس، ویس و...) دریافت شود
+@router.message(AdminMessageStates.waiting_for_message_content)
+@main_admin_only
 async def msg_content_received(message: types.Message, state: FSMContext) -> None:
-    if message.from_user.id != config.ADMIN_ID:
-        return
-        
-    text = message.text
-    await state.update_data(message_text=text)
+    # به جای ذخیره متن، آیدی پیام و چت را ذخیره می‌کنیم تا بعداً کپی کنیم
+    await state.update_data(
+        message_id=message.message_id,
+        from_chat_id=message.chat.id
+    )
     
     fsm_data = await state.get_data()
     recipient = fsm_data.get("recipient")
@@ -594,7 +599,7 @@ async def msg_content_received(message: types.Message, state: FSMContext) -> Non
         
     preview = (
         "📋 <b>پیش‌نمایش پیام:</b>\n\n"
-        f"{text}\n\n"
+        "✅ <i>پیام شما (شامل مدیا/فایل/متن) با موفقیت دریافت شد.</i>\n\n"
         f"📨 <b>گیرنده:</b> {target_str}\n\n"
         "آیا از ارسال این پیام اطمینان دارید؟"
     )
@@ -602,17 +607,17 @@ async def msg_content_received(message: types.Message, state: FSMContext) -> Non
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ بله، ارسال کن", callback_data="confirm_send_msg/")
     builder.button(text="❌ انصراف", callback_data="menu_list_admins/")
-    builder.button(text="✏️ ویرایش متن", callback_data="edit_msg_text/")
+    builder.button(text="✏️ ارسال پیام جدید", callback_data="edit_msg_text/")
     builder.adjust(1, 2)
     
-    await message.answer(preview, reply_markup=builder.as_markup(), parse_mode="HTML")
+    # اینجا از message.reply استفاده می‌کنیم تا دکمه‌ها زیر پیام خود ادمین ریپلای شوند
+    await message.reply(preview, reply_markup=builder.as_markup(), parse_mode="HTML")
     await state.set_state(AdminMessageStates.waiting_for_send_confirmation)
 
+
 @router.callback_query(AdminMessageStates.waiting_for_send_confirmation, F.data == "edit_msg_text/")
+@main_admin_only
 async def edit_msg_text(callback: types.CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     await safe_callback_answer(callback)
     await state.set_state(AdminMessageStates.waiting_for_message_content)
     
@@ -625,19 +630,17 @@ async def edit_msg_text(callback: types.CallbackQuery, state: FSMContext) -> Non
         reply_markup=builder.as_markup()
     )
 
+
+# هندلر اجرای نهایی ارسال
 @router.callback_query(AdminMessageStates.waiting_for_send_confirmation, F.data == "confirm_send_msg/")
+@main_admin_only
 async def execute_send_msg(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     await safe_callback_answer(callback, "⏳ در حال ارسال...")
     
     fsm_data = await state.get_data()
     recipient = fsm_data.get("recipient")
-    text = fsm_data.get("message_text", "")
-    
-    # هدر مخصوص سیستم
-    final_text = f"📨 پیام از ادمین اصلی:\n\n{text}"
+    message_id = fsm_data.get("message_id")
+    from_chat_id = fsm_data.get("from_chat_id")
     
     success = 0
     failed_ids = []
@@ -650,10 +653,15 @@ async def execute_send_msg(callback: types.CallbackQuery, state: FSMContext, ses
         
     for tg_id in targets:
         try:
-            await callback.bot.send_message(chat_id=tg_id, text=final_text, parse_mode="HTML")
+            # استفاده از copy_message به جای send_message
+            await callback.bot.copy_message(
+                chat_id=tg_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+            )
             success += 1
         except Exception as e:
-            logger.error(f"Failed to send admin message to {tg_id}: {e}")
+            logger.error(f"Failed to copy admin message to {tg_id}: {e}")
             failed_ids.append(str(tg_id))
             
     report = f"✅ پیام به <b>{success}</b> از <b>{len(targets)}</b> ادمین ارسال شد.\n"
@@ -667,14 +675,13 @@ async def execute_send_msg(callback: types.CallbackQuery, state: FSMContext, ses
     await safe_edit_or_answer(callback.message, report, reply_markup=builder.as_markup())
     await state.clear()
 
-from database.models import Account, AccountStatus
 
+# ==========================================
+# ACCOUNT HEALTH PANEL (بدون گیت دستی — آزاد برای تمام ادمین‌ها)
+# ==========================================
 @router.callback_query(F.data == "menu_account_health/")
 async def account_health_panel(callback: types.CallbackQuery, session: AsyncSession) -> None:
     """🩺 فاز ۱۰: نمایش وضعیت اکانت‌های در استراحت یا مسدود شده"""
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     await safe_callback_answer(callback)
     
     # واکشی اکانت‌هایی که در حالت Active نیستند (Blocked یا Cooldown)
@@ -693,10 +700,8 @@ async def account_health_panel(callback: types.CallbackQuery, session: AsyncSess
             # تبدیل زمان بازگشت به تایم‌زون محلی (تهران) برای نمایش به ادمین
             return_str = "دستی (نیازمند بررسی)"
             if acc.expected_return_time:
-                from zoneinfo import ZoneInfo
-                tehran_tz = ZoneInfo("Asia/Tehran")
-                local_time = acc.expected_return_time.astimezone(tehran_tz)
-                return_str = local_time.strftime("%H:%M")
+                from utils.timezone_helpers import to_tehran_time
+                return_str = to_tehran_time(acc.expected_return_time, "%H:%M")
                 
             status_val = acc.status.value if hasattr(acc.status, 'value') else str(acc.status)
             text += (
@@ -719,9 +724,6 @@ async def account_health_panel(callback: types.CallbackQuery, session: AsyncSess
 @router.callback_query(F.data.startswith("unblock_acc_") & F.data.endswith("/"))
 async def unblock_account_handler(callback: types.CallbackQuery, session: AsyncSession) -> None:
     """🩺 فاز ۱۰: بازگردانی دستی اکانت از حالت مسدود به اکتیو"""
-    if callback.from_user.id != config.ADMIN_ID:
-        return await safe_callback_answer(callback, "⛔️ دسترسی غیرمجاز.", show_alert=True)
-        
     acc_id = int(callback.data.replace("unblock_acc_", "").replace("/", ""))
     
     # استفاده از تابع استاندارد change_account_status برای تغییر اتمیک و ثبت لاگ

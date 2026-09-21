@@ -12,6 +12,8 @@ from workers.sender import mark_global_slowdown
 
 logger = logging.getLogger(__name__)
 
+LIMIT_FLOOD_WAIT = "flood_wait"
+
 async def register_account_limit(
     session: AsyncSession,
     account_id: int,
@@ -23,29 +25,25 @@ async def register_account_limit(
     """
     مدیریت متمرکز لیمیت‌های تلگرام: ثبت استراحت در دیتابیس، کاهش بار سراسری، 
     ارسال گزارش تجمیعی، و اجرای خودکار ربات اسپم.
-    تراکنش‌های حیاتی ایمن‌سازی شده‌اند تا از Rollback‌های تصادفی جلوگیری شود.
+    🟢 تغییرات: استقلال سشن جهت جلوگیری از تداخل تراکنش با حلقه ارسال دیسپچر.
     """
+    from database.engine import async_session  # وارد کردن در سطح تابع برای اطمینان
     account_tag = f"user_{account_id}/"
     error_msg = ""
     
-    # --- گرفتن تنظیمات جهانی برای هر دو قابلیت (محافظت هوشمند و مقدار جریمه) ---
+    # --- گرفتن تنظیمات جهانی با سشن مستقل ---
     try:
-        gs = await session.scalar(select(GlobalSettings).limit(1))
-        
-        # ۱. وضعیت روشن/خاموش بودن محافظت هوشمند
-        smart_anti_ban_enabled = getattr(gs, 'smart_anti_ban', True) if gs else True
-        
-        # ۲. مقدار جریمه اسپم (جلوگیری از مقدار ۰ و استفاده از حداقل امن)
-        val = getattr(gs, 'spam_penalty_days', None) if gs else None
-        user_penalty_days = max(int(val) if val is not None else 3, 1) # حداقل ۱ روز گارانتی می‌شود
+        async with async_session() as indep_session:
+            gs = await indep_session.scalar(select(GlobalSettings).limit(1))
+            smart_anti_ban_enabled = getattr(gs, 'smart_anti_ban', True) if gs else True
+            val = getattr(gs, 'spam_penalty_days', None) if gs else None
+            user_penalty_days = max(int(val) if val is not None else 3, 1) # حداقل ۱ روز گارانتی می‌شود
     except Exception as e:
         logger.error(f"Failed to fetch GlobalSettings in limit_handler: {e}")
-        gs = None
         smart_anti_ban_enabled = True
         user_penalty_days = 3
-    # -------------------------------------------------------------------------
 
-    # 🛡 فاز ۹: Circuit Breaker - فقط در صورت روشن بودن محافظت اجرا می‌شود
+    # 🛡 فاز ۹: Circuit Breaker - ایمن‌سازی TTLها (آیتم ۶)
     if smart_anti_ban_enabled:
         from workers.sender import _get_redis
         try:
@@ -56,69 +54,72 @@ async def register_account_limit(
             if current_speed != "safe":
                 if is_banned:
                     bans = await redis.incr("cb:bans")
-                    if bans == 1: await redis.expire("cb:bans", 600) # 10 دقیقه
+                    if bans == 1 or await redis.ttl("cb:bans") == -1: 
+                        await redis.expire("cb:bans", 600) # 10 دقیقه
                     if bans >= 2:
-                        await redis.set("settings:speed_mode", "fast")
-                        await report_admin_error("⚠️ <b>مدار قطع‌کن (Circuit Breaker) فعال شد!</b>\n۲ بن واقعی در ۱۰ دقیقه تشخیص داده شد. سرعت سیستم به‌طور خودکار به `fast` کاهش یافت.")
+                        await redis.set("settings:speed_mode", "safe", ex=30)
+                        await report_admin_error("⚠️ <b>مدار قطع‌کن (Circuit Breaker) فعال شد!</b>\n۲ بن واقعی در ۱۰ دقیقه تشخیص داده شد. سرعت سیستم به‌طور خودکار به حالت `safe` (ایمن) کاهش یافت.")
                 
-                if limit_type == "flood_wait":
+                # استفاده از نام متغیر ثابت LIMIT_FLOOD_WAIT یا رشته اصلی
+                if limit_type in ("flood_wait", getattr(globals(), "LIMIT_FLOOD_WAIT", "flood_wait")):
                     consec = await redis.incr(f"cb:consec_fw:{account_id}")
-                    if consec == 1: await redis.expire(f"cb:consec_fw:{account_id}", 3600)
+                    if consec == 1 or await redis.ttl(f"cb:consec_fw:{account_id}") == -1: 
+                        await redis.expire(f"cb:consec_fw:{account_id}", 3600)
                     if consec >= 3:
-                        await redis.set("settings:speed_mode", "fast")
-                        logger.warning(f"Circuit Breaker: Worker {account_id} hit 3 consec FloodWaits. System dropped to fast.")
+                        await redis.set("settings:speed_mode", "safe", ex=30)
+                        logger.warning(f"Circuit Breaker: Worker {account_id} hit 3 consec FloodWaits. System dropped to safe.")
                     
                     if wait_seconds > 300:
                         fw300 = await redis.incr("cb:fw_300")
-                        if fw300 == 1: await redis.expire("cb:fw_300", 3600)
+                        if fw300 == 1 or await redis.ttl("cb:fw_300") == -1: 
+                            await redis.expire("cb:fw_300", 3600)
                         if fw300 >= 2:
-                            await redis.set("settings:speed_mode", "fast")
-                            await report_admin_error("⚠️ <b>مدار قطع‌کن فعال شد!</b>\n۲ توقف FloodWait بیش از ۳۰۰ ثانیه در ۱ ساعت. سرعت به `fast` کاهش یافت.")
+                            await redis.set("settings:speed_mode", "safe", ex=30)
+                            await report_admin_error("⚠️ <b>مدار قطع‌کن فعال شد!</b>\n۲ توقف FloodWait بیش از ۳۰۰ ثانیه در ۱ ساعت. سرعت به‌طور خودکار به حالت `safe` (ایمن) کاهش یافت.")
         except Exception as cb_err:
             logger.error(f"Circuit breaker failed to evaluate: {cb_err}")
     else:
         logger.info(f"Smart Anti-Ban is DISABLED. Circuit breaker bypassed for {account_tag}.")
 
-    # ۱. بخش حیاتی: ثبت جریمه اصلی (بن شدن یا Floor Wait)
+    # ۱. بخش حیاتی: ثبت جریمه اصلی (استفاده از سشن مستقل - آیتم ۵)
     try:
-        if is_banned:
-            await session.execute(
-                update(Account).where(Account.id == account_id).values(is_banned=True)
-            )
-            error_msg = f"⛔️ <b>بن اکانت!</b>\nاکانت <code>{account_tag}</code> بن یا دی‌اکتیو شده است."
+        async with async_session() as indep_session:
+            if is_banned or limit_type == "banned":
+                await indep_session.execute(
+                    update(Account).where(Account.id == account_id).values(is_banned=True)
+                )
+                error_msg = f"⛔️ <b>بن اکانت!</b>\nاکانت <code>{account_tag}</code> بن یا دی‌اکتیو شده است."
 
-        elif limit_type == "flood_wait":
-            await apply_adaptive_flood_wait(session, account_id, wait_seconds)
-            error_msg = f"⏳ <b>توقف FloodWait</b>\nاکانت <code>{account_tag}</code> به مدت {wait_seconds} ثانیه محدود شد."
+            elif limit_type in ("flood_wait", getattr(globals(), "LIMIT_FLOOD_WAIT", "flood_wait")):
+                await apply_adaptive_flood_wait(indep_session, account_id, wait_seconds)
+                error_msg = f"⏳ <b>توقف FloodWait</b>\nاکانت <code>{account_tag}</code> به مدت {wait_seconds} ثانیه محدود شد."
 
-        elif limit_type == "peer_flood":
-            penalty_seconds = user_penalty_days * 86400
-            await apply_adaptive_flood_wait(session, account_id, penalty_seconds)
-            
-            # --- ترمز سراسری مشروط به روشن بودن محافظت هوشمند ---
-            if smart_anti_ban_enabled:
-                await mark_global_slowdown(300) # پنج دقیقه ترمز سراسری برای احتیاط
-                error_msg = f"🚫 <b>محدودیت اسپم (PeerFlood)</b>\nاکانت <code>{account_tag}</code> اسپم شد! استراحت: {user_penalty_days} روز.\nدر حال بررسی با @spambot..."
-            else:
-                error_msg = f"🚫 <b>محدودیت اسپم (PeerFlood)</b>\nاکانت <code>{account_tag}</code> اسپم شد! استراحت: {user_penalty_days} روز (ترمز سراسری به دلیل غیرفعال بودن محافظت هوشمند، اعمال نشد)."
+            elif limit_type == "peer_flood":
+                penalty_seconds = user_penalty_days * 86400
+                await apply_adaptive_flood_wait(indep_session, account_id, penalty_seconds)
+                
+                if smart_anti_ban_enabled:
+                    await mark_global_slowdown(300)
+                    error_msg = f"🚫 <b>محدودیت اسپم (PeerFlood)</b>\nاکانت <code>{account_tag}</code> اسپم شد! استراحت: {user_penalty_days} روز.\nدر حال بررسی با @spambot..."
+                else:
+                    error_msg = f"🚫 <b>محدودیت اسپم (PeerFlood)</b>\nاکانت <code>{account_tag}</code> اسپم شد! استراحت: {user_penalty_days} روز (ترمز سراسری اعمال نشد)."
 
-        # کامیتِ قطعی برای مقادیر حیاتی
-        await session.commit()
+            # کامیت قطعی صرفاً روی سشن مستقل
+            await indep_session.commit()
     except Exception as e:
         logger.error(f"Critical Error in register_account_limit for {account_tag}: {e}")
-        await session.rollback()
-        return  # اگر فیلدهای حیاتی ذخیره نشد، ادامه نمی‌دهیم.
+        return  # بدون آسیب زدن به سشن اصلی دیسپچر، خارج می‌شویم
 
-    # ۲. بخش متادیتا: ثبت last_limit_type در تراکنش مجزا
+    # ۲. بخش متادیتا: ثبت last_limit_type در تراکنش مستقل مجزا
     try:
-        limit_val = "banned" if is_banned else limit_type
-        await session.execute(
-            update(Account).where(Account.id == account_id).values(last_limit_type=limit_val)
-        )
-        await session.commit()
+        async with async_session() as indep_session:
+            limit_val = "banned" if is_banned else limit_type
+            await indep_session.execute(
+                update(Account).where(Account.id == account_id).values(last_limit_type=limit_val)
+            )
+            await indep_session.commit()
     except Exception as e:
-        logger.warning(f"Metadata update failed in register_account_limit for {account_tag} (safe to ignore if pending migration): {e}")
-        await session.rollback()
+        logger.warning(f"Metadata update failed in register_account_limit for {account_tag}: {e}")
 
     # ۳. تریگر چک وضعیت اسپم بات در بک‌گراند و ارسال گزارش
     if limit_type == "peer_flood" and client:
@@ -126,7 +127,6 @@ async def register_account_limit(
 
     if error_msg:
         await report_admin_error(error_msg)
-
 
 async def _run_spambot_check(client: Client, account_id: int):
     """اجرای چک اسپم‌بات و ذخیره نتیجه در دیتابیس با مدیریت مجزای تراکنش."""
@@ -148,10 +148,19 @@ async def _run_spambot_check(client: Client, account_id: int):
                     # 🛡 همگام‌سازی: اعمال محدودیت زمانی اسپم‌بات روی flood_wait_until تا دیسپچر متوقف بماند
                     update_vals["flood_wait_until"] = status["until"]
                 elif not status.get("restricted", False):
-                    # 🔥 بخش اضافه‌شده: پاک کردن جریمه و محدودیت اگر اکانت کاملاً آزاد است
                     update_vals["restricted_until"] = None
                     update_vals["flood_wait_until"] = None
                     update_vals["last_limit_type"] = None
+                    update_vals["status"] = "active"
+                    update_vals["status_reason"] = "SpamBot clear"
+                    
+                    old_status_val = await session.scalar(select(Account.status).where(Account.id == account_id))
+                    old_status = old_status_val.value if hasattr(old_status_val, 'value') else str(old_status_val) if old_status_val else "blocked"
+                    
+                    from database.models import WorkerEvent
+                    session.add(WorkerEvent(
+                        account_id=account_id, old_status=old_status, new_status="active", reason="spambot-clear"
+                    ))
                     
                 await session.execute(
                     update(Account).where(Account.id == account_id).values(**update_vals)

@@ -285,8 +285,9 @@ async def classic_confirm_and_start(message: types.Message, state: FSMContext, s
     admin_builder.adjust(2)
     
     try:
-        await message.bot.send_message(
-            chat_id=config.ADMIN_ID,
+        from utils.admin_broadcast import broadcast_to_admins_with_keyboard
+        await broadcast_to_admins_with_keyboard(
+            bot=message.bot,
             text=(
                 f"🛎 <b>سفارش استخراج جدید نیازمند تایید</b>\n\n"
                 f"🆔 شناسه: <code>{new_order.id}</code>\n"
@@ -295,8 +296,7 @@ async def classic_confirm_and_start(message: types.Message, state: FSMContext, s
                 f"🎯 تارگت: <code>{html.escape(target_link)}</code>\n\n"
                 f"<i>لطفاً جهت ورود این سفارش به صف اجرا آن را تایید کنید.</i>"
             ),
-            reply_markup=admin_builder.as_markup(),
-            disable_web_page_preview=True
+            keyboard=admin_builder.as_markup()
         )
     except Exception as e:
         logger.error(f"Failed to send extraction approval request to admin: {e}")
@@ -595,3 +595,77 @@ async def show_extraction_dashboard(callback: types.CallbackQuery, state: FSMCon
         _active_refresh_tasks[task_key] = asyncio.create_task(
             _auto_refresh_dashboard_task(sent_message, order.id, callback.bot)
         )
+
+
+# ==========================================
+# 📄 فاز ۵/۶: هندلر درخواست استخراج از طریق پیام‌ها (Fallback دستی)
+# ==========================================
+@router.callback_query(F.data.startswith("new_extract_messages_") & F.data.endswith("/"))
+async def confirm_new_extract_messages(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    await safe_callback_answer(callback)
+    order_id_str = callback.data.replace("new_extract_messages_", "").replace("/", "")
+    
+    if not order_id_str.isdigit():
+        return await safe_edit_message(callback.message, "❌ شناسه سفارش نامعتبر است.")
+        
+    order_id = int(order_id_str)
+    
+    old_order = await session.get(Order, order_id)
+    if not old_order:
+        return await callback.message.answer("❌ سفارش قبلی یافت نشد.")
+        
+    import string
+    import random
+    from config import config
+    
+    chars = string.ascii_uppercase + string.digits
+    tracking_code = f"EXT-{''.join(random.choices(chars, k=6))}"
+    
+    new_order = Order(
+        order_type="extract",
+        target_data=old_order.target_data,
+        filter_type="messages",
+        status=OrderStatus.pending,
+        tracking_code=tracking_code,
+        user_id=callback.from_user.id,
+        is_approved=False,
+        speed_mode=old_order.speed_mode,
+    )
+    session.add(new_order)
+    await session.commit()
+    
+    await callback.message.answer(
+        f"✅ <b>سفارش استخراج جایگزین ثبت شد!</b>\n\n"
+        f"🆔 کد رهگیری: <code>{tracking_code}</code>\n"
+        f"🎯 تارگت: {html.escape(old_order.target_data or '')}\n"
+        f"⚙️ استراتژی: <b>پیام‌ها (messages)</b>\n\n"
+        "⏳ سفارش در انتظار تایید ادمین است."
+    )
+    
+    admin_builder = InlineKeyboardBuilder()
+    admin_builder.button(text="✅ تایید و شروع", callback_data=f"approve_order_{new_order.id}/")
+    admin_builder.button(text="❌ رد سفارش", callback_data=f"reject_order_{new_order.id}/")
+    admin_builder.adjust(2)
+    
+    try:
+        from utils.admin_broadcast import broadcast_to_admins_with_keyboard
+        await broadcast_to_admins_with_keyboard(
+            bot=callback.bot,
+            text=(
+                f"🛎 <b>سفارش استخراج جدید (فال‌بک دستی) نیازمند تایید</b>\n\n"
+                f"🆔 شناسه: <code>{new_order.id}</code>\n"
+                f"🎟 کد رهگیری: <code>{new_order.tracking_code}</code>\n"
+                f"📊 استراتژی: <b>پیام‌ها</b>\n"
+                f"🎯 تارگت: <code>{html.escape(old_order.target_data or '')}</code>\n\n"
+                f"<i>این سفارش به عنوان جایگزین سفارش مخفیِ ({old_order.id}) ثبت شده است.</i>"
+            ),
+            keyboard=admin_builder.as_markup()
+        )
+    except Exception as e:
+        logger.error(f"Failed to send manual fallback extraction approval request to admin: {e}")
+        
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+

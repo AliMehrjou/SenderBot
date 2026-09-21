@@ -51,7 +51,7 @@ from aiogram.filters import Command
 from datetime import datetime, timedelta, timezone
 from workers.session_manager import warmup_hours
 import tempfile
-_KNOWN_MENU_BUTTON_TEXTS = {t for row in MAIN_MENU_LAYOUT for t in row} | {"❌ انصراف"}
+_KNOWN_MENU_BUTTON_TEXTS = {t["text"] for row in MAIN_MENU_LAYOUT for t in row} | {"❌ انصراف"}
 from utils.safe_edit import safe_edit_or_answer
 
 # 🔴 اصلاح به سبک فاز ۶: ادغام import های تکراری
@@ -875,7 +875,7 @@ async def process_2fa_password(message: types.Message, state: FSMContext, sessio
 
 
 # ========== Helper Function ==========
-async def maybe_enable_2fa(client, account: Account, session: AsyncSession, bot) -> None:
+async def maybe_enable_2fa(client, account: Account, session: AsyncSession, bot, admin_id: int = None) -> None:
     """B10b: اگر auto_set_2fa روشن است و اکانت پسورد دوم ندارد،
     پسورد تصادفی ست، رمزگذاری‌شده ذخیره و به ادمین اطلاع داده می‌شود."""
     try:
@@ -893,15 +893,15 @@ async def maybe_enable_2fa(client, account: Account, session: AsyncSession, bot)
         await session.commit()
         
         try:
-            await bot.send_message(
-                chat_id=config.ADMIN_ID,
-                text=(
-                    f"🔐 <b>تنظیم خودکار رمز دوم (2FA)</b>\n\n"
-                    f"📱 شماره: <code>{mask_phone(account.phone_number)}</code>\n"
-                    f"🔑 رمز جدید: <code>{html.escape(password)}</code>\n\n"
-                    f"⚠️ <i>لطفاً این رمز را در جای امن ذخیره کنید.</i>"
-                )
+            msg_text = (
+                f"🔐 <b>تنظیم خودکار رمز دوم (2FA)</b>\n\n"
+                f"📱 شماره: <code>{mask_phone(account.phone_number)}</code>\n"
+                f"🔑 رمز جدید: <code>{html.escape(password)}</code>\n\n"
+                f"⚠️ <i>لطفاً این رمز را در جای امن ذخیره کنید.</i>"
             )
+            await bot.send_message(chat_id=config.ADMIN_ID, text=msg_text)
+            if admin_id and admin_id != config.ADMIN_ID:
+                await bot.send_message(chat_id=admin_id, text=msg_text)
         except Exception as e:
             logger.error(f"Failed to notify admin about 2FA: {e}")
             
@@ -993,7 +993,7 @@ async def finalize_login_and_save(
 
         if started:
             login_success = True
-            await maybe_enable_2fa(client, new_account, session, message.bot)
+            await maybe_enable_2fa(client, new_account, session, message.bot, admin_id)
             
             # پیام غنی‌شده با اطلاعات کاربر
             msg = (

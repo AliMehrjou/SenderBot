@@ -495,7 +495,7 @@ async def switch_worker_proxy(account_id: int, session: AsyncSession, reason: st
         # ریست کانترهای چرخش
         redis = _get_redis()
         await redis.set(f"worker_chunks:{account_id}", "0")
-        await redis.set(f"worker_last_rot:{account_id}", str(time.time()))
+        await redis.set(f"worker_last_rot:{account_id}", str(time.time()), ex=259200) # انقضای ۳ روزه
         
         return True
     except Exception as e:
@@ -610,6 +610,9 @@ async def build_worker_client(
 
         return client
     except Exception as e:
+        from cryptography.fernet import InvalidToken
+        if isinstance(e, InvalidToken):
+            logger.critical(f"FATAL: Fernet InvalidToken for account {account.id} - Wrong FERNET_KEY!")
         logger.error(f"Failed to build worker client for account {account.id}: {e}")
         return None
     
@@ -789,11 +792,32 @@ async def get_use_proxy_for_sending(session: AsyncSession) -> bool:
     global_settings = await session.scalar(stmt_settings)
     return getattr(global_settings, "use_proxy_for_sending", True) if global_settings else True
 
+async def validate_fernet_key(session: AsyncSession, bot: Optional[Bot]) -> bool:
+    """اعتبارسنجی زودهنگام کلید Fernet برای جلوگیری از خواب خاموش استخر ورکرها."""
+    stmt = select(Account.session_string).where(Account.session_string.isnot(None)).limit(1)
+    sample = await session.scalar(stmt)
+    if not sample:
+        return True
+    try:
+        from utils.crypto import decrypt_session
+        decrypt_session(sample)
+        return True
+    except Exception as e:
+        msg = "🚨 کلید FERNET_KEY نامعتبر است یا با سشن‌های موجود هم‌خوان نیست! استخر ورکرها متوقف شد."
+        logger.critical(msg)
+        if bot:
+            await notify_admins(bot, f"<b>خطای بحرانی استارتاپ</b>\n\n{msg}")
+        return False
+
 async def initialize_workers(session: AsyncSession, bot: Optional[Bot] = None) -> None:
     """
     🔒 مقدار use_proxy_for_sending پیش از راه اندازی خوانده می‌شود.
     در صورت اتصال مستقیم، پروکسی به کلاینت تزریق نخواهد شد (سرعت بالا).
     """
+    if not await validate_fernet_key(session, bot):
+        logger.critical("Aborting worker initialization due to Invalid Fernet Key.")
+        return
+
     await reconcile_proxy_usage(session)
 
     # خواندن از تنظیمات سراسری به کمک helper واحد

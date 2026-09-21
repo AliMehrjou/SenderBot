@@ -26,6 +26,7 @@ async def report_admin_error(error_text: str):
         # کلید admin_errors:buffer به عنوان یک دیکشنری در ردیس عمل می‌کند
         # و در صورت تکرار یک خطا، فقط شمارنده آن بالا می‌رود.
         await redis.hincrby("admin_errors:buffer", error_text, 1)
+        await redis.expire("admin_errors:buffer", 86400)  # TTL معادل ۲۴ ساعت
     except Exception as e:
         logger.error(f"Failed to buffer admin error: {e}")
 
@@ -56,7 +57,8 @@ async def error_aggregator_loop(bot: Bot):
             if len(final_msg) > 4000:
                 final_msg = final_msg[:4000] + "\n... (پیام به دلیل محدودیت طول کوتاه شد)"
                 
-            await bot.send_message(chat_id=config.ADMIN_ID, text=final_msg)
+            from utils.admin_broadcast import broadcast_to_admins
+            await broadcast_to_admins(bot, text=final_msg)
             
         except asyncio.CancelledError:
             break

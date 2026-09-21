@@ -35,72 +35,109 @@ from workers.session_manager import (
 logger = logging.getLogger(__name__)
 
 
+
 async def auto_health_check_loop(worker_pool: dict, bot: Bot) -> None:
-    """تسک پس‌زمینه برای بررسی سلامت روزانه پراکسی‌ها و کلاینت‌ها"""
+    """تسک پس‌زمینه برای بررسی سلامت روزانه و گزارش تفکیک‌شده اکانت‌ها (تنظیم‌شده برای ۹ صبح تهران)"""
     logger.info("Auto Health Checker Loop started. Waiting 60 seconds for workers to boot...")
     
-    # فاز ۲: تاخیر اولیه یک دقیقه‌ای برای بالا آمدن ورکرها
     await asyncio.sleep(180)
+    
+    from utils.timezone_helpers import get_current_tehran_time
+    from datetime import timedelta
+    
+    first_run = True
     
     while True:
         try:
-            total_workers = len(worker_pool)
+            if not first_run:
+                # محاسبه زمان خواب تا ۹:۰۰ صبح به وقت تهران
+                now_tehran = get_current_tehran_time()
+                next_run = now_tehran.replace(hour=9, minute=0, second=0, microsecond=0)
+                if now_tehran >= next_run:
+                    next_run += timedelta(days=1)
+                    
+                sleep_seconds = (next_run - now_tehran).total_seconds()
+                logger.info(f"Health Checker sleeping for {sleep_seconds} seconds until {next_run.strftime('%Y-%m-%d %H:%M:%S')} Tehran time.")
+                await asyncio.sleep(sleep_seconds)
+                
+            first_run = False
             
-            # --- فیکس فاز ۴: استخراج آیدی ورکرهای قطعی ---
-            # 🛡 فاز ۴ (BUG-26): iterate روی snapshot (list(...)) — حلقه‌ی Reconnect
-            # همزمان ممکن است pop/insert کند ← "dictionary changed size during iteration"
-            disconnected_ids = [acc_id for acc_id, client in list(worker_pool.items()) if not client.is_connected]
-            disconnected_count = len(disconnected_ids)
-            connected_workers = total_workers - disconnected_count
-            
-            disconnected_details = ""
-            if disconnected_ids:
-                try:
-                    # استفاده از سشن برای استخراج شماره تلفن‌ها از دیتابیس
-                    async with async_session() as db_session:
-                        stmt = select(Account.id, Account.phone_number).where(Account.id.in_(disconnected_ids))
-                        result = await db_session.execute(stmt)
-                        accounts = result.all()
+            async with async_session() as db_session:
+                from workers.sender import _get_redis
+                from utils.account_display import get_account_display_status
+                
+                redis_client = _get_redis()
+                stmt = select(Account).where(Account.session_string.is_not(None))
+                registered_accs = (await db_session.scalars(stmt)).all()
+                
+                pipe = redis_client.pipeline()
+                for acc in registered_accs:
+                    pipe.exists(f"chunk_cooldown:{acc.id}")
+                redis_results = await pipe.execute()
+                
+                now_utc = datetime.now(timezone.utc)
+                
+                connected_workers = 0
+                ready_count = 0
+                temp_rest_count = 0
+                db_rest_count = 0
+                limited_banned_count = 0
+                disconnected_ids = []
+                
+                for idx, acc in enumerate(registered_accs):
+                    is_conn = acc.id in worker_pool and getattr(worker_pool[acc.id], "is_connected", False)
+                    if is_conn:
+                        connected_workers += 1
+                    else:
+                        disconnected_ids.append(acc.id)
                         
-                        # --- FIX M8: Mask phone numbers in the daily report ---
-                        details_list = [f"▫️ آیدی {acc.id} (<code>{mask_phone(acc.phone_number)}</code>)" for acc in accounts]
-                        # ------------------------------------------------------
+                    disp = get_account_display_status(acc, is_conn, bool(redis_results[idx]), now_utc)
+                    cat = disp["cat"]
+                    
+                    if cat == "READY": ready_count += 1
+                    elif cat == "COOLDOWN_REDIS": temp_rest_count += 1
+                    elif cat == "COOLDOWN_DB": db_rest_count += 1
+                    elif cat in ("BANNED", "BLOCKED", "RESTRICTED", "LIMITED"): limited_banned_count += 1
+                
+                disconnected_details = ""
+                if disconnected_ids:
+                    try:
+                        stmt_details = select(Account.id, Account.phone_number).where(Account.id.in_(disconnected_ids))
+                        accounts = (await db_session.execute(stmt_details)).all()
                         
-                        # گارد محدودیت طول پیام برای قطعی‌های گسترده
+                        details_list = [f"▫️ آیدی {a.id} (<code>{mask_phone(a.phone_number)}</code>)" for a in accounts]
                         if len(details_list) > 30:
-                            details_list = details_list[:30]
-                            details_list.append("▫️ ... و موارد دیگر")
+                            details_list = details_list[:30] + ["▫️ ... و موارد دیگر"]
                             
                         if details_list:
-                            disconnected_details = "\n📋 <b>لیست ورکرهای قطعی:</b>\n" + "\n".join(details_list) + "\n"
-                except Exception as db_err:
-                    logger.error(f"Failed to fetch disconnected accounts details: {db_err}")
-                    disconnected_details = f"\n📋 <b>لیست آیدی‌های قطعی:</b> {', '.join(map(str, disconnected_ids))}\n"
-            # -----------------------------------------------------
-            
+                            disconnected_details = "\n📋 <b>لیست اکانت‌های قطعی:</b>\n" + "\n".join(details_list) + "\n"
+                    except Exception as db_err:
+                        logger.error(f"Failed to fetch disconnected details: {db_err}")
+                        disconnected_details = f"\n📋 <b>لیست آیدی‌های قطعی:</b> {', '.join(map(str, disconnected_ids))}\n"
+                        
             report_text = (
                 "🩺 <b>گزارش روزانه سلامت موتور سندر</b>\n\n"
-                f"🟢 <b>ورکرهای آنلاین و سالم:</b> <code>{connected_workers}</code>\n"
-                f"🔴 <b>ورکرهای قطع یا بن شده:</b> <code>{disconnected_count}</code>\n"
-                f"🌐 <b>کل اکانت‌های در استخر:</b> <code>{total_workers}</code>\n"
-                f"{disconnected_details}\n"
-                "<i>💡 برای جزئیات بیشتر می‌توانید از منوی اصلی وارد بخش «📈 آمار» شوید.</i>"
+                f"🟢 <b>متصل (حافظه RAM):</b> <code>{connected_workers}</code>\n"
+                f" ┣ ♻️ آماده ارسال: <code>{ready_count}</code>\n"
+                f" ┣ 💤 استراحت موقت: <code>{temp_rest_count}</code>\n"
+                f" ┗ 💤 استراحت (DB): <code>{db_rest_count}</code>\n\n"
+                f"🔴 <b>محدود/مسدود اسپم:</b> <code>{limited_banned_count}</code>\n"
+                f"⚠️ <b>آفلاین (قطع از تلگرام):</b> <code>{len(disconnected_ids)}</code>\n"
+                f"🌐 <b>کل اکانت‌های ثبت‌شده:</b> <code>{len(registered_accs)}</code>\n"
+                f"{disconnected_details}"
+                "<i>💡 وضعیت دقیق هر اکانت در «لیست اکانت‌ها» هم‌اکنون هماهنگ است.</i>"
             )
             
-            # فاز ۳: ارسال گزارش به ادمین‌ها (ADMIN_ID از config + ساب‌ادمین‌های
-            # جدول Admin) از طریق تابع مشترک notify_admins
             sent_count = await notify_admins(bot, report_text)
             if sent_count:
                 logger.info(f"Daily Health Check report sent to {sent_count} admin(s).")
-            
-            # فاز ۲: خواب ۲۴ ساعته در انتهای حلقه
-            await asyncio.sleep(24 * 3600)
             
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Error in Health Check loop: {e}")
             await asyncio.sleep(60)
+
 
 # ==========================================
 # 🔁 RECONNECT خودکار ورکرها (هر ۵ دقیقه)
@@ -128,32 +165,44 @@ async def auto_reconnect_loop(worker_pool: dict, bot: Bot) -> None:
             added_ids = []
 
             # ---------------------------------------------------------
-            # بخش ۰: بازگردانی اتوماتیک اکانت‌هایی که زمان Cooldown آنها تمام شده
+            # بخش ۰: بازگردانی اتوماتیک اکانت‌هایی که زمان Cooldown آنها تمام شده و اکانت‌های Blocked رفع‌محدودیت‌شده
             # ---------------------------------------------------------
             async with async_session() as db_session:
+                from sqlalchemy import or_, and_
                 from database.models import Account, AccountStatus, WorkerEvent
                 now_utc = datetime.now(timezone.utc)
+                
                 cooldown_accs = (await db_session.scalars(
                     select(Account).where(
                         Account.status == AccountStatus.cooldown,
                         Account.expected_return_time <= now_utc
                     )
                 )).all()
-                
                 for acc in cooldown_accs:
                     acc.status = AccountStatus.active
                     acc.status_reason = "Auto cooldown finished"
                     acc.consecutive_errors = 0
-                    db_session.add(WorkerEvent(
-                        account_id=acc.id, 
-                        old_status=AccountStatus.cooldown.value, 
-                        new_status=AccountStatus.active.value, 
-                        reason="Cooldown expired"
-                    ))
+                    db_session.add(WorkerEvent(account_id=acc.id, old_status=AccountStatus.cooldown.value, new_status=AccountStatus.active.value, reason="Cooldown expired"))
                 
-                if cooldown_accs:
+                blocked_accs = (await db_session.scalars(
+                    select(Account).where(
+                        Account.status == AccountStatus.blocked,
+                        and_(
+                            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_utc),
+                            or_(Account.restricted_until.is_(None), Account.restricted_until <= now_utc)
+                        )
+                    )
+                )).all()
+                for acc in blocked_accs:
+                    acc.status = AccountStatus.active
+                    acc.status_reason = "Auto recovery (limits expired)"
+                    acc.consecutive_errors = 0
+                    db_session.add(WorkerEvent(account_id=acc.id, old_status=AccountStatus.blocked.value, new_status=AccountStatus.active.value, reason="expired-recovery"))
+                
+                if cooldown_accs or blocked_accs:
                     await db_session.commit()
-                    logger.info(f"HealthChecker: Automatically reactivated {len(cooldown_accs)} account(s) from cooldown.")
+                    if cooldown_accs: logger.info(f"HealthChecker: Reactivated {len(cooldown_accs)} from cooldown.")
+                    if blocked_accs: logger.info(f"HealthChecker: Reactivated {len(blocked_accs)} blocked accounts (expired-recovery).")
 
             # ---------------------------------------------------------
             # بخش ۱: restart ورکرهای قطعیِ موجود در استخر

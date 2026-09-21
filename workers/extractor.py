@@ -43,6 +43,7 @@ from utils.health_checker import report_proxy_result
 
 from utils.advanced_anti_ban import check_spambot_status
 from utils.seen_watcher import arm_seen_event, dismiss_seen_event, wait_for_seen
+from utils.limit_handler import LIMIT_FLOOD_WAIT
 
 # تعریف تایپ‌هینت سراسری
 progress_cb_type = Optional[Callable[[int, int], Awaitable[bool]]]
@@ -109,11 +110,12 @@ async def safe_join_chat(
             if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
                 logger.info(f"Worker {client.name} is already a member (direct check via chat_id_hint).")
                 chat_obj = await client.get_chat(chat_id_hint)
-                return ("success", chat_obj, False)
-        except UserNotParticipant:  # 🟢 اصلاح شد
-            if not profile.rejoin_on_redispatch:
-                logger.warning(f"Worker {client.name} not member and rejoin_on_redispatch is False.")
-                return ("error", None, False)
+                return ("already_member", chat_obj, False)
+        except UserNotParticipant:  
+            # 🟢 اصلاح: اگر ربات از گروه ریمو و آنبن شده بود، به جای ارور دادن، اجازه می‌دهیم
+            # کد ادامه پیدا کند تا ربات دوباره روی لینک جوین/ریکوئست بزند.
+            logger.warning(f"Worker {client.name} not member (probably kicked/unbanned). Proceeding to rejoin...")
+            pass
         except Exception as e:
             logger.debug(f"Worker {client.name} direct member check failed: {e}")
 
@@ -154,29 +156,27 @@ async def safe_join_chat(
                 
                 # بررسی خاموش: آیا در این مدت درخواست تایید شده است؟
                 try:
-                    temp_chat = await client.get_chat(target_chat)
+                    # 🟢 اصلاح: متد get_chat لینک پرایوت را قبول نمی‌کند. اگر آیدی داریم از آن استفاده می‌کنیم.
+                    check_target = chat_id_hint if (chat_id_hint and is_private) else target_chat
+                    temp_chat = await client.get_chat(check_target)
                     if temp_chat and getattr(temp_chat, "id", None):
                         member = await client.get_chat_member(temp_chat.id, "me")
                         if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
                             logger.info(f"Worker {client.name} was approved for {target_chat} during cooldown!")
                             await redis_client.delete(cooldown_key)
                             return ("success", temp_chat, False)
-                        # --- 🟢 بخش اضافه شده: تشخیص رد شدن یا بلاک شدن ---
                         elif member.status in [ChatMemberStatus.BANNED, ChatMemberStatus.RESTRICTED]:
                             logger.info(f"Worker {client.name} was REJECTED for {target_chat} during cooldown!")
                             await redis_client.delete(cooldown_key)
                             return ("rejected", temp_chat, False)
-                        # ---------------------------------------------------
                 except UserNotParticipant:
-                    pass # هنوز درخواست در حالت انتظار است و تایید/رد نشده
+                    pass # هنوز درخواست در حالت انتظار است
                 except Exception as check_err:
                     logger.debug(f"Silent check during cooldown failed: {check_err}")
                     
-                # اگر هنوز تایید نشده، برمی‌گردیم تا دیسپچر بدون FloodWait خوردن، در چرخه بعدی بررسی کند
                 return ("pending_approval", None, False)
         except Exception as e:
             logger.error(f"Redis get cooldown failed: {e}")
-
     try:
         # 🛡 پلکانی‌سازی و سقف عضویت (Join Staggering & Rate Cap)
         if redis_client and worker_user_id:
@@ -281,11 +281,11 @@ async def safe_join_chat(
 
     except InviteRequestSent:  # 🟢 اصلاح شد
         logger.warning(f"Worker {client.name} sent join request to {target_chat}.")
-        # 🛑 تنظیم کول‌داون طولانی‌مدت (۲ ساعت) برای جلوگیری قطعی از اسپم شدن
+        # 🛑 تنظیم کول‌داون کوتاه‌مدت (۱۰ دقیقه) برای جلوگیری از فلادویت
         if redis_client:
             try:
-                await redis_client.set(cooldown_key, "1", ex=7200)
-                logger.info(f"Worker {client.name}: Cooldown of 7200s set for {target_chat} to prevent FloodWait.")
+                await redis_client.set(cooldown_key, "1", ex=600)
+                logger.info(f"Worker {client.name}: Cooldown of 600s set for {target_chat} to prevent FloodWait.")
             except Exception as e:
                 logger.error(f"Redis set cooldown failed: {e}")
         try:
@@ -320,7 +320,7 @@ async def safe_join_chat(
 
     await asyncio.sleep(random.uniform(profile.join_pause[0], profile.join_pause[1]))
     _report_proxy(client, True)
-    return ("success", chat_obj, joined_now)
+    return ("success" if joined_now else "already_member", chat_obj, joined_now)
 
 
 # ==========================================
@@ -354,10 +354,17 @@ async def iter_group_members(
     member_count = 0
     seen_ids = resume_seen_ids or set()
     retries = 3
+    offset = 0  # 🟢 حفظ آفست برای جلوگیری از اسکن مجددِ اعضای قبلی
 
     while retries > 0:
         try:
-            async for member in client.get_chat_members(chat_id, limit=config.EXTRACT_MEMBERS_API_LIMIT):
+            limit = config.EXTRACT_MEMBERS_API_LIMIT - offset
+            if limit <= 0:
+                break
+            
+            async for member in client.get_chat_members(chat_id, limit=limit):
+                offset += 1  # پیشروی آفست با هر عضو دریافتی
+                
                 if member.user and member.user.id in seen_ids:
                     continue
                 if member.user:
@@ -421,7 +428,10 @@ def _passes_filter(user: User, filter_type: Optional[str]) -> tuple[bool, str]:
     except:
         options = {}
 
-    if options.get("online_only") and user.status not in (UserStatus.ONLINE, UserStatus.RECENTLY):
+    # 🟢 پشتیبانی همزمان از فرمت JSON و فرمت کلاسیکِ استخراج
+    check_online = options.get("online_only") or (filter_type == "online")
+
+    if check_online and user.status not in (UserStatus.ONLINE, UserStatus.RECENTLY):
         return False, "آفلاین"
         
     if options.get("has_photo") and not getattr(user, "photo", None):
@@ -440,7 +450,7 @@ async def extract_active_users(
     chat_id_hint: Optional[int] = None,
     order_id: Optional[int] = None,
     speed_profile: Optional[SpeedProfile] = None # 🟢 این پارامتر به تابع اضافه شد
-) -> tuple[str, Optional[str], Optional[int], bool]:
+) -> tuple[str, Optional[str], Optional[int], bool, int]:
     from config import config
     logger.info(f"Worker {client.name} starting '{filter_type.upper()}' extraction for {group_link}")
 
@@ -448,8 +458,9 @@ async def extract_active_users(
     joined_now = False
     golden_usernames: Set[str] = set()
     is_partial = False
+    is_stopped = False
     total_yielded = 0
-    stats = {"total_scanned": 0, "filtered_out": 0}
+    stats = {"total_scanned": 0, "filtered_out": 0, "no_username": 0}
 
     try:
         join_status, chat_obj, joined_now = await safe_join_chat(
@@ -457,8 +468,8 @@ async def extract_active_users(
         )
         chat_id = getattr(chat_obj, "id", None)
         
-        if join_status != "success" or not chat_obj:
-            return (join_status, None, chat_id, joined_now)
+        if join_status not in ("success", "already_member") or not chat_obj:
+            return (join_status, None, chat_id, joined_now, 0)
 
         admin_ids: Set[int] = await _collect_admin_ids(client, chat_id)
         
@@ -484,6 +495,7 @@ async def extract_active_users(
                             last_report_time = now
                             if await progress_cb(total_yielded, total_yielded) is False:
                                 is_partial = True
+                                is_stopped = True
                                 break  # 🟢 خروج فوری از حلقه استخراج
 
                         passed, reason = _passes_filter(user, filter_type)
@@ -493,6 +505,7 @@ async def extract_active_users(
                             
                         # 🟢 فیلتر کردن کاربرانی که یوزرنیم ندارند
                         if not user.username:
+                            stats["no_username"] += 1
                             stats["filtered_out"] += 1
                             continue
                         
@@ -518,25 +531,29 @@ async def extract_active_users(
                         raise
 
                 if filter_type in ["users", "golden", "online"] and total_yielded == 0:
-                    # 🟢 B3: تمایز بین صفر نتیجه به‌دلیل خستگی FloodWait و مخفی بودن اعضا.
-                    if not is_partial:
+                    # 🟢 تبدیل هوشمندانه: وقتی تلگرام به جای ارور، فقط ادمین‌ها را برمی‌گرداند،
+                    # نتیجه صفر می‌شود. آن را مستقیماً به عنوان "لیست مخفی" در نظر می‌گیریم تا فال‌بک اتوماتیک به پیام‌ها فعال شود.
+                    if not is_partial and override_status != "members_hidden":
                         override_status = "members_hidden"
 
                 # 🟢 مکانیزم Fallback: تغییر مسیر به استخراج از پیام‌ها در صورت مخفی بودن اعضا
                 if override_status == "members_hidden":
-                    logger.info(f"Worker {client.name} applying fallback: switching to message extraction.")
-                    override_status = "success_fallback"
-                    filter_type = "messages"  # تغییر رفتار بلوک‌های بعدی به پردازش تاریخچه پیام‌ها
-                    is_partial = False
-                    if order_id:
-                        try:
-                            async with async_session() as session:
-                                await session.execute(
-                                    update(Order).where(Order.id == order_id).values(reject_reason="fallback_messages")
-                                )
-                                await session.commit()
-                        except Exception as e:
-                            logger.error(f"Failed to update order fallback status: {e}")
+                    if getattr(config, "EXTRACT_AUTO_FALLBACK_TO_MESSAGES", True):
+                        logger.info(f"Worker {client.name} applying fallback: switching to message extraction.")
+                        override_status = "success_fallback"
+                        filter_type = "messages"  # تغییر رفتار بلوک‌های بعدی به پردازش تاریخچه پیام‌ها
+                        is_partial = False
+                        if order_id:
+                            try:
+                                async with async_session() as session:
+                                    await session.execute(
+                                        update(Order).where(Order.id == order_id).values(reject_reason="fallback_messages")
+                                    )
+                                    await session.commit()
+                            except Exception as e:
+                                logger.error(f"Failed to update order fallback status: {e}")
+                    else:
+                        logger.info(f"Worker {client.name}: Members hidden, but EXTRACT_AUTO_FALLBACK_TO_MESSAGES is disabled.")
 
                 if total_yielded >= config.EXTRACT_MEMBERS_API_LIMIT:
                     is_partial = True
@@ -601,6 +618,7 @@ async def extract_active_users(
                                 if user.id not in admin_ids:
                                     # 🟢 فیلتر کردن آیدی‌های عددی و ادمین‌های بدون یوزرنیم
                                     if not user.username:
+                                        stats["no_username"] += 1
                                         continue
                                         
                                     target_id = f"@{user.username}"
@@ -614,6 +632,7 @@ async def extract_active_users(
                                 last_report_time = now
                                 if await progress_cb(total_yielded, message_count) is False:
                                     is_partial = True
+                                    is_stopped = True
                                     break  # 🟢 خروج فوری از حلقه پیام‌ها
                         break
                     except FloodWait as e:
@@ -631,9 +650,9 @@ async def extract_active_users(
         logger.error(f"Proxy/Network error during extraction for worker {client.name}: {e}")
         _report_proxy(client, False)
         if total_yielded > 0:
-            return ("partial_success", file_path, chat_id, joined_now)
+            return ("partial_success", file_path, chat_id, joined_now, stats["no_username"])
         if os.path.exists(file_path): os.remove(file_path)
-        return ("proxy_connection_error", None, chat_id, joined_now)
+        return ("proxy_connection_error", None, chat_id, joined_now, stats["no_username"])
 
     except Exception as e:
         logger.error(f"Critical error during extraction logic execution: {e}")
@@ -641,39 +660,55 @@ async def extract_active_users(
         err_name = str(e.__class__.__name__)
         if any(banned_err in err_name for banned_err in ["UserDeactivated", "UserDeactivatedBan", "AuthKeyUnregistered", "SessionRevoked"]):
             logger.error(f"Worker {client.name} BANNED during extraction.")
-            return ("limit:banned:0", file_path if total_yielded > 0 else None, chat_id, joined_now) 
+            return ("limit:banned:0", file_path if total_yielded > 0 else None, chat_id, joined_now, stats["no_username"]) 
         
         # 🟢 تشخیص هوشمندانه: اگر ارور مربوط به نداشتن ادمینی برای دیدن اعضا بود، یعنی لیست مخفی است
         if "ChatAdminRequired" in err_name:
-            return ("members_hidden", None, chat_id, joined_now)
+            return ("members_hidden", None, chat_id, joined_now, stats["no_username"])
             
         # 🟢 تعمیم منطق Partial: حفظ فایل اگر بخشی از اعضا استخراج شده‌اند
         if total_yielded > 0:
             logger.warning(f"Worker {client.name} crashed but extracted {total_yielded} users. Returning partial_success.")
-            return ("partial_success", file_path, chat_id, joined_now)
+            return ("partial_success", file_path, chat_id, joined_now, stats["no_username"])
             
         if os.path.exists(file_path): os.remove(file_path)
-        return ("error", None, chat_id, joined_now)
+        return ("error", None, chat_id, joined_now, stats["no_username"])
 
     if override_status == "members_hidden":
         if os.path.exists(file_path):
             os.remove(file_path)
-        return ("members_hidden", None, chat_id, joined_now)
+        return ("members_hidden", None, chat_id, joined_now, stats["no_username"])
 
-    # 🟢 B10: پاک شدن شرط تکراری override_status == "members_hidden" 
+    if override_status == "empty_filter_result":
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return ("empty_filter_result", None, chat_id, joined_now, stats["no_username"])
 
     if not golden_usernames:
         logger.warning(f"Extraction yielded no valid targets from {group_link}.")
         # حذف فایل خالی
         if os.path.exists(file_path):
             os.remove(file_path)
-        return ("error", None, chat_id, joined_now)
+            
+        if is_stopped:
+            return ("stopped", None, chat_id, joined_now, stats["no_username"])
+        elif override_status == "success_fallback":
+            return ("fallback_empty", None, chat_id, joined_now, stats["no_username"])
+        else:
+            return ("error", None, chat_id, joined_now, stats["no_username"])
 
-    final_status = "partial_success" if is_partial else "success"
-    if override_status == "success_fallback":
+    if is_stopped:
+        final_status = "stopped"
+    elif is_partial:
+        final_status = "partial_success"
+    else:
+        final_status = "success"
+
+    if override_status == "success_fallback" and not is_stopped:
         final_status = "success_fallback"
+
     _report_proxy(client, True)
-    return (final_status, file_path, chat_id, joined_now)
+    return (final_status, file_path, chat_id, joined_now, stats["no_username"])
 
 
 # ==========================================
@@ -687,7 +722,7 @@ _RESOLVE_TIMEOUT = 25.0   # ثانیه — گارد ضد-گیرکردنِ resolv
 # فیلترهایی که «پارتیشن‌بندی آفست» روی آن‌ها معنا دارد (لیست اعضای عادی).
 # فیلترهای کوچک (ادمین/بن‌شده/…) → مسیر تک‌کلاینت.
 # 💡 اگر مقادیر filter_type پروژه‌تان متفاوت است، این مجموعه را هم‌تراز کنید.
-_PARALLEL_SAFE_FILTERS = {None, "", "all", "recent", "members", "search"}
+_PARALLEL_SAFE_FILTERS = {None, "", "all", "recent", "members", "search", "users", "golden", "online"}
 
 
 def _member_to_line(member) -> Optional[str]:
@@ -731,27 +766,35 @@ async def _ensure_member(
     client: Client,
     chat_id_hint: Optional[int],
     group_link: str,
-    order_id: Optional[int] = None
+    order_id: Optional[int] = None,
+    speed_profile: Optional[SpeedProfile] = None
 ) -> tuple[Optional[int], bool, str]:
     """
-    🔄 تضمین عضویت یک ورکر در گروهِ هدف.
-    خروجی: (join_chat_id, joined_now, status)
-      status ∈ {"ok", "pending_approval", "error", "limit:floodwait:<sec>"}
+    🔄 تضمین عضویت یک ورکر در گروهِ هدف با رعایت دقیق پروفایل سرعت.
     """
-    # ۱) از قبل عضو است؟ (بستن R6)
+    from utils.speed_profile import SAFE_PROFILE
+    import random
+    import asyncio
+    
+    profile = speed_profile or SAFE_PROFILE
+
+    # ۱) از قبل عضو است؟ (بستن R6 و چک کردن rejoin_on_redispatch)
     if chat_id_hint is not None:
         try:
             m = await client.get_chat_member(chat_id_hint, "me")
             if m.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-                return chat_id_hint, False, "ok"
+                return chat_id_hint, False, "already_member"
         except UserNotParticipant:
-            pass  # عضو نیست → مسیر join
+            if not profile.rejoin_on_redispatch:
+                logger.warning(f"Worker {client.name} not member and rejoin_on_redispatch is False.")
+                return None, False, "error"
         except FloodWait as e:
-            return None, False, f"limit:floodwait:{int(e.value)}"
+            pad_min, pad_max = profile.floodwait_padding_join
+            return None, False, f"limit:{LIMIT_FLOOD_WAIT}:{int(e.value + random.uniform(pad_min, pad_max))}"
         except Exception:
             pass  # peer هنوز resolve نشده → با join ادامه می‌دهیم
 
-    # 🟢 بستن R4: پیش‌نویسلید کلیدهای Redis برای استخراج موازی
+    # 🟢 بستن R4: پیش‌نویس کلیدهای Redis برای استخراج موازی و اعمال Stagger/RateCap
     worker_user_id = None
     redis_client = None
     backup_key = None
@@ -773,12 +816,33 @@ async def _ensure_member(
         except Exception as e:
             logger.warning(f"Failed to pre-write Redis keys for R4 parallel (Order #{order_id}): {e}")
 
-    # ۲) عضویت از طریق لینک (resolve داخلی Pyrogram)
+    # 🛡 پلکانی‌سازی و سقف عضویت بر اساس پروفایل (Join Staggering & Rate Cap)
+    if redis_client and worker_user_id:
+        s_min, s_max = profile.join_stagger_seconds
+        if s_max > 0:
+            s_time = random.uniform(s_min, s_max)
+            locked = await redis_client.set(f"join_stagger:{worker_user_id}", "1", nx=True, px=int(s_time * 1000))
+            if not locked:
+                return None, False, f"limit:join_stagger:{int(s_time)}"
+        
+        if profile.join_rate_cap_per_hour > 0:
+            cap_key = f"join_rate:{worker_user_id}"
+            current_joins = await redis_client.get(cap_key)
+            if current_joins and int(current_joins) >= profile.join_rate_cap_per_hour:
+                return None, False, "limit:join_rate:3600"
+
+    # ۲) عضویت از طریق لینک
     joined_now = True
     try:
+        await asyncio.sleep(random.uniform(profile.pre_join_sleep[0], profile.pre_join_sleep[1]))
         await client.join_chat(group_link)
         
-        # 🟢 بستن R4: عضویت بلافاصله موفقیت‌آمیز بود (بدون ریکوئست)، پس کلیدها پاک می‌شوند
+        # ثبت موفقیت join در Rate Cap
+        if redis_client and worker_user_id and profile.join_rate_cap_per_hour > 0:
+            await redis_client.incr(f"join_rate:{worker_user_id}")
+            if await redis_client.ttl(f"join_rate:{worker_user_id}") == -1:
+                await redis_client.expire(f"join_rate:{worker_user_id}", 3600)
+                
         if redis_client and order_id and backup_key:
             try:
                 await redis_client.srem(backup_key, order_id)
@@ -789,7 +853,8 @@ async def _ensure_member(
                 pass
                 
     except FloodWait as e:
-        return None, False, f"limit:floodwait:{int(e.value)}"
+        pad_min, pad_max = profile.floodwait_padding_join
+        return None, False, f"limit:floodwait:{int(e.value + random.uniform(pad_min, pad_max))}"
     except UserAlreadyParticipant:
         joined_now = False
         if redis_client and order_id and backup_key:
@@ -806,27 +871,19 @@ async def _ensure_member(
         logger.warning(f"_ensure_member: join_chat failed for {group_link}: {e}")
         return None, False, "error"
 
-    # ۳) تعیین chat_id (اگر نداریم) + تأیید عضویت
-    target_chat_id = chat_id_hint
-    if target_chat_id is None:
-        try:
-            target_chat_id = (await client.get_chat(group_link)).id
-        except Exception:
-            target_chat_id = None
-
     if target_chat_id is not None:
         try:
             await client.get_chat_member(target_chat_id, "me")
-            return target_chat_id, joined_now, "ok"
+            return target_chat_id, joined_now, "success" if joined_now else "already_member"
         except UserNotParticipant:
-            # join «درخواستی» ارسال شده ولی هنوز تأیید نشده (کلیدهای Redis اینجا به کار می‌آیند)
             return None, False, "pending_approval"
         except FloodWait as e:
-            return None, False, f"limit:floodwait:{int(e.value)}"
+            pad_min, pad_max = profile.floodwait_padding_join
+            return None, False, f"limit:{LIMIT_FLOOD_WAIT}:{int(e.value + random.uniform(pad_min, pad_max))}"
         except Exception:
-            return target_chat_id, joined_now, "ok"
+            return target_chat_id, joined_now, "success" if joined_now else "already_member"
 
-    return None, joined_now, "ok"
+    return None, joined_now, "success" if joined_now else "already_member"
 
 async def extract_members_parallel(
     clients: List[Client],
@@ -846,6 +903,7 @@ async def extract_members_parallel(
         "total_collected": 0,
         "total_slices": 0,
         "failed_slices": 0,
+        "no_username_count": 0,
     }
 
     try:
@@ -854,13 +912,14 @@ async def extract_members_parallel(
         fail_threshold = 0.3
 
     async def _single(idx: int, client: Client) -> Dict:
-        status, path, join_chat_id, joined_now = await extract_active_users(
+        status, path, join_chat_id, joined_now, no_user_cnt = await extract_active_users(
             client, group_link, filter_type=filter_type, progress_cb=progress_cb,
             chat_id_hint=chat_id_hint, order_id=order_id, speed_profile=speed_profile
         )
         out = dict(result)
         out["status_code"] = status
         out["file_path"] = path
+        out["no_username_count"] = no_user_cnt
         out["join_records"] = [{"index": idx, "join_chat_id": join_chat_id, "joined_now": joined_now, "status": status}]
         if status.startswith("limit:"):
             parts = status.split(":")
@@ -870,15 +929,17 @@ async def extract_members_parallel(
     if not clients:
         return result
         
-    if len(clients) == 1 or filter_type not in _PARALLEL_SAFE_FILTERS:
+    # 🟢 پشتیبانی از فیلترهای ویزارد (JSON) در موتور موازی
+    is_valid_parallel = (filter_type in _PARALLEL_SAFE_FILTERS) or (isinstance(filter_type, str) and filter_type.startswith("{"))
+    if len(clients) == 1 or not is_valid_parallel:
         return await _single(0, clients[0])
 
     lead = clients[0]
     try:
         chat = await asyncio.wait_for(lead.get_chat(group_link), timeout=_RESOLVE_TIMEOUT)
     except FloodWait as e:
-        result["status_code"] = f"limit:floodwait:{int(e.value)}"
-        result["limit_records"].append({"index": 0, "limit_type": "floodwait", "wait_seconds": int(e.value)})
+        result["status_code"] = f"limit:{LIMIT_FLOOD_WAIT}:{int(e.value)}"
+        result["limit_records"].append({"index": 0, "limit_type": LIMIT_FLOOD_WAIT, "wait_seconds": int(e.value)})
         return result
     except Exception as e:
         logger.warning(f"parallel extract: chat resolve failed ({group_link}): {e} → single fallback")
@@ -897,14 +958,14 @@ async def extract_members_parallel(
         return result
     if lead_status.startswith("limit:"):
         result["status_code"] = lead_status
-        result["limit_records"].append({"index": 0, "limit_type": "floodwait", "wait_seconds": int(lead_status.rsplit(":", 1)[-1]) if ":" in lead_status else 0})
+        result["limit_records"].append({"index": 0, "limit_type": LIMIT_FLOOD_WAIT, "wait_seconds": int(lead_status.rsplit(":", 1)[-1]) if ":" in lead_status else 0})
         return result
     if lead_status == "error":
         result["status_code"] = "error"
         return result
 
     secondary_outcomes = await asyncio.gather(
-        *[asyncio.create_task(_ensure_member(clients[idx], chat.id, group_link, order_id=order_id)) for idx in range(1, len(clients))],
+        *[asyncio.create_task(_ensure_member(clients[idx], chat.id, group_link, order_id=order_id, speed_profile=speed_profile)) for idx in range(1, len(clients))],
         return_exceptions=True,
     )
 
@@ -915,10 +976,10 @@ async def extract_members_parallel(
             continue
         j_chat_id, joined_now, status = outcome
         result["join_records"].append({"index": idx, "join_chat_id": j_chat_id, "joined_now": joined_now, "status": status})
-        if status == "ok":
+        if status in ("success", "already_member"):
             roster.append((idx, clients[idx]))
         elif status.startswith("limit:"):
-            result["limit_records"].append({"index": idx, "limit_type": "floodwait", "wait_seconds": int(status.rsplit(":", 1)[-1]) if ":" in status else 0})
+            result["limit_records"].append({"index": idx, "limit_type": LIMIT_FLOOD_WAIT, "wait_seconds": int(status.rsplit(":", 1)[-1]) if ":" in status else 0})
 
     total = total_estimate
     if not total or int(total) <= 0:
@@ -961,8 +1022,8 @@ async def extract_members_parallel(
                 try:
                     page = await _fetch_page(client, chat.id, sl["current_offset"])
                 except FloodWait as e:
-                    sl["status"] = "floodwait"
-                    worker_states[idx] = ("floodwait", int(e.value))
+                    sl["status"] = LIMIT_FLOOD_WAIT
+                    worker_states[idx] = (LIMIT_FLOOD_WAIT, int(e.value))
                     _report_proxy(client, True)
                     return
                 except _NETWORK_ERRORS as e:
@@ -978,6 +1039,16 @@ async def extract_members_parallel(
 
                 if not page: break
                 for m in page:
+                    user = getattr(m, "user", None)
+                    if user and not user.username:
+                        sl["no_user_count"] = sl.get("no_user_count", 0) + 1
+                    
+                    # 🟢 ممیزی و اعمال فیلتر مشترک در مسیر ادغام موازی
+                    if user:
+                        passed, _ = _passes_filter(user, filter_type)
+                        if not passed:
+                            continue
+                        
                     line = _member_to_line(m)
                     if line: sink.append(line)
                     
@@ -1048,17 +1119,18 @@ async def extract_members_parallel(
     result["file_path"] = file_path
     result["total_collected"] = len(merged)
     result["total_slices"] = len(slices)
+    result["no_username_count"] = sum(sl.get("no_user_count", 0) for sl in slices)
 
     # ثبت محدودیت‌ها برای هر ورکری که در هر مرحله فِلاد-ویت خورده
     for sl in slices:
-        if sl["status"] == "floodwait":
-            w_state = worker_states.get(sl["idx"], ("floodwait", 0))
-            result["limit_records"].append({"index": sl["idx"], "limit_type": "floodwait", "wait_seconds": int(w_state[1] or 0)})
+        if sl["status"] == LIMIT_FLOOD_WAIT:
+            w_state = worker_states.get(sl["idx"], (LIMIT_FLOOD_WAIT, 0))
+            result["limit_records"].append({"index": sl["idx"], "limit_type": LIMIT_FLOOD_WAIT, "wait_seconds": int(w_state[1] or 0)})
 
     final_failed = [sl for sl in slices if sl["status"] not in ("ok", "stopped")]
     result["failed_slices"] = len(final_failed)
     fail_ratio = len(final_failed) / len(slices) if slices else 0
-    floodwait_slices = [sl for sl in slices if sl["status"] == "floodwait"]
+    floodwait_slices = [sl for sl in slices if sl["status"] == LIMIT_FLOOD_WAIT]
 
     # 🟢 ارزیابی وضعیت نهایی بر اساس آستانه خطا (B4-1)
     if merged:
@@ -1069,7 +1141,7 @@ async def extract_members_parallel(
     elif floodwait_slices and len(floodwait_slices) == len(slices):
         # 🟢 محاسبه دقیق تایمر انتظار بر اساس ماکزیممِ همه‌ی ورکرهای محدودشده
         max_wait = max((int(worker_states.get(sl["idx"], ("", 0))[1] or 0) for sl in floodwait_slices), default=0)
-        result["status_code"] = f"limit:floodwait:{max_wait}"
+        result["status_code"] = f"limit:{LIMIT_FLOOD_WAIT}:{max_wait}"
     else:
         result["status_code"] = "members_hidden"
 
@@ -1087,7 +1159,8 @@ async def extract_members_for_sending(
     filter_type: Optional[str] = None,
     progress_cb: Optional[Callable[[int, int], Awaitable[bool]]] = None,
     chat_id_hint: Optional[int] = None,
-    order_id: Optional[int] = None
+    order_id: Optional[int] = None,
+    speed_profile: Optional[SpeedProfile] = None
 ) -> tuple[str, Optional[List[str]], Optional[int], bool]:
     """
     Returns:
@@ -1098,11 +1171,13 @@ async def extract_members_for_sending(
     logger.info(f"Worker {client.name} resolving link-order members of {group_link} (filter: {filter_type})")
 
     # گام اول: Safe-Join (کد مشترک با مسیر استخراج)
+    # 🟢 تزریق پروفایل سرعت به پروسه عضویت
     join_status, chat_obj, joined_now = await safe_join_chat(
-        client, group_link, chat_id_hint=chat_id_hint, order_id=order_id
+        client, group_link, chat_id_hint=chat_id_hint, order_id=order_id, speed_profile=speed_profile
     )
     chat_id = getattr(chat_obj, "id", None)
-    if join_status != "success" or not chat_obj:
+    # 👈 اصلاح باگ: اضافه شدن "already_member" به وضعیت‌های مجاز
+    if join_status not in ("success", "already_member") or not chat_obj:
         return (join_status, None, chat_id, joined_now)
 
     # گام دوم: ادمین‌ها (کد مشترک — ادمین‌ها هرگز تارگت نمی‌شوند)
@@ -1116,11 +1191,12 @@ async def extract_members_for_sending(
 
     try:
         # گام سوم: پیمایش امن اعضا (کد مشترک)
+        # 🟢 تزریق پروفایل سرعت به پروسه پیمایش و FloodWaitهای احتمالی
         last_report_time = time.time()
-        async for user in iter_group_members(client, chat_id, admin_ids):
+        async for user in iter_group_members(client, chat_id, admin_ids, resume_seen_ids=None, speed_profile=speed_profile):
             scanned_count += 1  # 🟢 هر کاربری که تلگرام به ما داد شمرده می‌شود
             
-            if not _passes_filter(user, filter_type):
+            if not _passes_filter(user, filter_type)[0]:  # اصلاح: _passes_filter خروجی tuple دارد
                 continue
 
             # 🟢 الزام داشتن یوزرنیم برای جلوگیری از خطای PeerIdInvalid در ورکرها
@@ -1165,8 +1241,9 @@ async def extract_members_for_sending(
             return ("members_hidden", None, chat_id, joined_now)
             
         if total_yielded == 0:
-            # اعضا مخفی نبودند، اما هیچکس از فیلتر (مثلاً داشتن یوزرنیم) عبور نکرد
-            return ("empty_filter_result", None, chat_id, joined_now)
+            # 🟢 تبدیل هوشمندانه: اگر خروجی صفر شد (مثلاً فقط ادمین‌ها برگشتند)،
+            # مستقیماً آن را "لیست مخفی" در نظر می‌گیریم تا فال‌بک به پیام‌ها روشن شود.
+            return ("members_hidden", None, chat_id, joined_now)
 
         # 🟢 مرتب‌سازی لیست تارگت‌ها بر اساس اولویت (از 1 تا 6)
         members_with_priority.sort(key=lambda x: x[1])

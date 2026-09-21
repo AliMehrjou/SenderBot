@@ -122,6 +122,6 @@ async def restart_callback_handler(callback: types.CallbackQuery, state: FSMCont
 
 
 @router.message(F.text == "🔄 ریستارت ربات")
-@router.message(Command("start", "reset", "restart"))
+@router.message(Command("reset", "restart"))
 async def restart_message_handler(message: types.Message, state: FSMContext, session: AsyncSession, bot: Bot):
     await execute_smart_restart(message, state, session, bot)

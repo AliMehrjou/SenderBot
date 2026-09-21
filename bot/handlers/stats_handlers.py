@@ -121,6 +121,7 @@ def _build_accounts_filter_conditions(filter_type: str, now_naive: datetime):
 # REPORTS: FILTERED ACCOUNTS LIST (با صفحه‌بندی)
 # ==========================================
 @router.callback_query(F.data.startswith("list_acc_filter_"))
+@router.callback_query(F.data.startswith("list_acc_filter_"))
 async def render_filtered_account_list(
     callback: types.CallbackQuery,
     session: AsyncSession,
@@ -140,56 +141,47 @@ async def render_filtered_account_list(
         page = int(match.group(2))
 
     now = datetime.now(timezone.utc)
-    now_naive = now.replace(tzinfo=None)
-
+    
     filter_titles = {
         "all": "💢 تمام اکانت‌ها",
         "notreg": "⛔️ ثبت‌نام نشده",
-        "limited": "❌ محدود شده",
-        "active": "✅ فعال",
-        "ability": "♻️ آماده ارسال",
-        "cooldown": "💤 در حال استراحت" # 🟢 اضافه شدن تایتل جدید
+        "limited": "🚫 مسدود/محدود",
+        "disconnected": "⚠️ قطع اتصال",
+        "ready": "✅ آماده ارسال",
+        "cooldown": "💤 در حال استراحت"
     }
     display_title = filter_titles.get(filter_type, "لیست اکانت‌ها")
 
-    conditions = _build_accounts_filter_conditions(filter_type, now_naive)
+    from workers.sender import _get_redis
+    from utils.account_display import get_all_accounts_stats, get_account_display_status
+    from workers.session_manager import worker_pool
+    
+    redis_client = _get_redis()
+    stats, account_categories = await get_all_accounts_stats(session, redis_client, worker_pool)
 
-    # 🟢 فاز جدید: اضافه کردن فیلتر Redis برای وضعیت استراحت (Cooldown)
-    try:
-        if filter_type in ["ability", "cooldown"]:
-            stmt_active = select(Account.id).where(
-                Account.is_banned == False,
-                Account.session_string.is_not(None)
-            )
-            active_ids = (await session.execute(stmt_active)).scalars().all()
-            cooldown_ids = []
-            if active_ids:
-                from workers.sender import _get_redis
-                redis_client = _get_redis()
-                pipe = redis_client.pipeline()
-                for aid in active_ids:
-                    pipe.exists(f"chunk_cooldown:{aid}")
-                results = await pipe.execute()
-                cooldown_ids = [aid for aid, res in zip(active_ids, results) if res]
-                
-            if filter_type == "cooldown":
-                if not cooldown_ids:
-                    conditions = [Account.id == -1] # شرط غیرممکن برای برگرداندن صفر نتیجه در صورت خالی بودن
-                else:
-                    conditions = [Account.id.in_(cooldown_ids)]
-            elif filter_type == "ability" and conditions is not None:
-                if cooldown_ids:
-                    conditions.append(Account.id.notin_(cooldown_ids)) # کسر استراحت‌کننده‌ها از لیست آماده ارسال
-    except Exception as e:
-        logger.error(f"Error filtering cooldown accounts: {e}")
+    filter_map = {
+        "notreg": "NOT_REG",
+        "limited": "BLOCKED",
+        "cooldown": "COOLDOWN",
+        "disconnected": "DISCONNECTED",
+        "ready": "READY",
+        "all": "ALL"
+    }
+    
+    target_cat = filter_map.get(filter_type, "ALL")
+    if target_cat != "ALL":
+        valid_ids = [aid for aid, cat in account_categories.items() if cat == target_cat]
+        if not valid_ids:
+            conditions = [Account.id == -1]
+        else:
+            conditions = [Account.id.in_(valid_ids)]
+    else:
+        conditions = None
 
     try:
         count_stmt = select(func.count(Account.id))
-        list_stmt = (
-            select(Account)
-            .options(selectinload(Account.category))
-            .order_by(Account.id.asc())
-        )
+        list_stmt = select(Account).options(selectinload(Account.category)).order_by(Account.id.asc())
+        
         if conditions is not None:
             count_stmt = count_stmt.where(*conditions)
             list_stmt = list_stmt.where(*conditions)
@@ -199,9 +191,7 @@ async def render_filtered_account_list(
         page = clamp_page(page, total_pages)
         offset = get_page_offset(page)
 
-        current_accounts = (
-            await session.scalars(list_stmt.offset(offset).limit(PAGINATION_SIZE))
-        ).all()
+        current_accounts = (await session.scalars(list_stmt.offset(offset).limit(PAGINATION_SIZE))).all()
     except Exception as e:
         await session.rollback()
         return await answer_callback_error(
@@ -229,23 +219,22 @@ async def render_filtered_account_list(
         f"📄 صفحهٔ <b>{page}</b> از <b>{total_pages}</b>\n\n"
     )
 
-    for idx, acc in enumerate(current_accounts, start=offset + 1):
-        if acc.is_banned:
-            status_badge = "🚫 مسدود شده"
-        elif acc.flood_wait_until and _as_utc(acc.flood_wait_until) > now:
-            status_badge = "❌ محدود شده"
-        elif not acc.session_string:
-            status_badge = "⛔️ ثبت‌نام نشده"
-        else:
-            status_badge = "✅ فعال"
-            # 🟢 تغییر ایموجی برای لیست استراحت‌کننده‌ها
-            if filter_type == "cooldown":
-                 status_badge = "💤 در حال استراحت"
+    pipe = redis_client.pipeline()
+    for acc in current_accounts:
+        pipe.exists(f"chunk_cooldown:{acc.id}")
+    redis_results = await pipe.execute()
+
+    for idx, acc in enumerate(current_accounts):
+        is_conn = acc.id in worker_pool and getattr(worker_pool[acc.id], "is_connected", False)
+        has_redis = bool(redis_results[idx])
+        disp = get_account_display_status(acc, is_conn, has_redis, now)
+        status_badge = disp["badge"]
 
         cat_name = html.escape(acc.category.name) if acc.category else "بدون دسته"
-
+        
+        display_idx = offset + idx + 1
         text += (
-            f"{idx}. شماره: <code>{acc.phone_number}</code> {status_badge}\n"
+            f"{display_idx}. شماره: <code>{acc.phone_number}</code> {status_badge}\n"
             f"📁 دسته‌بندی: /category_{acc.id} ({cat_name})\n"
             f"🔸 وضعیت: /status_{acc.id}\n\n"
         )
@@ -255,28 +244,16 @@ async def render_filtered_account_list(
         builder.button(text=f"🗑 حذف {btn_label}", callback_data=f"delete_acc_{acc.id}/")
 
     builder.adjust(2)
-
     text += "👇 برای حذف هر اکانت، روی دکمه مربوطه کلیک کنید:"
 
-    add_pagination_nav_row(
-        builder, page, total_pages,
-        callback_prefix=f"list_acc_filter_{filter_type}_",
-    )
-
+    add_pagination_nav_row(builder, page, total_pages, callback_prefix=f"list_acc_filter_{filter_type}_")
     builder.row(
-        types.InlineKeyboardButton(
-            text="🔄 بروزرسانی",
-            callback_data=f"list_acc_filter_{filter_type}_page_{page}/",
-        ),
+        types.InlineKeyboardButton(text="🔄 بروزرسانی", callback_data=f"list_acc_filter_{filter_type}_page_{page}/"),
         types.InlineKeyboardButton(text="🔍 جستجو", callback_data="search_accounts/"),
     )
-
-    builder.row(
-        types.InlineKeyboardButton(text="🔙 بازگشت به داشبورد", callback_data="menu_list_accounts/")
-    )
+    builder.row(types.InlineKeyboardButton(text="🔙 بازگشت به داشبورد", callback_data="menu_list_accounts/"))
 
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
-
 
 
 # ==========================================
@@ -361,15 +338,21 @@ async def build_accounts_search_view(
         return text, builder.as_markup(), page
 
     # ── آیتم‌های صفحه (قالب یکسان با لیست فیلتردار) ──
+    from workers.sender import _get_redis
+    from utils.account_display import get_account_display_status
+    from workers.session_manager import worker_pool
+    redis_client = _get_redis()
+    
+    pipe = redis_client.pipeline()
+    for acc in accounts:
+        pipe.exists(f"chunk_cooldown:{acc.id}")
+    redis_results = await pipe.execute()
+
     for idx, acc in enumerate(accounts, start=offset + 1):
-        if acc.is_banned:
-            status_badge = "🚫 مسدود شده"
-        elif acc.flood_wait_until and _as_utc(acc.flood_wait_until) > now:
-            status_badge = "❌ محدود شده"
-        elif not acc.session_string:
-            status_badge = "⛔️ ثبت‌نام نشده"
-        else:
-            status_badge = "✅ فعال"
+        is_conn = acc.id in worker_pool and getattr(worker_pool[acc.id], "is_connected", False)
+        has_redis = bool(redis_results[idx - offset - 1])
+        disp = get_account_display_status(acc, is_conn, has_redis, now)
+        status_badge = disp["badge"]
 
         cat_name = html.escape(acc.category.name) if acc.category else "بدون دسته"
 
@@ -892,17 +875,12 @@ async def cancel_delete_unregistered_confirmation(callback: types.CallbackQuery,
 # ==========================================
 # 🟣 فاز ۴ — DELETE ACCOUNT: توابع کمکی مشترک
 # ==========================================
-def build_acc_delete_confirmation_text(acc: Account, cat_name: str, is_worker_online: bool) -> str:
+def build_acc_delete_confirmation_text(acc: Account, cat_name: str, is_worker_online: bool, has_redis: bool = False) -> str:
     now = datetime.now(timezone.utc)
-
-    if acc.is_banned:
-        status_display = "🚫 مسدود"
-    elif acc.flood_wait_until and _as_utc(acc.flood_wait_until) > now:
-        status_display = "❌ محدود شده (FloodWait)"
-    elif not acc.session_string:
-        status_display = "⛔️ ثبت‌نام نشده"
-    else:
-        status_display = "✅ فعال"
+    from utils.account_display import get_account_display_status
+    
+    disp = get_account_display_status(acc, is_worker_online, has_redis, now)
+    status_display = f"{disp['badge']} ({disp['desc']})"
 
     worker_display = "🟢 متصل (در حال اجرا)" if is_worker_online else "⚪️ آفلاین"
     safe_cat_name = html.escape(cat_name)
@@ -1222,8 +1200,9 @@ async def show_account_status(message: types.Message, session: AsyncSession) -> 
 
             for auth in authorizations:
                 if getattr(auth, 'current', False):
-                    date_created = datetime.fromtimestamp(auth.date_created).strftime('%Y-%m-%d %H:%M:%S')
-                    date_active = datetime.fromtimestamp(auth.date_active).strftime('%Y-%m-%d %H:%M:%S')
+                    from utils.timezone_helpers import to_tehran_time
+                    date_created = to_tehran_time(datetime.fromtimestamp(auth.date_created, timezone.utc))
+                    date_active = to_tehran_time(datetime.fromtimestamp(auth.date_active, timezone.utc))
 
                     # 🛡 فاز ۴: escape رشته‌های سمت کلاینت تلگرام
                     current_session_text = (
@@ -1254,18 +1233,15 @@ async def show_account_status(message: types.Message, session: AsyncSession) -> 
             logger.error(f"Error fetching live session data for acc {acc_id}: {e}", exc_info=True)
             current_session_text = "⚠️ <i>خطا در دریافت اطلاعات نشست از تلگرام.</i>\n\n"
 
-    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-
-    if acc.is_banned:
-        status_text = "🚫 اکانت مسدود شده است"
-    elif acc.flood_wait_until and _as_utc(acc.flood_wait_until) > now:
-        status_text = "❌ اکانت محدود شده است (FloodWait)"
-    elif not acc.session_string:
-        status_text = "⛔️ اکانت ثبت‌نام نشده است"
-    elif is_live:
-        status_text = "✅ اکانت فعال و متصل است"
-    else:
-        status_text = "⚠️ اکانت آفلاین است"
+    from workers.sender import _get_redis
+    from utils.account_display import get_account_display_status
+    try:
+        has_redis = await _get_redis().exists(f"chunk_cooldown:{acc.id}")
+    except Exception:
+        has_redis = False
+        
+    disp = get_account_display_status(acc, is_live, bool(has_redis), now)
+    status_text = f"{disp['badge']} — {disp['desc']}"
 
     cat_name = acc.category.name if acc.category else "بدون دسته"
     
@@ -1708,9 +1684,9 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
     await cleanup_fsm_temp_files(state)
     await state.clear()
 
-    now_aware = datetime.now(timezone.utc)
-    now_naive = now_aware.replace(tzinfo=None)
-    start_of_today = now_aware.replace(hour=0, minute=0, second=0, microsecond=0)
+    from utils.timezone_helpers import get_current_tehran_time
+    now_tehran = get_current_tehran_time()
+    start_of_today = now_tehran.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     start_of_yesterday = start_of_today - timedelta(days=1)
 
     try:
@@ -1734,49 +1710,12 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
         yesterday_comp, yesterday_total = await get_order_stats(start_of_yesterday, start_of_today)
         all_comp, all_total = await get_order_stats()
 
-        acc_all = await session.scalar(select(func.count(Account.id))) or 0
-
-        acc_active = await session.scalar(
-            select(func.count(Account.id)).where(Account.is_banned == False, Account.session_string.is_not(None))
-        ) or 0
-
-        # اضافه شدن شرط غیرمسدود بودن اکانت (برای هم‌خوانی با acc_active)
-        acc_limited = await session.scalar(
-            select(func.count(Account.id)).where(
-                Account.is_banned == False, 
-                Account.session_string.is_not(None),
-                Account.flood_wait_until > now_naive
-            )
-        ) or 0
-
-        acc_not_reg = await session.scalar(
-            select(func.count(Account.id)).where(Account.session_string.is_(None))
-        ) or 0
-
-        # 🟢 1. دریافت لیست اکانت‌های فعال برای بررسی در Redis
-        stmt_all_active_accs = select(Account.id).where(
-            Account.is_banned == False, 
-            Account.session_string.is_not(None)
-        )
-        all_active_acc_ids = (await session.execute(stmt_all_active_accs)).scalars().all()
+        from workers.sender import _get_redis
+        from utils.account_display import get_all_accounts_stats
+        from workers.session_manager import worker_pool
         
-        # 🟢 2. بررسی Redis برای یافتن اکانت‌هایی که در حال استراحت دوره‌ای هستند
-        acc_cooldown = 0
-        if all_active_acc_ids:
-            from workers.sender import _get_redis
-            redis_client = _get_redis()
-            
-            pipe = redis_client.pipeline()
-            for aid in all_active_acc_ids:
-                pipe.exists(f"chunk_cooldown:{aid}")
-            
-            cooldown_results = await pipe.execute()
-            acc_cooldown = sum(1 for res in cooldown_results if res)
-
-        # 🟢 3. محاسبه و اصلاح نهایی «آماده ارسال»
-        acc_ability = acc_active - acc_limited - acc_cooldown
-        if acc_ability < 0:
-            acc_ability = 0
+        redis_client = _get_redis()
+        stats, _ = await get_all_accounts_stats(session, redis_client, worker_pool)
 
         try:
             total_api = await session.scalar(select(func.count(APIKey.id))) or 0
@@ -1784,7 +1723,6 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
             logger.error(f"Error counting APIKeys: {e}")
             total_api = 0
             
-        # L-04 (Phase 6 / T6): محاسبه توان ارسال واقعی
         throughput_text = await render_throughput_stats(session)
 
     except Exception as e:
@@ -1794,7 +1732,6 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
             reply_markup=get_back_keyboard()
         )
 
-    # 🟢 اضافه کردن acc_cooldown به متن خروجی
     stats_text = (
         "📊 <b>آمار سیستم</b>\n\n"
 
@@ -1804,12 +1741,12 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
         f"🔴 کل: {all_comp} از {all_total}\n\n"
 
         "🤖 <b>اکانت‌ها:</b>\n"
-        f"💢 کل: {acc_all}\n"
-        f"✅ فعال: {acc_active}\n"
-        f"♻️ آماده ارسال: {acc_ability}\n"
-        f"⚠️ محدود شده: {acc_limited}\n"
-        f"💤 در حال استراحت: {acc_cooldown}\n"
-        f"⛔️ ثبت نشده: {acc_not_reg}\n\n"
+        f"💢 کل: {stats['TOTAL']}\n"
+        f"✅ آماده ارسال: {stats['READY']}\n"
+        f"🚫 مسدود/محدود: {stats['BLOCKED']}\n"
+        f"💤 در حال استراحت: {stats['COOLDOWN']}\n"
+        f"⚠️ قطع اتصال: {stats['DISCONNECTED']}\n"
+        f"⛔️ ثبت نشده: {stats['NOT_REG']}\n\n"
 
         f"🔘 <b>تعداد APIها:</b> {total_api}\n\n"
         
@@ -1817,14 +1754,12 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
     )
 
     builder = InlineKeyboardBuilder()
-    # افزودن ورودی دکمه داشبورد تحویل‌سنجی سفارشات به منوی آمار
     builder.button(text="📈 تحویل‌سنجی سفارشات", callback_data="menu_delivery_stats/")
     builder.button(text="🔄 بروزرسانی", callback_data="menu_stats/")
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
     builder.adjust(1, 2)
 
     await safe_edit_message(callback.message, stats_text, reply_markup=builder.as_markup())
-
 
 # کد جدید (به انتهای فایل stats_handlers.py اضافه شود)
 @router.message(F.text.regexp(r"^/orderstats_(\d+)$"))

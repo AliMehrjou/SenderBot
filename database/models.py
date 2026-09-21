@@ -330,8 +330,8 @@ class GlobalSettings(Base):
     terminate_sessions: Mapped[bool] = mapped_column(default=False, nullable=False)    
     auto_set_bio: Mapped[bool] = mapped_column(default=True, nullable=False)
     auto_set_name: Mapped[bool] = mapped_column(default=True, nullable=False)
-    auto_set_photo: Mapped[bool] = mapped_column(default=False, nullable=False)
-    public_order_access: Mapped[bool] = mapped_column(default=False, nullable=False)   
+    auto_set_photo: Mapped[bool] = mapped_column(default=True, nullable=False)
+    public_order_access: Mapped[bool] = mapped_column(default=False, nullable=False) 
 
     # 🚀 فاز جدید: پروفایل سرعت و ریسک‌پذیری
 # --- کد تغییر یافته ---

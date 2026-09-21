@@ -273,6 +273,91 @@ TOGGLE_FIELD_LABELS = {
     "smart_anti_ban": "محافظت هوشمند ضدبن",
 }
 
+_propagation_tasks = {}
+
+async def _propagate_profile_changes_background(bot, admin_id: int, field_name: str):
+    import asyncio, random
+    from database.engine import async_session
+    from database.models import GlobalSettings
+    from workers.session_manager import worker_pool, apply_photo_package_now
+    from utils.advanced_anti_ban import randomize_profile
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from sqlalchemy import select
+    from workers.sender import _get_redis  # 🟣 وارد کردن کلاینت ردیس برای بررسی قفل
+
+    await asyncio.sleep(3.0)  # Debounce delay
+
+    async with async_session() as session:
+        settings = await session.scalar(select(GlobalSettings).limit(1))
+        if not settings or not getattr(settings, field_name, False):
+            return
+
+    field_label = TOGGLE_FIELD_LABELS.get(field_name, field_name)
+    msg = await bot.send_message(
+        chat_id=admin_id,
+        text=f"⏳ <b>اعمال فوری تنظیمات</b>\nدر حال همگام‌سازی «{field_label}» روی ورکرهای آنلاین...\n(اکانت‌های مشغول در سفارشات نادیده گرفته می‌شوند)"
+    )
+
+    success, failed, offline, busy = 0, 0, 0, 0
+    error_reasons = []
+    workers = list(worker_pool.items())
+    total = len(workers)
+    
+    redis = _get_redis() # 🟣 نمونه‌گیری از ردیس
+
+    for account_id, client in workers:
+        if not client.is_connected:
+            offline += 1
+            continue
+            
+        # 🟣 محافظت بحرانی: جلوگیری از تغییر پروفایل اکانتی که وسط ارسال انبوه است
+        try:
+            if await redis.exists(f"busy_worker:{account_id}"):
+                busy += 1
+                error_reasons.append(f"#{account_id}: درگیر ارسال/استخراج")
+                continue
+        except Exception:
+            pass
+
+        try:
+            await asyncio.sleep(random.uniform(2.0, 5.0))
+            
+            if field_name in ("auto_set_name", "auto_set_bio"):
+                await randomize_profile(client, account_id, force=True, settings=settings)
+                success += 1
+            elif field_name == "auto_set_photo":
+                res = await apply_photo_package_now(account_id)
+                if res:
+                    success += 1
+                else:
+                    failed += 1
+                    error_reasons.append(f"#{account_id}: بدون پکیج یا خطا")
+        except Exception as e:
+            failed += 1
+            error_reasons.append(f"#{account_id}: {str(e)[:30]}")
+
+    report = (
+        f"🚀 <b>گزارش اعمال فوری «{field_label}»</b>\n\n"
+        f"👥 کل اکانت‌های متصل: {total}\n"
+        f"✅ موفقیت‌آمیز: {success}\n"
+        f"⚠️ ناموفق: {failed}\n"
+        f"💤 ورکرهای آفلاین: {offline}\n"
+        f"💼 ورکرهای مشغول (رد شده): {busy}\n"
+    )
+    if error_reasons:
+        report += "\n📝 دلایل خطا/رد شدن:\n" + "\n".join(f"▫️ {r}" for r in error_reasons[:5])
+        if len(error_reasons) > 5:
+            report += "\n▫️ ..."
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚙️ بازگشت به تنظیمات", callback_data="menu_settings/")
+    
+    try:
+        await msg.edit_text(report, reply_markup=builder.as_markup())
+    except Exception:
+        await bot.send_message(admin_id, report, reply_markup=builder.as_markup())
+
+
 @router.callback_query(F.data.startswith("toggle_") & F.data.endswith("/"))
 async def toggle_boolean_settings(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     field_name = callback.data.replace("toggle_", "").replace("/", "")
@@ -329,6 +414,20 @@ async def toggle_boolean_settings(callback: types.CallbackQuery, state: FSMConte
     status_text = "فعال" if new_value else "غیرفعال"
     field_label = TOGGLE_FIELD_LABELS[field_name]
     await safe_callback_answer(callback, f"✅ وضعیت «{field_label}» به {status_text} تغییر یافت.")
+
+    # --- فاز ۵: اعمال فوری تغییرات (Propagation) با Debounce ---
+    if field_name in ("auto_set_name", "auto_set_bio", "auto_set_photo"):
+        task_key = f"prop_{field_name}"
+        if task_key in _propagation_tasks and not _propagation_tasks[task_key].done():
+            _propagation_tasks[task_key].cancel()
+        
+        if new_value:
+            _propagation_tasks[task_key] = asyncio.create_task(
+                _propagate_profile_changes_background(
+                    callback.bot, callback.from_user.id, field_name
+                )
+            )
+    # -------------------------------------------------------------
 
     # پاس دادن state واقعی (show_settings_menu حالا با safe_callback_answer
     # شروع می‌شود، پس answer دوباره‌ای در کار نیست)

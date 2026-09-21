@@ -64,6 +64,17 @@ async def reset_zombie_orders() -> None:
     """بازگردانی سفارشات در حال اجرا به حالت انتظار در زمان ری‌استارت سرور
     + بازیابی تارگت‌های در-flight از دفترکل (B3)."""
     logger.info("Checking for zombie orders...")
+    
+    try:
+        from workers.sender import _get_redis
+        redis_client = _get_redis()
+        keys = await redis_client.keys("busy_worker:*")
+        if keys:
+            await redis_client.delete(*keys)
+            logger.info(f"Cleared {len(keys)} stale busy_worker locks from Redis.")
+    except Exception as e:
+        logger.warning(f"Failed to clear stale busy_worker locks: {e}")
+
     async with async_session() as session:
         zombies = (await session.scalars(
             select(Order).where(Order.status == OrderStatus.running)
@@ -96,8 +107,14 @@ def supervise(name: str, coro_factory):
             task = asyncio.create_task(coro_factory())
             try:
                 await task
-                break  # خروج طبیعی (مثل CancelledError)
+                break  # خروج طبیعی
             except asyncio.CancelledError:
+                # 🛡 لغو صریح تسک داخلی تا یتیم (Orphan) نشود
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
                 raise
             except Exception:
                 logger.critical(f"Loop {name} crashed; restarting in 60s", exc_info=True)
@@ -273,6 +290,9 @@ async def main() -> None:
     db_middleware = DatabaseMiddleware(session_maker=async_session)
     dp.message.middleware(db_middleware)
     dp.callback_query.middleware(db_middleware)
+    
+    # 🟣 فاز ۱: ثبت emergency قبل از cancel تا هندلر خوش‌آمدگویی /start برنده شود
+    dp.include_router(emergency_router)
     dp.include_router(cancel_handlers.router)
     dp.include_router(api_router)
     
@@ -286,8 +306,8 @@ async def main() -> None:
     
     # ثبت روترها
     dp.include_router(pagination_router)
-    dp.include_router(emergency_router) 
-    dp.include_router(admin_router)     
+    # emergency_router به بالا منتقل شد
+    dp.include_router(admin_router)   
     dp.include_router(login_router)
     dp.include_router(order_router)
     dp.include_router(general_router)
