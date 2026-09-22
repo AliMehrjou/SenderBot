@@ -1164,6 +1164,9 @@ async def extractor_task_wrapper(
                     elif status_code == "stopped":
                         caption_text = "🛑 عملیات استخراج توسط ادمین در میانه راه لغو شد، اما فایل استخراج‌شده تا این لحظه معتبر است.\n" + caption_text
                         
+                    elif status_code == "success_fallback":
+                        caption_text = "⚠️ <i>لیست اعضا مخفی بود؛ استخراج به‌صورت خودکار از تاریخچه پیام‌ها انجام شد.</i>\n\n" + caption_text
+
                     await bot.send_document(
                         chat_id=admin_id,
                         document=document,
@@ -1189,6 +1192,10 @@ async def extractor_task_wrapper(
                 elif status_code == "partial_success":
                     outcome_label = "ناقص"
                     partial_note = "\n⚠️ بخشی از اسکن با خطا/FloodWait متوقف شد اما داده‌ها معتبرند."
+                    title_msg = "✅ <b>عملیات استخراج تکمیل شد</b>"
+                elif status_code == "success_fallback":
+                    outcome_label = "کامل (فال‌بک پیام‌ها)"
+                    partial_note = "\n⚠️ لیست اعضا مخفی بود؛ استخراج به‌صورت خودکار از میان پیام‌دهندگان انجام شد."
                     title_msg = "✅ <b>عملیات استخراج تکمیل شد</b>"
                 else:
                     outcome_label = "کامل"
@@ -2155,6 +2162,46 @@ async def background_order_execution(
                 if new_worker_found:
                     continue
                 else:
+                    # 🟢 اضافه شده: پایان فوری سفارش در صورت اتمام سقف روزانه اکانت‌ها و ارسال فایل خروجی
+                    if stop_reason == "daily_cap":
+                        async with session_maker() as session:
+                            db_order = await session.get(Order, order_id)
+                            if db_order:
+                                success_count = await session.scalar(
+                                    select(func.count())
+                                    .select_from(OrderLog)
+                                    .where(OrderLog.order_id == order_id, OrderLog.status == "success")
+                                ) or 0
+                                
+                                finish_msg = f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). به دلیل رسیدن تمام اکانت‌ها به سقف روزانه، سفارش پایان یافت."
+                                
+                                final_status = OrderStatus.completed if success_count > 0 else OrderStatus.error
+                                db_order.status = final_status
+                                db_order.scheduled_for = None
+                                db_order.reject_reason = "اتمام سقف روزانه اکانت‌ها"
+                                
+                                session.add(OrderLog(order_id=order_id, target="System", status=final_status, error_message=finish_msg))
+                                await session.commit()
+                                
+                                # ارسال اتوماتیک فایل خروجی برای کارفرما
+                                if not _is_extract_order(db_order):
+                                    _spawn_background_task(_send_export_file(session_maker, bot, order_id, finish_msg))
+                                    
+                                # بروزرسانی داشبورد لایو کاربر
+                                task_type = "extract" if _is_extract_order(db_order) else "order"
+                                if reporter := _progress_reporters.get(f"{task_type}:{order_id}"):
+                                    if final_status == OrderStatus.completed:
+                                        await reporter.finish(f"✅ <b>پایان سفارش</b>\n\n{finish_msg}")
+                                    else:
+                                        await reporter.fail(f"⛔️ <b>لغو سفارش</b>\n\n{finish_msg}")
+                                    _pop_progress_reporter(task_type, order_id)
+                                    
+                                # اطلاع‌رسانی به ادمین سیستم
+                                from utils.admin_broadcast import broadcast_to_admins
+                                await broadcast_to_admins(bot, text=f"🏁 <b>پایان سفارش (سقف روزانه)</b>\n\nسفارش: <code>{order_id}</code>\n{finish_msg}")
+                        break
+
+                    # --- رفتار قبلی برای بقیه محدودیت‌ها (مثل فلادویت) که فقط استراحت ۳۰ دقیقه‌ای نیاز دارند ---
                     min_wait_seconds = 1800  # مقدار پیش‌فرض امن خارج از کانتکست دیتابیس
                     async with session_maker() as session:
                         db_order = await session.get(Order, order_id)
@@ -3421,6 +3468,10 @@ async def order_dispatcher_loop(
                                             go_parallel = True
                                 except (TypeError, ValueError):
                                     go_parallel = False
+                                
+                                # 🔴 کلید قطع/وصل استخراج موازی:
+                                # برای فعال‌سازی مجدد استخراج موازی، کافیست خط زیر را پاک یا کامنت (با #) کنید.
+                                go_parallel = False
 
                                 if go_parallel:
                                     for acc in eligible_accounts:

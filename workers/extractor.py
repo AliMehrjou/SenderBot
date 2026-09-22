@@ -536,24 +536,10 @@ async def extract_active_users(
                     if not is_partial and override_status != "members_hidden":
                         override_status = "members_hidden"
 
-                # 🟢 مکانیزم Fallback: تغییر مسیر به استخراج از پیام‌ها در صورت مخفی بودن اعضا
+                # 🟢 مکانیزم Fallback: واگذاری تصمیم‌گیری و تغییر مسیر به لایه task_queue جهت ارسال پیام هشدار
                 if override_status == "members_hidden":
-                    if getattr(config, "EXTRACT_AUTO_FALLBACK_TO_MESSAGES", True):
-                        logger.info(f"Worker {client.name} applying fallback: switching to message extraction.")
-                        override_status = "success_fallback"
-                        filter_type = "messages"  # تغییر رفتار بلوک‌های بعدی به پردازش تاریخچه پیام‌ها
-                        is_partial = False
-                        if order_id:
-                            try:
-                                async with async_session() as session:
-                                    await session.execute(
-                                        update(Order).where(Order.id == order_id).values(reject_reason="fallback_messages")
-                                    )
-                                    await session.commit()
-                            except Exception as e:
-                                logger.error(f"Failed to update order fallback status: {e}")
-                    else:
-                        logger.info(f"Worker {client.name}: Members hidden, but EXTRACT_AUTO_FALLBACK_TO_MESSAGES is disabled.")
+                    logger.info(f"Worker {client.name}: Members hidden. Returning status to dispatcher for fallback handling.")
+                    # هیچ تغییری در filter_type یا override_status نمی‌دهیم تا ارور به لایه بالاتر برگردد
 
                 if total_yielded >= config.EXTRACT_MEMBERS_API_LIMIT:
                     is_partial = True

@@ -493,7 +493,7 @@ async def build_extraction_dashboard_view(
         builder.button(text="🛑 توقف عملیات / لغو", callback_data=f"cancel_order_{extraction.id}/")
     
     # 🟢 دکمه خروجی برای عملیات تمام شده یا متوقف شده (در صورت وجود دیتا)
-    if extraction.status in [OrderStatus.completed, OrderStatus.error]:
+    if extraction.status in [OrderStatus.completed, OrderStatus.error] and getattr(extraction, "media_path", None):
         builder.button(text="📥 خروجی", callback_data=f"export_order_{extraction.id}/")
     
     
