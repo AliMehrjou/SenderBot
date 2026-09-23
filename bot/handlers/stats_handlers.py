@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import OrderLog
-
+from database.models import Account, Category, Order, OrderLog, OrderStatus, APIKey, AccountStatus
 # 🟣 فاز ۷ (رفع بن‌بست FSM): helper های قبلی
 from bot.keyboards.main_menu import get_main_menu_keyboard, get_main_menu_button
 from utils.fsm_cleanup import cleanup_fsm_temp_files
@@ -112,6 +112,7 @@ def _build_accounts_filter_conditions(filter_type: str, now_naive: datetime):
         return [
             Account.is_banned == False,
             Account.session_string.is_not(None),
+            Account.status == AccountStatus.active,  # 👈 این شرط اضافه شد
             or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
             or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
         ]
@@ -682,6 +683,7 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
         stmt_ability = select(Account.id).where(
             Account.is_banned == False,
             Account.session_string.is_not(None),
+            Account.status == AccountStatus.active,  # 👈 این شرط اضافه شد
             or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
             or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
         )
