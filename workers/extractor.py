@@ -417,6 +417,7 @@ async def iter_group_members(
 # «سفارش ارسال از نوع link» بود؛ حالا فیلترِ مشترک بین مسیر استخراج
 # extract_active_users و مسیر ارسال لینکی extract_members_for_sending است.)
 # ==========================================
+
 def _passes_filter(user: User, filter_type: Optional[str]) -> tuple[bool, str]:
     """
     پشتیبانی از فیلترهای ویزارد JSON یا مقادیر قدیمی.
@@ -431,16 +432,32 @@ def _passes_filter(user: User, filter_type: Optional[str]) -> tuple[bool, str]:
     # 🟢 پشتیبانی همزمان از فرمت JSON و فرمت کلاسیکِ استخراج
     check_online = options.get("online_only") or (filter_type == "online")
 
-    if check_online and user.status not in (UserStatus.ONLINE, UserStatus.RECENTLY):
+    if check_online and getattr(user, "status", None) not in (UserStatus.ONLINE, UserStatus.RECENTLY):
         return False, "آفلاین"
         
     if options.get("has_photo") and not getattr(user, "photo", None):
         return False, "بدون عکس"
         
-    if options.get("no_bots") and (user.is_bot or user.is_deleted):
+    if options.get("no_bots") and (getattr(user, "is_bot", False) or getattr(user, "is_deleted", False)):
         return False, "ربات/دلیت شده"
-        
+
+    # +++ بخش اصلاح شده: اضافه کردن فیلترهای منوی کلاسیک +++
+    if filter_type == "phone":
+        if not getattr(user, "phone_number", None):
+            return False, "بدون شماره تلفن عمومی"
+
+    if filter_type == "real":
+        if getattr(user, "is_bot", False) or getattr(user, "is_deleted", False):
+            return False, "کاربر واقعی نیست (ربات یا دلیت اکانت)"
+
+    if filter_type == "fake":
+        # یک تعریف ساده برای فیک: عکس ندارد و مدت‌هاست آنلاین نبوده است
+        if getattr(user, "photo", None) or getattr(user, "status", None) in (UserStatus.ONLINE, UserStatus.RECENTLY):
+            return False, "به نظر واقعی می‌رسد"
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++
+
     return True, "تایید"
+    
 async def extract_active_users(
     client: Client, 
     group_link: str, 
