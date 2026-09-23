@@ -187,7 +187,10 @@ async def render_admins_list(
     📄 فاز ۱: رندر لیست ادمین‌های فرعی با صفحه‌بندی استاندارد.
     """
     try:
-        total_count = await session.scalar(select(func.count(Admin.id))) or 0
+        # 🟢 پنهان کردن ادمین اصلی از آمار و لیست ادمین‌های فرعی
+        total_count = await session.scalar(
+            select(func.count(Admin.id)).where(Admin.telegram_id != config.ADMIN_ID)
+        ) or 0
         total_pages = calculate_total_pages(total_count)
 
         page = clamp_page(page, total_pages)
@@ -196,6 +199,7 @@ async def render_admins_list(
         admins = (
             await session.scalars(
                 select(Admin)
+                .where(Admin.telegram_id != config.ADMIN_ID)
                 .order_by(Admin.id.asc())
                 .offset(offset)
                 .limit(PAGINATION_SIZE)
@@ -482,7 +486,10 @@ async def admin_message_all(callback: types.CallbackQuery, state: FSMContext) ->
 async def render_message_admins_list(callback: types.CallbackQuery, session: AsyncSession, page: int = 1) -> None:
     """تابع کمکی برای رندر کردن لیست ادمین‌ها جهت انتخاب گیرنده پیام"""
     try:
-        total_count = await session.scalar(select(func.count(Admin.id))) or 0
+        # 🟢 پنهان کردن ادمین اصلی از آمار و لیست انتخاب گیرنده پیام
+        total_count = await session.scalar(
+            select(func.count(Admin.id)).where(Admin.telegram_id != config.ADMIN_ID)
+        ) or 0
         total_pages = calculate_total_pages(total_count)
 
         page = clamp_page(page, total_pages)
@@ -491,6 +498,7 @@ async def render_message_admins_list(callback: types.CallbackQuery, session: Asy
         admins = (
             await session.scalars(
                 select(Admin)
+                .where(Admin.telegram_id != config.ADMIN_ID)
                 .order_by(Admin.id.asc())
                 .offset(offset)
                 .limit(PAGINATION_SIZE)

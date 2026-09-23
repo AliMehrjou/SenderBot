@@ -661,12 +661,12 @@ async def assign_package_to_account(callback: types.CallbackQuery) -> None:
         return await report_db_error(callback, e)
 
     safe_name = html.escape(pkg_name)
-    await callback.answer(f"✅ پکیج «{pkg_name}» متصل شد.", show_alert=True)
+    # پاپ‌آپ Alert برداشته شد تا هیچ نوتیفیکیشنی روی صفحه نیاید
+    await callback.answer()
     
-    applied = False
     try:
         from workers.session_manager import apply_photo_package_now
-        applied = await apply_photo_package_now(acc_id)
+        await apply_photo_package_now(acc_id)
     except Exception as e:
         logger.warning(f"Immediate photo rotation failed for account {acc_id}: {e}")
 
@@ -674,15 +674,10 @@ async def assign_package_to_account(callback: types.CallbackQuery) -> None:
     builder.row(types.InlineKeyboardButton(text="↩️ لیست اکانت‌ها", callback_data="photo_pkg_assign/"))
     builder.row(types.InlineKeyboardButton(text="🖼 پنل پکیج‌ها", callback_data="photo_pkg_panel/"))
     
-    status_note = (
-        "✅ <b>عکس‌های پکیج همین حالا روی اکانت اعمال شد.</b>" 
-        if applied else 
-        "ℹ️ عکس‌ها هنگام <b>استارت بعدی ورکر</b> و با روشن بودن <b>Auto Set Photo</b> اعمال می‌شوند."
-    )
-    
+    # متغیر status_note کاملاً حذف شد تا کاربر از اعمال فوری مطلع نشود
     await safe_edit_or_answer(
         callback.message,
-        f"✅ پکیج «{safe_name}» به <code>{phone}</code> متصل شد.\n\n{status_note}",
+        f"✅ پکیج «{safe_name}» به <code>{phone}</code> متصل شد.",
         reply_markup=builder.as_markup(),
     )
 

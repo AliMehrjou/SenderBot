@@ -104,7 +104,7 @@ def _build_accounts_filter_conditions(filter_type: str, now_naive: datetime):
         return [
             Account.is_banned == False, 
             Account.session_string.is_not(None), 
-            Account.flood_wait_until > now_naive
+            or_(Account.flood_wait_until > now_naive, Account.restricted_until > now_naive)
         ]
     if filter_type == "active":
         return [Account.is_banned == False, Account.session_string.is_not(None)]
@@ -113,6 +113,7 @@ def _build_accounts_filter_conditions(filter_type: str, now_naive: datetime):
             Account.is_banned == False,
             Account.session_string.is_not(None),
             or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
+            or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
         ]
     return None  # all
 
@@ -666,7 +667,7 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
         stmt_limited = select(func.count(Account.id)).where(
             Account.is_banned == False, 
             Account.session_string.is_not(None),
-            Account.flood_wait_until > now_naive
+            or_(Account.flood_wait_until > now_naive, Account.restricted_until > now_naive)
         )
         total_limited = (await session.execute(stmt_limited)).scalar() or 0
 
@@ -681,7 +682,8 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
         stmt_ability = select(Account.id).where(
             Account.is_banned == False,
             Account.session_string.is_not(None),
-            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive)
+            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
+            or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
         )
         ability_ids = (await session.execute(stmt_ability)).scalars().all()
         

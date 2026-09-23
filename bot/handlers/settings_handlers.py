@@ -281,40 +281,25 @@ async def _propagate_profile_changes_background(bot, admin_id: int, field_name: 
     from database.models import GlobalSettings
     from workers.session_manager import worker_pool, apply_photo_package_now
     from utils.advanced_anti_ban import randomize_profile
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
     from sqlalchemy import select
-    from workers.sender import _get_redis  # 🟣 وارد کردن کلاینت ردیس برای بررسی قفل
+    from workers.sender import _get_redis 
 
-    await asyncio.sleep(3.0)  # Debounce delay
+    await asyncio.sleep(3.0) 
 
     async with async_session() as session:
         settings = await session.scalar(select(GlobalSettings).limit(1))
         if not settings or not getattr(settings, field_name, False):
             return
 
-    field_label = TOGGLE_FIELD_LABELS.get(field_name, field_name)
-    msg = await bot.send_message(
-        chat_id=admin_id,
-        text=f"⏳ <b>اعمال فوری تنظیمات</b>\nدر حال همگام‌سازی «{field_label}» روی ورکرهای آنلاین...\n(اکانت‌های مشغول در سفارشات نادیده گرفته می‌شوند)"
-    )
-
-    success, failed, offline, busy = 0, 0, 0, 0
-    error_reasons = []
     workers = list(worker_pool.items())
-    total = len(workers)
-    
-    redis = _get_redis() # 🟣 نمونه‌گیری از ردیس
+    redis = _get_redis() 
 
     for account_id, client in workers:
         if not client.is_connected:
-            offline += 1
             continue
             
-        # 🟣 محافظت بحرانی: جلوگیری از تغییر پروفایل اکانتی که وسط ارسال انبوه است
         try:
             if await redis.exists(f"busy_worker:{account_id}"):
-                busy += 1
-                error_reasons.append(f"#{account_id}: درگیر ارسال/استخراج")
                 continue
         except Exception:
             pass
@@ -324,38 +309,10 @@ async def _propagate_profile_changes_background(bot, admin_id: int, field_name: 
             
             if field_name in ("auto_set_name", "auto_set_bio"):
                 await randomize_profile(client, account_id, force=True, settings=settings)
-                success += 1
             elif field_name == "auto_set_photo":
-                res = await apply_photo_package_now(account_id)
-                if res:
-                    success += 1
-                else:
-                    failed += 1
-                    error_reasons.append(f"#{account_id}: بدون پکیج یا خطا")
-        except Exception as e:
-            failed += 1
-            error_reasons.append(f"#{account_id}: {str(e)[:30]}")
-
-    report = (
-        f"🚀 <b>گزارش اعمال فوری «{field_label}»</b>\n\n"
-        f"👥 کل اکانت‌های متصل: {total}\n"
-        f"✅ موفقیت‌آمیز: {success}\n"
-        f"⚠️ ناموفق: {failed}\n"
-        f"💤 ورکرهای آفلاین: {offline}\n"
-        f"💼 ورکرهای مشغول (رد شده): {busy}\n"
-    )
-    if error_reasons:
-        report += "\n📝 دلایل خطا/رد شدن:\n" + "\n".join(f"▫️ {r}" for r in error_reasons[:5])
-        if len(error_reasons) > 5:
-            report += "\n▫️ ..."
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⚙️ بازگشت به تنظیمات", callback_data="menu_settings/")
-    
-    try:
-        await msg.edit_text(report, reply_markup=builder.as_markup())
-    except Exception:
-        await bot.send_message(admin_id, report, reply_markup=builder.as_markup())
+                await apply_photo_package_now(account_id)
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("toggle_") & F.data.endswith("/"))
@@ -620,11 +577,23 @@ async def add_proxy_ask_type(callback: types.CallbackQuery, state: FSMContext) -
     await safe_callback_answer(callback)
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔐 پروکسی ورود (Login)", callback_data="add_proxy_type_login/")
+    is_main_admin = (callback.from_user.id == config.ADMIN_ID)
+    
+    # 🟢 فقط ادمین اصلی دکمه‌های مربوط به پروکسی لاگین را می‌بیند
+    if is_main_admin:
+        builder.button(text="🔐 پروکسی ورود (Login)", callback_data="add_proxy_type_login/")
+        
     builder.button(text="📤 پروکسی ارسال (Sender)", callback_data="add_proxy_type_sender/")
-    builder.button(text="🌐 برای هر دو (دوکاره)", callback_data="add_proxy_type_both/")
+    
+    if is_main_admin:
+        builder.button(text="🌐 برای هر دو (دوکاره)", callback_data="add_proxy_type_both/")
+        
     builder.button(text="🔙 بازگشت", callback_data="menu_proxies/")
-    builder.adjust(2, 1, 1)
+    
+    if is_main_admin:
+        builder.adjust(2, 1, 1)
+    else:
+        builder.adjust(1, 1)
     
     await safe_edit_or_answer(
         callback.message,
@@ -634,6 +603,11 @@ async def add_proxy_ask_type(callback: types.CallbackQuery, state: FSMContext) -
 
 @router.callback_query(F.data.in_({"add_proxy_type_login/", "add_proxy_type_sender/", "add_proxy_type_both/"}))
 async def ask_for_proxies_input(callback: types.CallbackQuery, state: FSMContext) -> None:
+    # 🟢 گارد امنیتی بک‌اند: جلوگیری از درخواست جعلی ادمین فرعی
+    is_main_admin = (callback.from_user.id == config.ADMIN_ID)
+    if ("login" in callback.data or "both" in callback.data) and not is_main_admin:
+        return await callback.answer("⛔️ فقط ادمین اصلی سیستم مجاز به افزودن این نوع پروکسی است.", show_alert=True)
+
     if "login" in callback.data:
         proxy_type = "login"
         type_fa = "ورود (Login)"
@@ -774,9 +748,16 @@ async def process_new_proxies(message: types.Message, state: FSMContext, session
 
 @router.callback_query(F.data == "settings_manage_proxies/")
 async def manage_proxies_list(callback: types.CallbackQuery, session: AsyncSession) -> None:
+    is_main_admin = (callback.from_user.id == config.ADMIN_ID)
     try:
-        # واکشی ۵۰ پروکسی آخر (محدود شده برای جلوگیری از خطای تلگرام در کیبورد اینلاین)
-        stmt = select(Proxy).order_by(Proxy.id.desc()).limit(50)
+        # واکشی ۵۰ پروکسی آخر
+        stmt = select(Proxy)
+        
+        # 🟢 ادمین‌های فرعی فقط پروکسی‌های «ارسال» را در لیست مدیریت می‌بینند
+        if not is_main_admin:
+            stmt = stmt.where(Proxy.usage_type == "sender")
+            
+        stmt = stmt.order_by(Proxy.id.desc()).limit(50)
         proxies = (await session.scalars(stmt)).all()
     except Exception as e:
         await session.rollback()
@@ -814,9 +795,15 @@ async def delete_proxy_inline_handler(callback: types.CallbackQuery, session: As
     if not proxy_id_str.isdigit():
         return await callback.answer("⚠️ شناسه نامعتبر.", show_alert=True)
 
+    is_main_admin = (callback.from_user.id == config.ADMIN_ID)
+
     try:
         proxy = await session.scalar(select(Proxy).where(Proxy.id == int(proxy_id_str)))
         if proxy:
+            # 🟢 گارد امنیتی: ادمین فرعی نمی‌تواند پروکسی لاگین را حذف کند
+            if proxy.usage_type in ("login", "both") and not is_main_admin:
+                return await callback.answer("⛔️ تنها ادمین اصلی مجاز به حذف پروکسی‌های مربوط به لاگین است.", show_alert=True)
+                
             # آزاد کردن اکانت‌های متصل قبل از حذف
             unbind_stmt = (
                 update(Account)
@@ -2006,6 +1993,8 @@ async def apply_speed_mode(callback: types.CallbackQuery, state: FSMContext, ses
 # ==========================================
 from datetime import datetime, timezone
 
+from datetime import datetime, timezone
+
 @router.callback_query(F.data.startswith("menu_account_health_page_"))
 async def account_health_dashboard(callback: types.CallbackQuery, session: AsyncSession):
     await safe_callback_answer(callback)
@@ -2031,20 +2020,33 @@ async def account_health_dashboard(callback: types.CallbackQuery, session: Async
     )
 
     now = datetime.now(timezone.utc)
+    now_naive = now.replace(tzinfo=None)
 
     for acc in accounts:
-        # تشخیص وضعیت اکانت
-        is_cooldown = acc.expected_return_time and acc.expected_return_time > now
-        
-        if getattr(acc, "session_invalid", False):
-            emoji_status = "⚪️" 
-            status_text = "نامعتبر/خروج"
-        elif getattr(acc, "spam_restricted", False):
+        # تابع کمکی برای بررسی تاریخ‌ها
+        def is_future(dt):
+            if not dt: return False
+            if dt.tzinfo: return dt > now
+            return dt > now_naive
+
+        # 🟢 تشخیص وضعیت دقیق اکانت با چک کردن فیلدهای محدودیت تلگرام
+        is_cooldown = is_future(acc.expected_return_time)
+        is_restricted = is_future(acc.restricted_until) or is_future(acc.flood_wait_until)
+        is_banned = getattr(acc, "is_banned", False) or getattr(acc, "status", "") in ["blocked", "error"]
+        is_invalid = not getattr(acc, "session_string", None)
+
+        if is_banned:
+            emoji_status = "🔴"
+            status_text = "مسدود/حذف شده"
+        elif is_invalid:
+            emoji_status = "⚪️"
+            status_text = "نامعتبر/خروج زده"
+        elif is_restricted:
             emoji_status = "🔴"
             status_text = "محدود/اسپم"
         elif is_cooldown:
             emoji_status = "🟡"
-            rem_time = acc.expected_return_time - now
+            rem_time = (acc.expected_return_time - now if acc.expected_return_time.tzinfo else acc.expected_return_time - now_naive)
             hours, remainder = divmod(int(rem_time.total_seconds()), 3600)
             mins, _ = divmod(remainder, 60)
             status_text = f"استراحت ({hours}h:{mins}m)"
@@ -2073,7 +2075,28 @@ async def account_health_detail(callback: types.CallbackQuery, session: AsyncSes
         return await callback.message.answer("⚠️ اکانت یافت نشد.")
 
     now = datetime.now(timezone.utc)
-    is_cooldown = acc.expected_return_time and acc.expected_return_time > now
+    now_naive = now.replace(tzinfo=None)
+
+    def is_future(dt):
+        if not dt: return False
+        if dt.tzinfo: return dt > now
+        return dt > now_naive
+
+    is_cooldown = is_future(acc.expected_return_time)
+    is_restricted = is_future(acc.restricted_until) or is_future(acc.flood_wait_until)
+    is_banned = getattr(acc, "is_banned", False) or getattr(acc, "status", "") in ["blocked", "error"]
+    is_invalid = not getattr(acc, "session_string", None)
+    
+    if is_banned:
+        status_str = "🔴 مسدود/حذف شده"
+    elif is_invalid:
+        status_str = "⚪️ نامعتبر/خروج زده"
+    elif is_restricted:
+        status_str = "🔴 محدود/اسپم (FloodWait/Restrict)"
+    elif is_cooldown:
+        status_str = "🟡 در حال استراحت"
+    else:
+        status_str = "🟢 سالم و فعال"
     
     builder = InlineKeyboardBuilder()
     if is_cooldown:
@@ -2084,7 +2107,6 @@ async def account_health_detail(callback: types.CallbackQuery, session: AsyncSes
     builder.button(text="🔙 بازگشت به لیست", callback_data="menu_account_health_page_1/")
     builder.adjust(1)
 
-    status_str = "🟢 فعال" if not getattr(acc, "spam_restricted", False) else "🔴 اسپم"
     text = (
         f"👤 <b>جزئیات سلامت اکانت</b>\n\n"
         f"📱 شماره: <code>{acc.phone_number}</code>\n"
@@ -2093,3 +2115,58 @@ async def account_health_detail(callback: types.CallbackQuery, session: AsyncSes
     )
     
     await safe_edit_message(callback.message, text, reply_markup=builder.as_markup())
+
+from datetime import timedelta
+from database.models import AccountStatus
+
+@router.callback_query(F.data.startswith("force_cooldown_") & F.data.endswith("/"))
+async def force_cooldown_handler(callback: types.CallbackQuery, session: AsyncSession):
+    acc_id = int(callback.data.replace("force_cooldown_", "").replace("/", ""))
+    try:
+        acc = await session.get(Account, acc_id)
+        if not acc:
+            return await callback.answer("⚠️ اکانت یافت نشد.", show_alert=True)
+        
+        # اعمال زمان استراحت به مدت ۲۴ ساعت
+        now_utc = datetime.now(timezone.utc)
+        acc.expected_return_time = now_utc + timedelta(hours=24)
+        acc.status = AccountStatus.cooldown
+        
+        await session.commit()
+        await callback.answer("✅ استراحت ۲۴ ساعته با موفقیت اعمال شد.", show_alert=True)
+        
+        # رفرش کردن صفحه جزئیات برای نمایش وضعیت جدید
+        await account_health_detail(callback, session)
+    except Exception as e:
+        await session.rollback()
+        await callback.answer(f"❌ خطا: {e}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("reset_cooldown_") & F.data.endswith("/"))
+async def reset_cooldown_handler(callback: types.CallbackQuery, session: AsyncSession):
+    acc_id = int(callback.data.replace("reset_cooldown_", "").replace("/", ""))
+    try:
+        acc = await session.get(Account, acc_id)
+        if not acc:
+            return await callback.answer("⚠️ اکانت یافت نشد.", show_alert=True)
+        
+        # پاک کردن زمان استراحت
+        acc.expected_return_time = None
+        acc.status = AccountStatus.active
+        
+        # پاک کردن استراحت از کش ردیس (تا ورکر بلافاصله آماده شود)
+        try:
+            from workers.sender import _get_redis
+            redis_client = _get_redis()
+            await redis_client.delete(f"chunk_cooldown:{acc.id}")
+        except Exception:
+            pass
+            
+        await session.commit()
+        await callback.answer("✅ استراحت اکانت لغو شد و به صف کار بازگشت.", show_alert=True)
+        
+        # رفرش کردن صفحه جزئیات
+        await account_health_detail(callback, session)
+    except Exception as e:
+        await session.rollback()
+        await callback.answer(f"❌ خطا: {e}", show_alert=True)

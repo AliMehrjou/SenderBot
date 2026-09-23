@@ -431,7 +431,13 @@ async def auto_reconnect_loop(worker_pool: dict, bot: Bot) -> None:
                     f"\n🌐 <b>وضعیت نهایی استخر:</b> <code>{connected_now}</code> متصل از "
                     f"<code>{len(worker_pool)}</code> ورکر"
                 )
-                await notify_admins(bot, "\n\n".join(parts))
+                
+                # ارسال فقط به ادمین اصلی (جایگزین تابع notify_admins)
+                if bot and config.ADMIN_ID:
+                    try:
+                        await bot.send_message(chat_id=config.ADMIN_ID, text="\n\n".join(parts))
+                    except Exception as e:
+                        logger.error(f"Failed to send reconnect alert to main admin: {e}")
                 
             elif total_changes > 0:
                 logger.info(f"Background Reconnect: {len(reconnected_ids)} reconnected, {len(added_ids)} added. Telegram notification suppressed.")
@@ -578,9 +584,18 @@ async def get_pool_status() -> dict:
         return stats
 
 
+# 🟢 متغیر سراسری برای جلوگیری از تکرار پیام اتمام پروکسی
+_proxy_depleted_notified = False
+
 async def check_all_proxies(bot: Bot = None) -> None:
+    global _proxy_depleted_notified
     """تست سلامت تمام پروکسی‌های فعال در دیتابیس (بدون بلاک کردن UI)"""
     async with async_session() as session:
+        # 🟢 بررسی تنظیمات جهانی: اگر پروکسی برای سندر غیرفعال است، نیازی به اسکن و هشدار نیست
+        use_proxy = await get_use_proxy_for_sending(session)
+        if not use_proxy:
+            return
+
         try:
             from sqlalchemy import or_
             proxies = (await session.execute(select(Proxy.proxy_string).where(
@@ -596,14 +611,26 @@ async def check_all_proxies(bot: Bot = None) -> None:
         
     # چک آمار و ارسال هشدار اتمام
     stats = await get_pool_status()
+    
+    # 🟢 ریست کردن وضعیت هشدار در صورت اضافه شدن/شارژ شدن پروکسی سالم
+    if stats["healthy_free"] > 0:
+        _proxy_depleted_notified = False
+        
     if stats["healthy_free"] == 0 and stats["total_active"] > 0 and bot:
-        if not _no_proxy_alert_throttled(0):
-            await notify_admins(
-                bot,
-                "⚠️ <b>پروکسی‌های سالم و آزاد به پایان رسیده‌اند!</b>\n\n"
+        # 🟢 ارسال پیام فقط یک بار (تا زمانی که دوباره پروکسی سالم اضافه نشود، پیام تکرار نمی‌شود)
+        if not _proxy_depleted_notified:
+            msg_text = (
+                "⚠️ <b>پروکسی‌های سالم و آزاد برای سندر به پایان رسیده‌اند!</b>\n\n"
                 f"🟢 سالمِ آزاد: <b>0</b>\n🟡 ضعیف: <b>{stats['weak']}</b>\n🔴 مرده: <b>{stats['dead']}</b>\n"
-                "<i>لطفاً جهت اتصال اکانت‌های جدید پروکسی اضافه کنید.</i>"
+                "<i>لطفاً جهت اتصال اکانت‌ها و ادامه ارسال، پروکسی جدید اضافه کنید.</i>"
             )
+            # ارسال فقط به ادمین اصلی (جایگزین تابع notify_admins)
+            if config.ADMIN_ID:
+                try:
+                    await bot.send_message(chat_id=config.ADMIN_ID, text=msg_text)
+                except Exception as e:
+                    logger.error(f"Failed to send proxy depletion alert to main admin: {e}")
+            _proxy_depleted_notified = True
 
 
 async def proxy_health_monitor_task(bot: Bot) -> None:

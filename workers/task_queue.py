@@ -2113,7 +2113,12 @@ async def background_order_execution(
                         break
 
             # 🔴 سوییچ فوری روی لیمیت ورکر (Immediate Limit Failover)
-            limit_reasons = ("flood_wait", "blocked", "banned", "consecutive_errors", "chunk_limit", "hourly_cap", "daily_cap", "error", "proxy_connection_error")
+            limit_reasons = (
+                "flood_wait", "blocked", "banned", "consecutive_errors", 
+                "chunk_limit", "hourly_cap", "daily_cap", "error", 
+                "proxy_connection_error", "account_limited", 
+                "account_banned", "account_inactive"
+            )
             if not _is_extract_order(order) and stop_reason in limit_reasons and unsent_targets:
                 new_worker_found = False
                 async with session_maker() as session:
@@ -2162,73 +2167,42 @@ async def background_order_execution(
                 if new_worker_found:
                     continue
                 else:
-                    # 🟢 اضافه شده: پایان فوری سفارش در صورت اتمام سقف روزانه اکانت‌ها و ارسال فایل خروجی
-                    if stop_reason == "daily_cap":
-                        async with session_maker() as session:
-                            db_order = await session.get(Order, order_id)
-                            if db_order:
-                                success_count = await session.scalar(
-                                    select(func.count())
-                                    .select_from(OrderLog)
-                                    .where(OrderLog.order_id == order_id, OrderLog.status == "success")
-                                ) or 0
-                                
-                                finish_msg = f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). به دلیل رسیدن تمام اکانت‌ها به سقف روزانه، سفارش پایان یافت."
-                                
-                                final_status = OrderStatus.completed if success_count > 0 else OrderStatus.error
-                                db_order.status = final_status
-                                db_order.scheduled_for = None
-                                db_order.reject_reason = "اتمام سقف روزانه اکانت‌ها"
-                                
-                                session.add(OrderLog(order_id=order_id, target="System", status=final_status, error_message=finish_msg))
-                                await session.commit()
-                                
-                                # ارسال اتوماتیک فایل خروجی برای کارفرما
-                                if not _is_extract_order(db_order):
-                                    _spawn_background_task(_send_export_file(session_maker, bot, order_id, finish_msg))
-                                    
-                                # بروزرسانی داشبورد لایو کاربر
-                                task_type = "extract" if _is_extract_order(db_order) else "order"
-                                if reporter := _progress_reporters.get(f"{task_type}:{order_id}"):
-                                    if final_status == OrderStatus.completed:
-                                        await reporter.finish(f"✅ <b>پایان سفارش</b>\n\n{finish_msg}")
-                                    else:
-                                        await reporter.fail(f"⛔️ <b>لغو سفارش</b>\n\n{finish_msg}")
-                                    _pop_progress_reporter(task_type, order_id)
-                                    
-                                # اطلاع‌رسانی به ادمین سیستم
-                                from utils.admin_broadcast import broadcast_to_admins
-                                await broadcast_to_admins(bot, text=f"🏁 <b>پایان سفارش (سقف روزانه)</b>\n\nسفارش: <code>{order_id}</code>\n{finish_msg}")
-                        break
-
-                    # --- رفتار قبلی برای بقیه محدودیت‌ها (مثل فلادویت) که فقط استراحت ۳۰ دقیقه‌ای نیاز دارند ---
-                    min_wait_seconds = 1800  # مقدار پیش‌فرض امن خارج از کانتکست دیتابیس
+                    # 🟢 بازنویسی منطق: پایان فوری سفارش در صورت اتمام ورکرهای آماده و ارسال فایل خروجی برای هر دلیلی
                     async with session_maker() as session:
                         db_order = await session.get(Order, order_id)
                         if db_order:
-                            merged = [t for t in unsent_targets if t.strip()] + [t for t in (db_order.target_data or "").split("\n") if t.strip()]
-                            db_order.target_data = "\n".join(merged)
-                            db_order.status = OrderStatus.pending
+                            success_count = await session.scalar(
+                                select(func.count())
+                                .select_from(OrderLog)
+                                .where(OrderLog.order_id == order_id, OrderLog.status == "success")
+                            ) or 0
                             
-                            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-                            connected_ids = [aid for aid, c in list(worker_pool.items()) if getattr(c, "is_connected", False)]
-                            if connected_ids:
-                                stmt_accs = select(Account).where(Account.id.in_(connected_ids), Account.is_banned == False)
-                                valid_accs = (await session.scalars(stmt_accs)).all()
-                                redis = _get_redis()
-                                for vacc in valid_accs:
-                                    if vacc.flood_wait_until and vacc.flood_wait_until > now_naive:
-                                        wait = (vacc.flood_wait_until - now_naive).total_seconds()
-                                        if wait < min_wait_seconds: min_wait_seconds = wait
-                                    ttl = await redis.ttl(f"chunk_cooldown:{vacc.id}")
-                                    if ttl and 0 < ttl < min_wait_seconds:
-                                        min_wait_seconds = ttl
-                            db_order.scheduled_for = datetime.now(timezone.utc) + timedelta(seconds=min_wait_seconds + 10)
+                            finish_msg = f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). به دلیل عدم وجود ورکر آماده جایگزین (لیمیت/استراحت سایر اکانت‌ها)، سفارش پایان یافت."
+                            
+                            final_status = OrderStatus.completed if success_count > 0 else OrderStatus.error
+                            db_order.status = final_status
+                            db_order.scheduled_for = None
+                            db_order.reject_reason = "اتمام ورکرهای آماده و در دسترس"
+                            
+                            session.add(OrderLog(order_id=order_id, target="System", status=final_status, error_message=finish_msg))
                             await session.commit()
-                    
-                    reporter = _progress_reporters.get(f"order:{order_id}")
-                    if reporter:
-                        await reporter.update(status=f"⏳ تمام اکانت‌ها موقتاً در استراحت/لیمیت هستند. سفارش متوقف نشد و برای حدود {int(min_wait_seconds/60)} دقیقه دیگر به تعویق افتاد...")
+                            
+                            # ارسال اتوماتیک فایل خروجی برای کارفرما
+                            if not _is_extract_order(db_order):
+                                _spawn_background_task(_send_export_file(session_maker, bot, order_id, finish_msg))
+                                
+                            # بروزرسانی داشبورد لایو کاربر
+                            task_type = "extract" if _is_extract_order(db_order) else "order"
+                            if reporter := _progress_reporters.get(f"{task_type}:{order_id}"):
+                                if final_status == OrderStatus.completed:
+                                    await reporter.finish(f"✅ <b>پایان سفارش</b>\n\n{finish_msg}")
+                                else:
+                                    await reporter.fail(f"⛔️ <b>لغو سفارش</b>\n\n{finish_msg}")
+                                _pop_progress_reporter(task_type, order_id)
+                                
+                            # اطلاع‌رسانی به ادمین سیستم
+                            from utils.admin_broadcast import broadcast_to_admins
+                            await broadcast_to_admins(bot, text=f"🏁 <b>پایان سفارش (کمبود ورکر)</b>\n\nسفارش: <code>{order_id}</code>\n{finish_msg}")
                     break
 
             elif stop_reason == "media_missing":
@@ -3684,67 +3658,32 @@ async def order_dispatcher_loop(
                 dispatched_anything = bool(send_jobs or extract_jobs or resolver_jobs)
                 
                 if not dispatched_anything and not empty_target_notify_code:
-                    # --- آیتم ۱: بازنویسی بلوک تصمیم‌گیری/لغو دیسپچر ---
-                    # (الف) تازه‌سازی بلادرنگ وضعیت اکانت‌ها از ردیس قبل از تصمیمِ لغو
+                    # --- بازنویسی منطق توقف سریع (Fail-Fast) دیسپچر ---
+                    # در این حالت هیچ تارگتی در این چرخه به ورکرها داده نشده است.
+                    
                     fresh_prechecks = {}
                     if eligible_accounts:
                         try:
                             redis = _get_redis()
                             pipe = redis.pipeline()
-                            
                             for acc in eligible_accounts:
                                 pipe.exists(f"busy_worker:{acc.id}")
-                                pipe.exists(f"chunk_cooldown:{acc.id}")
-                                pipe.get(_daily_key(acc.id)) 
                             results = await pipe.execute()
-                            idx = 0
-                            for acc in eligible_accounts:
-                                fresh_prechecks[acc.id] = {
-                                    "is_busy": bool(results[idx]),
-                                    "is_cooldown": bool(results[idx+1]),
-                                    "daily_sent": int(results[idx+2] or 0),
-                                }
-                                idx += 3
+                            for idx, acc in enumerate(eligible_accounts):
+                                fresh_prechecks[acc.id] = {"is_busy": bool(results[idx])}
                         except Exception as e:
                             logger.error(f"Failed to fetch fresh redis states for cancellation decision: {e}")
-                            # در صورت خطای موقت ردیس، فرض می‌کنیم اکانت‌ها مشغولند تا لغو مخرب رخ ندهد
                             for acc in eligible_accounts:
-                                fresh_prechecks[acc.id] = {"is_busy": True, "is_cooldown": False, "daily_sent": 0}
+                                fresh_prechecks[acc.id] = {"is_busy": True}
 
-                    # (ب) بررسی دقیق شرایط: آیا اصلاً اکانتی هست که بتواند در آینده این سفارش را انجام دهد؟
-                    has_future_capacity = False
-                    min_wait_ttl = None
+                    # آیا ورکری در حال ارسال (busy) هست؟ اگر بله، سیستم باید منتظر بماند.
+                    is_any_worker_busy = any(fresh_prechecks.get(acc.id, {}).get("is_busy", False) for acc in eligible_accounts)
+                    is_waiting_for_warmup = (accounts_delayed_by_warmup > 0)
                     
-                    if len(connected_ids) > 0:
-                        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-                        for acc in eligible_accounts:
-                            state = fresh_prechecks.get(acc.id, {})
-                            acc_daily_limit = effective_daily_limit(acc.created_at)
-                            
-                            if state.get("is_busy") or state.get("is_cooldown") or state.get("daily_sent", 0) < acc_daily_limit or acc.id in reserved_acc_ids:
-                                has_future_capacity = True
-                                
-                            # محاسبه زمان حدودی انتظار
-                            if acc.flood_wait_until and acc.flood_wait_until > now_naive:
-                                ttl = (acc.flood_wait_until - now_naive).total_seconds()
-                                if min_wait_ttl is None or ttl < min_wait_ttl: min_wait_ttl = ttl
-                            elif acc.restricted_until and acc.restricted_until > now_naive:
-                                ttl = (acc.restricted_until - now_naive).total_seconds()
-                                if min_wait_ttl is None or ttl < min_wait_ttl: min_wait_ttl = ttl
-                            else:
-                                try:
-                                    redis = _get_redis()
-                                    ttl = await redis.ttl(f"chunk_cooldown:{acc.id}")
-                                    if ttl and ttl > 0:
-                                        if min_wait_ttl is None or ttl < min_wait_ttl: min_wait_ttl = ttl
-                                except Exception: pass
-                                
-                    if accounts_delayed_by_warmup > 0:
-                        has_future_capacity = True
-
-                    # اگر اکانت سالمی در این لحظه وجود ندارد (چه موقت، چه دائم)، سفارش را می‌بندیم
-                    if not eligible_accounts:
-                        # دریافت آمار ارسال‌های موفق تا این لحظه
+                    # اگر هیچ اکانتی نیست، یا اکانت‌ها هستند ولی هیچ‌کدام busy یا در حال warmup نیستند 
+                    # (یعنی همگی در لیمیت، استراحت یا سقف روزانه گیر کرده‌اند) -> سفارش بلافاصله متوقف می‌شود
+                    if not eligible_accounts or (not is_any_worker_busy and not is_waiting_for_warmup):
+                        # توقف فوری سفارش و ارسال خروجی
                         success_count = (
                             await session.scalar(
                                 select(func.count())
@@ -3754,13 +3693,7 @@ async def order_dispatcher_loop(
                             or 0
                         )
                         
-                        # پیام پایان کار برای کاربر و ادمین
-                        if success_count > 0:
-                            finish_msg = f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). به دلیل اتمام ورکرهای سالم و در دسترس، سفارش با موفقیتِ جزئی پایان یافت."
-                        else:
-                            finish_msg = "هیچ ورکر سالمی برای انجام این سفارش در دسترس نبود و سفارش لغو شد."
-                        
-                        # بستن سفارش با وضعیت Completed (یا error بسته به ترجیح شما)
+                        finish_msg = f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). به دلیل عدم وجود ورکر آماده (لیمیت/استراحت سایر اکانت‌ها)، سفارش لغو و پایان یافت."
                         final_status = OrderStatus.completed if success_count > 0 else OrderStatus.error
                         
                         await session.execute(
@@ -3769,18 +3702,16 @@ async def order_dispatcher_loop(
                             .values(
                                 status=final_status, 
                                 scheduled_for=None, 
-                                reject_reason="اتمام ورکرهای سالم در لحظه"
+                                reject_reason="اتمام ورکرهای آماده و در دسترس"
                             )
                             .execution_options(synchronize_session=False)
                         )
                         session.add(OrderLog(order_id=order.id, target="System", status=final_status, error_message=finish_msg))
                         await session.commit()
                         
-                        # ارسال فایل خروجی به کاربر
                         if not _is_extract_order(order):
                             _spawn_background_task(_send_export_file(session_maker, bot, order.id, finish_msg))
                             
-                        # بروزرسانی داشبورد زنده کاربر
                         task_type = "extract" if _is_extract_order(order) else "order"
                         if reporter := _progress_reporters.get(f"{task_type}:{order.id}"):
                             if final_status == OrderStatus.completed:
@@ -3789,7 +3720,6 @@ async def order_dispatcher_loop(
                                 await reporter.fail(f"⛔️ <b>لغو سفارش</b>\n\n{finish_msg}")
                             _pop_progress_reporter(task_type, order.id)
                             
-                        # اطلاع به ادمین اصلی
                         await broadcast_to_admins(
                             bot,
                             text=f"🏁 <b>پایان سفارش به دلیل اتمام منابع</b>\n\nسفارش: <code>{order_tracking_code}</code>\n{finish_msg}"

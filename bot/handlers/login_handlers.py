@@ -976,24 +976,39 @@ async def finalize_login_and_save(
         await session.commit()
         await session.refresh(new_account)
 
+        # -------------------------------------------------------------
+        # +++ بخش اصلاح شده: ترتیب اجرای عملیات روی کلاینت موقت +++
+        # -------------------------------------------------------------
+
+        # ۱. تنظیم رمز دو مرحله‌ای توسط کلاینت موقت (قبل از دیسکانکت)
+        await maybe_enable_2fa(client, new_account, session, message.bot, admin_id)
+
         stmt_settings = select(GlobalSettings).limit(1)
         global_settings = await session.scalar(stmt_settings)
 
         sessions_terminated = False
         termination_attempted = False
 
+        # ۲. خروج از سایر نشست‌ها توسط کلاینت موقت (قبل از دیسکانکت)
         if global_settings and global_settings.terminate_sessions:
             termination_attempted = True
             sessions_terminated = await terminate_other_sessions(client)
 
+        # ۳. 🟢 قطع قطعی کلاینت موقت برای جلوگیری از تداخل (Conflict) در سرور تلگرام
+        if client.is_connected:
+            with suppress(Exception):
+                await client.disconnect()
+
+        # ۴. حالا که سوکت کلاینت موقت کاملاً بسته شد، استارت ورکر اصلی انجام می‌شود
         if not worker_proxy:
             started = False
         else:
             started = await start_single_worker(new_account, session)
+            
+        # -------------------------------------------------------------
 
         if started:
             login_success = True
-            await maybe_enable_2fa(client, new_account, session, message.bot, admin_id)
             
             # پیام غنی‌شده با اطلاعات کاربر
             msg = (

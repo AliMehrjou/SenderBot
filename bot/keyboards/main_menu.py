@@ -57,20 +57,33 @@ def get_main_menu_keyboard() -> types.InlineKeyboardMarkup:
     return builder.as_markup()
 
 def get_main_menu_reply_keyboard() -> ReplyKeyboardMarkup:
-    """⌨️ نسخه‌ی دکمه‌ای منوی اصلی — کیبورد پایین چت با پشتیبانی از رنگ‌ها"""
+    """⌨️ نسخه‌ی دکمه‌ای منوی اصلی — کیبورد مینیمال پایین چت"""
     keyboard = [
         [
-            KeyboardButton(
-                text=btn["text"], 
-                style=btn.get("style", "primary")
-            ) for btn in row
-        ] for row in MAIN_MENU_LAYOUT
+            KeyboardButton(text="🛍 ثبت سفارش"),
+            KeyboardButton(text="📋 لیست سفارشات")
+        ],
+        [
+            KeyboardButton(text="🌐 آنالیز"),
+            KeyboardButton(text="🏛 منوی اصلی")
+        ],
+        [
+            KeyboardButton(text="🔄 ریستارت ربات")
+        ]
     ]
     
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
-        is_persistent=True,
+        is_persistent=False,  # 🟢 این مقدار باید False باشد تا کاربر بتواند کیبورد را ببندد
+        # one_time_keyboard=True, # 💡 اگر می‌خواهید بعد از زدن هر دکمه، کیبورد خودکار مخفی شود این خط را از کامنت درآورید
+        input_field_placeholder="🏢 Master Control Panel...",
+    )
+    
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=True, # این گزینه کیبورد را همیشه پایین صفحه نگه می‌دارد
         input_field_placeholder="🏢 Master Control Panel...",
     )
 
