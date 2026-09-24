@@ -641,69 +641,6 @@ async def choose_package_for_account(callback: types.CallbackQuery) -> None:
     )
 
 
-@router.callback_query(F.data.startswith("photo_pkg_set:"), IsAdmin())
-async def assign_package_to_account(callback: types.CallbackQuery) -> None:
-    _, acc_id_str, pkg_id_str = callback.data.split(":")
-    acc_id, pkg_id = int(acc_id_str), int(pkg_id_str)
-
-    try:
-        async with async_session_maker() as session:
-            account = await session.get(Account, acc_id)
-            package = await session.get(ProfilePhotoPackage, pkg_id)
-            if not account or not package:
-                return await callback.answer("⚠️ اکانت یا پکیج یافت نشد.", show_alert=True)
-            
-            pkg_name, phone = package.name, account.phone_number
-            account.photo_package_id = package.id
-            await session.commit()
-    except Exception as e:
-        logger.error(f"DB Error in assign_package_to_account: {e}")
-        return await report_db_error(callback, e)
-
-    safe_name = html.escape(pkg_name)
-    # پاپ‌آپ Alert برداشته شد تا هیچ نوتیفیکیشنی روی صفحه نیاید
-    await callback.answer()
-    
-    try:
-        from workers.session_manager import apply_photo_package_now
-        await apply_photo_package_now(acc_id)
-    except Exception as e:
-        logger.warning(f"Immediate photo rotation failed for account {acc_id}: {e}")
-
-    builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="↩️ لیست اکانت‌ها", callback_data="photo_pkg_assign/"))
-    builder.row(types.InlineKeyboardButton(text="🖼 پنل پکیج‌ها", callback_data="photo_pkg_panel/"))
-    
-    # متغیر status_note کاملاً حذف شد تا کاربر از اعمال فوری مطلع نشود
-    await safe_edit_or_answer(
-        callback.message,
-        f"✅ پکیج «{safe_name}» به <code>{phone}</code> متصل شد.",
-        reply_markup=builder.as_markup(),
-    )
-
-
-@router.callback_query(F.data.startswith("photo_pkg_unset:"), IsAdmin())
-async def unassign_package_from_account(callback: types.CallbackQuery) -> None:
-    acc_id = int(callback.data.split(":")[1])
-    
-    try:
-        async with async_session_maker() as session:
-            account = await session.get(Account, acc_id)
-            if not account or not account.photo_package_id:
-                return await callback.answer("⚠️ این اکانت پکیجی ندارد.", show_alert=True)
-            account.photo_package_id = None
-            await session.commit()
-    except Exception as e:
-        logger.error(f"DB Error in unassign_package_from_account: {e}")
-        return await report_db_error(callback, e)
-        
-    await callback.answer("✅ تخصیص حذف شد.", show_alert=True)
-    await _send_accounts_page(callback.message, page=0)
-
-
-# ==========================================
-# ⚡️ AUTO-ASSIGN (کم‌استفاده‌ترین پکیج)
-# ==========================================
 @router.callback_query(F.data == "photo_pkg_auto/", IsAdmin())
 async def auto_assign_packages(callback: types.CallbackQuery) -> None:
     await callback.answer()
@@ -744,11 +681,14 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
                     )
                 )
             ).scalars().all()
-
+            
+            # ⚡️ جمع‌آوری ID اکانت‌هایی که پکیج دریافت می‌کنند
+            assigned_ids = []
             for acc in free_accounts:
                 best = min(complete, key=lambda p: counts[p.id])
                 acc.photo_package_id = best.id
                 counts[best.id] += 1
+                assigned_ids.append(acc.id)
 
             name_by_id = {p.id: p.name for p in complete}
             assigned_count = len(free_accounts)
@@ -765,15 +705,137 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
             reply_markup=get_photo_panel_keyboard(),
         )
 
+    # ⚡️ اجرای فرآیند تغییر عکس‌ها در پس‌زمینه برای تمام اکانت‌های جدید
+    if assigned_ids:
+        try:
+            from workers.session_manager import apply_photo_package_now
+            for a_id in assigned_ids:
+                asyncio.create_task(apply_photo_package_now(a_id))
+        except Exception as e:
+            logger.warning(f"Failed to trigger auto-apply background tasks: {e}")
+
     dist = "\n".join(f"• «{html.escape(name_by_id[pid])}»: {cnt} اکانت" for pid, cnt in counts.items())
     await safe_edit_or_answer(
         callback.message,
         f"⚡️ <b>تخصیص خودکار انجام شد</b>\n\n"
-        f"🔗 {assigned_count} اکانتِ بدون پکیج، به کم‌استفاده‌ترین پکیج‌ها متصل شدند.\n\n"
+        f"🔗 {assigned_count} اکانتِ بدون پکیج متصل شدند.\n"
+        f"⏳ <i>(عملیات اعمال عکس‌ها روی تلگرام در پس‌زمینه آغاز شد...)</i>\n\n"
         f"<b>توزیع نهایی (کل اتصال‌ها):</b>\n{dist}",
         reply_markup=get_photo_panel_keyboard(),
     )
 
+
+@router.callback_query(F.data.startswith("photo_pkg_unset:"), IsAdmin())
+async def unassign_package_from_account(callback: types.CallbackQuery) -> None:
+    acc_id = int(callback.data.split(":")[1])
+    
+    try:
+        async with async_session_maker() as session:
+            account = await session.get(Account, acc_id)
+            if not account or not account.photo_package_id:
+                return await callback.answer("⚠️ این اکانت پکیجی ندارد.", show_alert=True)
+            account.photo_package_id = None
+            await session.commit()
+    except Exception as e:
+        logger.error(f"DB Error in unassign_package_from_account: {e}")
+        return await report_db_error(callback, e)
+        
+    await callback.answer("✅ تخصیص حذف شد.", show_alert=True)
+    await _send_accounts_page(callback.message, page=0)
+
+
+# ==========================================
+# ⚡️ AUTO-ASSIGN (کم‌استفاده‌ترین پکیج)
+# ==========================================
+@router.callback_query(F.data == "photo_pkg_auto/", IsAdmin())
+async def auto_assign_packages(callback: types.CallbackQuery) -> None:
+    await callback.answer()
+
+    # ⏳ نمایش پیام انتظار بلافاصله پس از کلیک
+    await safe_edit_or_answer(
+        callback.message,
+        "⏳ <b>در حال پردازش و تخصیص خودکار پکیج‌ها...</b>\n\nاین عملیات ممکن است کمی طول بکشد، لطفاً منتظر بمانید."
+    )
+
+    try:
+        async with async_session_maker() as session:
+            packages = (
+                await session.execute(
+                    select(ProfilePhotoPackage).options(selectinload(ProfilePhotoPackage.photos))
+                )
+            ).scalars().all()
+            complete = [p for p in packages if len(p.photos) == PACKAGE_PHOTO_COUNT]
+
+            if not complete:
+                return await safe_edit_or_answer(
+                    callback.message,
+                    f"⚠️ هیچ پکیج کاملی ({PACKAGE_PHOTO_COUNT} عکسی) برای تخصیص وجود ندارد.",
+                    reply_markup=get_photo_panel_keyboard(),
+                )
+
+            counts = {p.id: 0 for p in complete}
+            rows = (
+                await session.execute(
+                    select(Account.photo_package_id, func.count(Account.id))
+                    .where(Account.photo_package_id.isnot(None))
+                    .group_by(Account.photo_package_id)
+                )
+            ).all()
+            for pid, cnt in rows:
+                if pid in counts:
+                    counts[pid] = cnt
+
+            free_accounts = (
+                await session.execute(
+                    select(Account).where(
+                        Account.photo_package_id.is_(None),
+                        Account.is_banned == False,
+                    )
+                )
+            ).scalars().all()
+            
+            # جمع‌آوری اکانت‌هایی که پکیج جدید می‌گیرند
+            assigned_ids = []
+            for acc in free_accounts:
+                best = min(complete, key=lambda p: counts[p.id])
+                acc.photo_package_id = best.id
+                counts[best.id] += 1
+                assigned_ids.append(acc.id)
+
+            name_by_id = {p.id: p.name for p in complete}
+            assigned_count = len(free_accounts)
+            await session.commit()
+            
+    except Exception as e:
+        logger.error(f"DB Error in auto_assign_packages: {e}")
+        return await report_db_error(callback, e)
+
+    if assigned_count == 0:
+        return await safe_edit_or_answer(
+            callback.message,
+            "ℹ️ همه‌ی اکانت‌ها (غیربن) پکیج دارند؛ چیزی برای تخصیص نبود.",
+            reply_markup=get_photo_panel_keyboard(),
+        )
+
+    # اجرای فرآیند تغییر عکس‌ها در پس‌زمینه
+    if assigned_ids:
+        try:
+            from workers.session_manager import apply_photo_package_now
+            for a_id in assigned_ids:
+                asyncio.create_task(apply_photo_package_now(a_id))
+        except Exception as e:
+            logger.warning(f"Failed to trigger auto-apply background tasks: {e}")
+
+    # ✅ جایگزینی پیام انتظار با گزارش نهایی
+    dist = "\n".join(f"• «{html.escape(name_by_id[pid])}»: {cnt} اکانت" for pid, cnt in counts.items())
+    await safe_edit_or_answer(
+        callback.message,
+        f"⚡️ <b>تخصیص خودکار با موفقیت انجام شد</b>\n\n"
+        f"🔗 <b>{assigned_count}</b> اکانتِ بدون پکیج متصل شدند.\n"
+        f"⏳ <i>(در حال حاضر ربات در پس‌زمینه مشغول اعمال این عکس‌ها روی سرورهای تلگرام است. نیازی نیست در این صفحه بمانید.)</i>\n\n"
+        f"<b>توزیع نهایی (کل اتصال‌ها):</b>\n{dist}",
+        reply_markup=get_photo_panel_keyboard(),
+    )
 
 
 # ==========================================

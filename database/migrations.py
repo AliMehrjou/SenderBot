@@ -286,17 +286,17 @@ async def run_startup_migrations() -> None:
             await session.rollback()
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         
-        # +++ فاز ۳: مهاجرت idempotent برای تنظیمات تهاجمی‌تر +++
+        # +++ فاز ۳: مهاجرت برای تنظیمات ایمن و جدید کارفرما +++
         try:
+            # اعمال اجباری تنظیمات جدید روی دیتابیس‌های قدیمی
             legacy_settings_sql = """
             UPDATE global_settings
-            SET send_limit_per_run = 80, cooldown_hours = 1, spam_penalty_days = 1
-            WHERE send_limit_per_run = 40 AND cooldown_hours = 24 AND spam_penalty_days = 3;
+            SET send_limit_per_run = 10, cooldown_hours = 24;
             """
             res = await session.execute(text(legacy_settings_sql))
             await session.commit()
             if res.rowcount > 0:
-                logger.info("Phase 3: Migrated legacy GlobalSettings to aggressive speed limits.")
+                logger.info("Phase 3: Migrated GlobalSettings to new safe limits (10 msgs, 24h cooldown).")
         except Exception as exc:
             logger.warning("Phase 3 Settings Migration failed: %s", exc)
             await session.rollback()

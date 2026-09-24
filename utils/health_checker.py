@@ -409,9 +409,16 @@ async def auto_reconnect_loop(worker_pool: dict, bot: Bot) -> None:
             # ---------------------------------------------------------
             total_changes = len(reconnected_ids) + len(added_ids)
             
-            if total_changes >= ALERT_THRESHOLD or len(disconnected_ids) >= ALERT_THRESHOLD:
+            # تغییر: اگر اکانت جدیدی (از صف انتظار) به استخر اضافه شد، حتماً پیام بده.
+            # قطعی‌ها و ریکانکت‌های جزئی (که معمولاً به خاطر نوسان شبکه است) همچنان با آستانه فیلتر می‌شوند.
+            if added_ids or len(reconnected_ids) >= ALERT_THRESHOLD or len(disconnected_ids) >= ALERT_THRESHOLD:
                 connected_now = sum(1 for c in list(worker_pool.values()) if c.is_connected)
-                parts = ["⚠️ <b>هشدار: گزارش چرخه‌ی Reconnect (تغییرات عمده)</b>"]
+                
+                # تغییر عنوان بر اساس نوع رخداد
+                if added_ids and not (len(reconnected_ids) >= ALERT_THRESHOLD or len(disconnected_ids) >= ALERT_THRESHOLD):
+                    parts = ["✅ <b>اتصال موفق اکانت(های) منتظر</b>"]
+                else:
+                    parts = ["⚠️ <b>هشدار: گزارش چرخه‌ی Reconnect (تغییرات عمده)</b>"]
                 
                 if reconnected_ids:
                     ids_text = ", ".join(f"<code>{i}</code>" for i in reconnected_ids[:20])
@@ -425,14 +432,14 @@ async def auto_reconnect_loop(worker_pool: dict, bot: Bot) -> None:
                     if len(added_ids) > 20:
                         ids_text += " و ..."
                     parts.append(
-                        f"➕ <b>ورکرهای اضافه‌شده به استخر:</b> <code>{len(added_ids)}</code>\n▫️ {ids_text}"
+                        f"➕ <b>ورکرهای اضافه‌شده به شبکه:</b> <code>{len(added_ids)}</code>\n▫️ {ids_text}"
                     )
                 parts.append(
                     f"\n🌐 <b>وضعیت نهایی استخر:</b> <code>{connected_now}</code> متصل از "
                     f"<code>{len(worker_pool)}</code> ورکر"
                 )
                 
-                # ارسال فقط به ادمین اصلی (جایگزین تابع notify_admins)
+                # ارسال فقط به ادمین اصلی
                 if bot and config.ADMIN_ID:
                     try:
                         await bot.send_message(chat_id=config.ADMIN_ID, text="\n\n".join(parts))

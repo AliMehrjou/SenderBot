@@ -1948,20 +1948,36 @@ async def worker_task_wrapper(
             stop_reason = "crash"
 
         finally:
-            # اعمال کول‌داون فقط در صورتی که حداقل یک پیام ارسال شده باشد
-            if unsent_targets is None or len(unsent_targets) < len(targets):
-                cooldown_hours = 24 
+            # بررسی تعداد ارسال‌های موفق در این دور
+            sent_count = len(targets) - len(unsent_targets) if unsent_targets is not None else 0
+            
+            if sent_count > 0:
+                cooldown_hours = 24
+                chunk_limit = 80 # مقدار پیش‌فرض
                 try:
                     settings_row = await session.scalar(select(GlobalSettings).limit(1))
-                    if settings_row and settings_row.cooldown_hours:
-                        cooldown_hours = settings_row.cooldown_hours
+                    if settings_row:
+                        if settings_row.cooldown_hours:
+                            cooldown_hours = settings_row.cooldown_hours
+                        if settings_row.send_limit_per_run:
+                            chunk_limit = settings_row.send_limit_per_run
                 except Exception: pass
                 
-                await mark_chunk_cooldown(account_db_id, cooldown_hours)
-                if reporter is not None:
-                    await reporter.update(
-                        status=f"اکانت user_{account_db_id}/ وارد استراحت دوره‌ای شد ({cooldown_hours} ساعت)."
-                    )
+                # 🧠 استراحت مشروط (Smart Cooldown):
+                # اکانت فقط زمانی به استراحت می‌رود که به یک لیمیت برخورد کرده باشد (stop_reason)
+                # یا تمام ظرفیت مجاز این دور (chunk_limit) را مصرف کرده باشد.
+                if stop_reason is not None or sent_count >= chunk_limit:
+                    await mark_chunk_cooldown(account_db_id, cooldown_hours)
+                    if reporter is not None:
+                        await reporter.update(
+                            status=f"اکانت user_{account_db_id}/ وارد استراحت دوره‌ای شد ({cooldown_hours} ساعت)."
+                        )
+                else:
+                    # اکانت ظرفیت باقیمانده دارد و بدون ثبت کول‌داون رها می‌شود
+                    if reporter is not None:
+                        await reporter.update(
+                            status=f"اکانت user_{account_db_id}/ دارای ظرفیت باقیمانده است و فوراً برای سفارشات دیگر آزاد شد."
+                        )
 
         return unsent_targets, stop_reason
 

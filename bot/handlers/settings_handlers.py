@@ -860,7 +860,7 @@ async def ask_for_send_limit(callback: types.CallbackQuery, state: FSMContext) -
         callback.message,
         with_cancel_hint(
             "⚙️ <b>تغییر ظرفیت ارسال</b>\n\n"
-            "لطفاً یک عدد وارد کنید (تعداد پیامی که هر ورکر در یک دوره اجرای سفارش ارسال می‌کند، پیش‌فرض ۴۰):"
+            "لطفاً یک عدد وارد کنید (تعداد پیامی که هر ورکر در یک دوره اجرای سفارش ارسال می‌کند، پیش‌فرض ۱۰ و حداکثر ۵۰):"
         ),
         reply_markup=get_settings_cancel_keyboard()
     )
@@ -875,9 +875,9 @@ async def process_new_send_limit(message: types.Message, state: FSMContext, sess
 
     new_limit = int(message.text)
 
-    if not (1 <= new_limit <= 500):
+    if not (1 <= new_limit <= 50):
         return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۱ تا ۵۰۰ باشد."),
+            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۱ تا ۵۰ باشد."),
             reply_markup=get_settings_cancel_keyboard()
         )
 

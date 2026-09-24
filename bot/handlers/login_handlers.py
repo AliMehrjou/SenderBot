@@ -1000,10 +1000,7 @@ async def finalize_login_and_save(
                 await client.disconnect()
 
         # ۴. حالا که سوکت کلاینت موقت کاملاً بسته شد، استارت ورکر اصلی انجام می‌شود
-        if not worker_proxy:
-            started = False
-        else:
-            started = await start_single_worker(new_account, session)
+        started = await start_single_worker(new_account, session)
             
         # -------------------------------------------------------------
 

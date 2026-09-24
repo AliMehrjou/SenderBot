@@ -322,8 +322,8 @@ class GlobalSettings(Base):
     __tablename__ = "global_settings"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     max_accounts_per_api: Mapped[int] = mapped_column(default=5, nullable=False)
-    send_limit_per_run: Mapped[int] = mapped_column(default=80, nullable=False)
-    cooldown_hours: Mapped[int] = mapped_column(default=1, nullable=False)
+    send_limit_per_run: Mapped[int] = mapped_column(default=10, nullable=False) # تغییر به 10
+    cooldown_hours: Mapped[int] = mapped_column(default=24, nullable=False)     # تغییر به 24
     spam_penalty_days: Mapped[int] = mapped_column(default=1, nullable=False)
     
     auto_set_2fa: Mapped[bool] = mapped_column(default=True, nullable=False)         
