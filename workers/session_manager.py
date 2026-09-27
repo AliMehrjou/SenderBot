@@ -119,37 +119,93 @@ worker_pool: Dict[int, Client] = {}
 # ==========================================
 # UTILITY: PROXY PARSER
 # ==========================================
+from urllib.parse import unquote
+
 def parse_proxy_string(proxy_string: str) -> Optional[dict]:
     if not proxy_string:
         return None
         
     try:
-        parsed = urlparse(proxy_string)
-        if not parsed.hostname or not parsed.port:
-            logger.error("Missing hostname or port in proxy string.")
-            return None
+        proxy_string = proxy_string.strip()
+        
+        # حذف پیشوندها برای یکسان‌سازی فرمت
+        if proxy_string.lower().startswith("socks5://"):
+            proxy_string = proxy_string[9:]
+        elif proxy_string.lower().startswith("socks5h://"):
+            proxy_string = proxy_string[10:]
+        elif "://" in proxy_string:
+            proxy_string = proxy_string.split("://", 1)[1]
+
+        username = None
+        password = None
+        hostname = None
+        port = None
+
+        # حالت اول: فرمت User:Pass@IP:Port
+        if "@" in proxy_string:
+            auth_part, addr_part = proxy_string.rsplit("@", 1)
             
-        scheme = parsed.scheme.lower()
-        if scheme not in ["socks4", "socks5"]:
-            logger.error(f"Unsupported proxy scheme '{scheme}'. Pyrogram requires socks4 or socks5.")
-            return None
+            if ":" in auth_part:
+                username, password = auth_part.split(":", 1)
+            else:
+                username = auth_part
+                
+            hostname, port_str = addr_part.split(":", 1)
+            port = int(port_str)
             
-        # 🛡 فاز ۵ (BUG-14c): urlparse اجزای userinfo را URL-encoded برمی‌گرداند.
-        # پسوردِ حاوی @ : / % و… به‌صورت %40/%3A/%2F در رشته ذخیره می‌شود؛ بدون
-        # unquote همان رشته‌ی encode شده به Pyrogram پاس می‌شود و اتصال بی‌دلیل
-        # fail می‌شود. گارد «is not None» سمانتیک قبلی را حفظ می‌کند (None→None،
-        # ""→"" و از unquote(None) که TypeError می‌دهد جلوگیری می‌کند).
+        # حالت دوم: فرمت IP:Port:User:Pass یا IP:Port ساده
+        else:
+            parts = proxy_string.split(":")
+            if len(parts) == 2:
+                hostname, port_str = parts
+                port = int(port_str)
+            elif len(parts) == 4:
+                hostname, port_str, username, password = parts
+                port = int(port_str)
+            else:
+                logger.error(f"Invalid proxy format: {proxy_string}")
+                return None
+
         return {
-            "scheme": scheme,
-            "hostname": parsed.hostname,
-            "port": int(parsed.port),
-            "username": unquote(parsed.username) if parsed.username is not None else None,
-            "password": unquote(parsed.password) if parsed.password is not None else None
+            "scheme": "socks5",
+            "hostname": hostname,
+            "port": port,
+            "username": unquote(username) if username else None,
+            "password": unquote(password) if password else None
         }
     except Exception as e:
         logger.error(f"Failed to parse proxy string '{proxy_string}': {e}")
         return None
 
+async def clear_profile_photos_now(account_id: int) -> bool:
+    """بک‌گراند تسک با حلقه تهاجمی برای پاک کردن قطعی تمام عکس‌های پروفایل"""
+    client = worker_pool.get(account_id)
+    if not client or not client.is_connected:
+        return False
+        
+    import asyncio
+    try:
+        deleted_count = 0
+        while True:
+            # در هر دور فقط ۵ عکس می‌گیریم و پاک می‌کنیم تا آیدی‌ها منقضی نشوند
+            photos = [p async for p in client.get_chat_photos("me", limit=5)]
+            if not photos:
+                break
+                
+            for photo in photos:
+                try:
+                    await client.delete_profile_photos([photo.file_id])
+                    deleted_count += 1
+                    await asyncio.sleep(1.5)
+                except Exception as e:
+                    logger.warning(f"Worker {client.name}: failed to delete a photo: {e}")
+                    
+        logger.info(f"Worker {client.name}: {deleted_count} profile photos aggressively cleared.")
+        return True
+    except Exception as e:
+        logger.warning(f"Worker {client.name}: failed to clear profile photos: {e}")
+        return False
+    
 
 # ==========================================
 # 🧲 PROXY CLAIM LOGIC (فاز ۵ — BUG-14a/14b)

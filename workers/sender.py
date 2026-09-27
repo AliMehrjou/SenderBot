@@ -575,50 +575,50 @@ async def _ensure_source_channel_access(
     client: Client,
     order: Order,
 ) -> tuple[bool, Optional[int], str]:
-    """
-    🟢 فاز ۳: قبل از شروع ارسال، بررسی می‌کند که آیا ورکر به کانال مبدا دسترسی دارد.
     
-    برمی‌گرداند:
-      (accessible, resolved_chat_id, status_message)
-    
-    حالت‌ها:
-      - accessible=True  → ورکر عضو است یا کانال پابلیک است؛ آماده‌ی ارسال.
-      - accessible=False → ورکر دسترسی ندارد؛ chunk باید به‌طور کامل به unsent برگردد.
-    
-    نکته: این تابع سعی نمی‌کند به کانال مبدا join بزند (join کردن کانال مبدا
-    معمولاً مطلوب admin نیست و می‌تواند باعث ban اکانت شود). فقط resolve و
-    access-check می‌کند.
-    """
     if not order.source_channel_id and not getattr(order, "source_message_ids", None):
-        # سفارش فوروارد نیست — چیزی برای بررسی نیست
         return True, None, "no_source_channel"
     
-    # تجزیه‌ی source_message_ids برای گرفتن source_username (قطب سوم)
     source_username = None
+    source_invite_link = None
+    
     if order.source_message_ids:
         parts = order.source_message_ids.split("|")
         if len(parts) > 2 and parts[2]:
-            source_username = parts[2]  # مثلاً "@channelname"
-    
+            source_username = parts[2]
+        if len(parts) > 3 and parts[3]:
+            source_invite_link = parts[3] # 🟢 استخراج لینک دعوت
+            
+    # 🟢 اولویت ویژه: اگر لینک دعوت داریم، ورکر ابتدا باید جوین بدهد
+    if source_invite_link:
+        try:
+            from pyrogram.errors import UserAlreadyParticipant, FloodWait
+            chat = await client.join_chat(source_invite_link)
+            return True, chat.id, "joined_via_invite"
+        except UserAlreadyParticipant:
+            return True, order.source_channel_id, "already_member"
+        except FloodWait as e:
+            return False, None, f"limit:flood_wait:{int(e.value)}"
+        except Exception as e:
+            logger.warning(f"Worker {client.name} failed to join private source channel via link: {e}")
+            # در صورت خطا ادامه می‌دهیم؛ شاید ورکر از قبل در کانال عضو باشد
+            
     # اولویت ۱: اگر یوزرنیم داریم (کانال پابلیک)، resolve می‌کنیم
     if source_username:
         try:
             chat = await asyncio.wait_for(client.get_chat(source_username), timeout=15)
             return True, chat.id, "resolved_via_username"
         except FloodWait as e:
-            # اگر FloodWait خوردیم، به‌معنای درست بودن کانال است ولی محدودیت داریم
             return False, None, f"limit:flood_wait:{int(e.value)}"
         except Exception as e:
             logger.warning(
                 f"Preflight source-check via username '{source_username}' failed "
                 f"for worker {client.name}: {e.__class__.__name__}"
             )
-            # به مسیر chat_id ادامه می‌دهیم
     
     # اولویت ۲: استفاده از source_channel_id عددی
     if order.source_channel_id:
         try:
-            # get_chat_member با "me" سریع‌تر از get_chat است و فقط عضویت را چک می‌کند
             from pyrogram.enums import ChatMemberStatus
             member = await asyncio.wait_for(
                 client.get_chat_member(order.source_channel_id, "me"),
@@ -643,7 +643,6 @@ async def _ensure_source_channel_access(
                 return False, None, "not_member"
             return False, None, f"error:{err_name}"
     
-    # هیچ منبعی برای resolve نداریم
     return False, None, "no_source_identifier"
 
 
@@ -955,10 +954,18 @@ async def execute_bulk_send(
         real_target = int(target) if target.lstrip("-").isdigit() else target
         markup = _reply_markup(button_text, button_url)
         parsed_text = parse_spintax(text) if text else ""
+        
         if media_path and os.path.exists(media_path):
-            if str(media_type or "").lower() == "video":
+            m_type = str(media_type or "").lower()
+            if m_type == "video":
                 return await client.send_video(chat_id=real_target, video=str(media_path), caption=parsed_text, reply_markup=markup)
-            return await client.send_photo(chat_id=real_target, photo=str(media_path), caption=parsed_text, reply_markup=markup)
+            # 🟢 پشتیبانی از موسیقی، ویس و داکیومنت اضافه شد
+            elif m_type in ["audio", "document", "music", "voice"]:
+                return await client.send_document(chat_id=real_target, document=str(media_path), caption=parsed_text, reply_markup=markup)
+            else:
+                # پیش‌فرض: عکس
+                return await client.send_photo(chat_id=real_target, photo=str(media_path), caption=parsed_text, reply_markup=markup)
+                
         return await client.send_message(chat_id=real_target, text=parsed_text, reply_markup=markup, disable_web_page_preview=True)
 
     stop_reason: Optional[str] = None

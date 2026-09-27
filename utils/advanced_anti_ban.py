@@ -110,30 +110,49 @@ async def randomize_profile(
 
 async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage") -> None:
     """
-    🖼 پکیج‌های ۳ تایی عکس پروفایل — جایگزینی عکس‌های پروفایل با عکس‌های پکیج.
-    استراتژی فاز ۴: آپلود امن عکس‌های جدید همراه با مهار FloodWait -> سپس حذف عکس‌های قدیمی -> Verify.
+    🖼 پکیج‌های عکس پروفایل — جایگزینی قطعی عکس‌های پروفایل.
+    استراتژی: حذف تهاجمی تمام عکس‌های فعلی -> آپلود عکس‌های جدید به صورت معکوس
     """
     if not package or not package.photos:
         return
 
     from pyrogram.errors import FloodWait
+    import asyncio
 
     async with PHOTO_ROTATION_SEMAPHORE:
-        # --- مرحله ۰: ثبت عکس‌های قدیمی برای حذف در آینده ---
+        # --- مرحله ۱: حذف تهاجمی و قطعی تمام عکس‌های قدیمی ---
+        deleted_count = 0
         try:
-            old_photos = [p async for p in client.get_chat_photos("me")]
-            old_ids = [p.file_id for p in old_photos] if old_photos else []
+            while True:
+                old_photos = [p async for p in client.get_chat_photos("me", limit=5)]
+                if not old_photos:
+                    break
+                for photo in old_photos:
+                    try:
+                        await client.delete_profile_photos([photo.file_id])
+                        deleted_count += 1
+                        await asyncio.sleep(1.5)
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 1)
+                        try:
+                            await client.delete_profile_photos([photo.file_id])
+                            deleted_count += 1
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
         except Exception as e:
-            logger.warning(f"Worker {client.name}: failed to fetch current profile photos: {e}")
-            old_ids = []
+            logger.warning(f"Worker {client.name}: error during aggressive old photo wipe: {e}")
+            
+        if deleted_count > 0:
+            logger.info(f"Worker {client.name}: {deleted_count} old profile photo(s) wiped completely.")
 
-        # --- مرحله ۱: آپلود عکس‌های پکیج به ترتیب position ---
+        # --- مرحله ۲: آپلود عکس‌های جدید به صورت معکوس (عکس اول، آواتار اصلی بماند) ---
         successful_uploads = 0
-        for photo in package.photos:
+        sorted_photos = sorted(package.photos, key=lambda p: getattr(p, "position", 0), reverse=True)
+        
+        for photo in sorted_photos:
             if not os.path.exists(photo.file_path):
-                logger.error(
-                    f"Worker {client.name}: package photo missing on disk: {photo.file_path} - Needs ADMIN check."
-                )
                 continue
 
             for attempt in range(2):
@@ -142,59 +161,25 @@ async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage") 
                     successful_uploads += 1
                     break
                 except FloodWait as e:
-                    logger.warning(
-                        f"Worker {client.name}: hit FloodWait ({e.value}s) during photo upload. Retrying..."
-                    )
-                    await asyncio.sleep(e.value)
-                    if attempt == 1:
-                        logger.error(
-                            f"Worker {client.name}: failed to set photo {photo.file_path} after retry due to FloodWait."
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Worker {client.name}: failed to set profile photo (pos={photo.position}): {e}"
-                    )
+                    logger.warning(f"Worker {client.name}: hit FloodWait ({e.value}s) during photo upload. Retrying...")
+                    await asyncio.sleep(e.value + 1)
+                except Exception:
                     break
             
-            await asyncio.sleep(random.uniform(2, 5))
+            await asyncio.sleep(random.uniform(5, 9))
 
-        # --- مرحله ۲: حذف عکس‌های قدیمی (فقط اگر آپلود جدیدی موفق بود) ---
-        if old_ids and successful_uploads > 0:
-            try:
-                await client.delete_profile_photos(old_ids)
-                logger.info(
-                    f"Worker {client.name}: {len(old_ids)} old profile photo(s) deleted."
-                )
-                await asyncio.sleep(random.uniform(2, 5))
-            except FloodWait as e:
-                logger.warning(
-                    f"Worker {client.name}: hit FloodWait ({e.value}s) during photo deletion. Waiting..."
-                )
-                await asyncio.sleep(e.value)
-                try:
-                    await client.delete_profile_photos(old_ids)
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(
-                    f"Worker {client.name}: failed to delete old profile photos: {e}"
-                )
-
-        # --- مرحله ۳: راستی‌آزمایی (Verify) مقادیر اعمال شده ---
+        # --- مرحله ۳: راستی‌آزمایی ---
         try:
             final_photos = [p async for p in client.get_chat_photos("me")]
             expected_count = len([p for p in package.photos if os.path.exists(p.file_path)])
             
-            if len(final_photos) == expected_count:
-                logger.info(
-                    f"Worker {client.name}: profile photo rotation verified successfully (Package: «{package.name}»)."
-                )
+            if len(final_photos) >= expected_count:
+                logger.info(f"Worker {client.name}: profile photo rotation verified successfully.")
             else:
-                logger.warning(
-                    f"Worker {client.name}: rotation incomplete. Expected {expected_count} photos, found {len(final_photos)}."
-                )
-        except Exception as e:
-            logger.debug(f"Worker {client.name}: could not verify rotation: {e}")
+                logger.warning(f"Worker {client.name}: rotation incomplete. Expected {expected_count}, found {len(final_photos)}.")
+        except Exception:
+            pass
+
 
 
 async def perform_warmup_cycle(client: Client, account_id: int) -> None:

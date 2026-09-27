@@ -100,7 +100,13 @@ def _build_banner_panel(banners: list, active_count: int):
     else:
         for idx, banner in enumerate(banners, start=1):
             status = "🟢 فعال" if banner.is_active else "🔴 غیرفعال"
-            media_label = {"photo": "📷 عکس", "video": "🎬 ویدیو"}.get(banner.media_type or "", "💬 فقط متن")
+            media_label = {
+                "photo": "📷 عکس", 
+                "video": "🎬 ویدیو", 
+                "document": "📄 فایل/سند",
+                "audio": "🎵 موسیقی",
+                "voice": "🎤 ویس"
+            }.get(banner.media_type or "", "💬 فقط متن")
             raw_text = (banner.text or "").strip()
             preview = html.escape(raw_text[:80]) + ("…" if len(raw_text) > 80 else "")
 
@@ -244,14 +250,15 @@ async def banner_process_text(message: types.Message, state: FSMContext) -> None
     await message.answer(
         with_cancel_hint(
             "🖼 <b>مدیای بنر را ارسال کنید (اختیاری):</b>\n\n"
-            "📷 عکس یا 🎬 ویدیو ارسال کنید، یا با دکمه‌ی «بدون مدیا» فقط متن را ثبت کنید.\n"
-            "<i>حداکثر حجم ویدیو: ۲۰ مگابایت.</i>"
+            "📷 عکس، 🎬 ویدیو، 📄 فایل، 🎵 موسیقی یا 🎤 ویس ارسال کنید، یا با دکمه‌ی «بدون مدیا» فقط متن را ثبت کنید.\n"
+            "<i>حداکثر حجم فایل/مدیا: ۲۰ مگابایت.</i>"
         ),
         reply_markup=_media_step_keyboard(),
     )
 
 
-@router.message(BannerStates.waiting_for_media, F.photo | F.video)
+
+@router.message(BannerStates.waiting_for_media, F.photo | F.video | F.document | F.audio | F.voice)
 async def banner_process_media(
     message: types.Message,
     state: FSMContext,
@@ -271,7 +278,6 @@ async def banner_process_media(
     media_path = None
     media_type = None
 
-    # 🛡 الگوی استاندارد دانلود پروژه: حفاظ کامل + پاکسازی فایل نصفه‌کاره
     try:
         if message.photo:
             media_type = "photo"
@@ -292,6 +298,44 @@ async def banner_process_media(
             media_path = f"{BANNERS_DIR}/{uuid.uuid4()}.mp4"
             await bot.download_file(file.file_path, destination=media_path)
 
+        elif message.document:
+            if message.document.file_size and message.document.file_size > 20 * 1024 * 1024:
+                return await message.answer(
+                    with_cancel_hint("⚠️ حجم فایل نباید بیشتر از ۲۰ مگابایت باشد."),
+                    reply_markup=_media_step_keyboard(),
+                )
+            media_type = "document"
+            file_id = message.document.file_id
+            ext = os.path.splitext(message.document.file_name)[1] if message.document.file_name else ".dat"
+            file = await bot.get_file(file_id)
+            media_path = f"{BANNERS_DIR}/{uuid.uuid4()}{ext}"
+            await bot.download_file(file.file_path, destination=media_path)
+
+        elif message.audio:
+            if message.audio.file_size and message.audio.file_size > 20 * 1024 * 1024:
+                return await message.answer(
+                    with_cancel_hint("⚠️ حجم موسیقی نباید بیشتر از ۲۰ مگابایت باشد."),
+                    reply_markup=_media_step_keyboard(),
+                )
+            media_type = "audio"
+            file_id = message.audio.file_id
+            ext = os.path.splitext(message.audio.file_name)[1] if message.audio.file_name else ".mp3"
+            file = await bot.get_file(file_id)
+            media_path = f"{BANNERS_DIR}/{uuid.uuid4()}{ext}"
+            await bot.download_file(file.file_path, destination=media_path)
+
+        elif message.voice:
+            if message.voice.file_size and message.voice.file_size > 20 * 1024 * 1024:
+                return await message.answer(
+                    with_cancel_hint("⚠️ حجم ویس نباید بیشتر از ۲۰ مگابایت باشد."),
+                    reply_markup=_media_step_keyboard(),
+                )
+            media_type = "voice"
+            file_id = message.voice.file_id
+            file = await bot.get_file(file_id)
+            media_path = f"{BANNERS_DIR}/{uuid.uuid4()}.ogg"
+            await bot.download_file(file.file_path, destination=media_path)
+
     except Exception as e:
         logger.error(f"Error downloading banner media: {e}", exc_info=True)
         _remove_banner_file(media_path)
@@ -302,12 +346,11 @@ async def banner_process_media(
 
     await _save_banner(session, message, state, banner_text, media_path, media_type)
 
-
 @router.message(BannerStates.waiting_for_media)
 async def banner_invalid_media(message: types.Message) -> None:
-    """محتوای غیرمجاز در مرحله‌ی مدیا (مثلاً فایل یا ویس)"""
+    """محتوای غیرمجاز در مرحله‌ی مدیا"""
     await message.answer(
-        with_cancel_hint("⚠️ فقط 📷 عکس یا 🎬 ویدیو پذیرفته می‌شود؛ یا دکمه‌ی «💬 بدون مدیا» را بزنید."),
+        with_cancel_hint("⚠️ فقط 📷 عکس، 🎬 ویدیو، 📄 فایل، 🎵 موسیقی یا 🎤 ویس پذیرفته می‌شود؛ یا دکمه‌ی «💬 بدون مدیا» را بزنید."),
         reply_markup=_media_step_keyboard(),
     )
 

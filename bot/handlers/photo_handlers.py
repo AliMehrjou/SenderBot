@@ -641,87 +641,54 @@ async def choose_package_for_account(callback: types.CallbackQuery) -> None:
     )
 
 
-@router.callback_query(F.data == "photo_pkg_auto/", IsAdmin())
-async def auto_assign_packages(callback: types.CallbackQuery) -> None:
+# ==========================================
+# 🔗 ASSIGN PACKAGE TO SPECIFIC ACCOUNT (تخصیص دستی)
+# ==========================================
+@router.callback_query(F.data.startswith("photo_pkg_set:"), IsAdmin())
+async def set_package_for_account(callback: types.CallbackQuery) -> None:
     await callback.answer()
+    
+    # استخراج ID اکانت و پکیج از دیتای کال‌بک
+    _, acc_id_str, pkg_id_str = callback.data.split(":")
+    acc_id = int(acc_id_str)
+    pkg_id = int(pkg_id_str)
 
-    try:
-        async with async_session_maker() as session:
-            packages = (
-                await session.execute(
-                    select(ProfilePhotoPackage).options(selectinload(ProfilePhotoPackage.photos))
-                )
-            ).scalars().all()
-            complete = [p for p in packages if len(p.photos) == PACKAGE_PHOTO_COUNT]
-
-            if not complete:
-                return await safe_edit_or_answer(
-                    callback.message,
-                    f"⚠️ هیچ پکیج کاملی ({PACKAGE_PHOTO_COUNT} عکسی) برای تخصیص وجود ندارد.",
-                    reply_markup=get_photo_panel_keyboard(),
-                )
-
-            counts = {p.id: 0 for p in complete}
-            rows = (
-                await session.execute(
-                    select(Account.photo_package_id, func.count(Account.id))
-                    .where(Account.photo_package_id.isnot(None))
-                    .group_by(Account.photo_package_id)
-                )
-            ).all()
-            for pid, cnt in rows:
-                if pid in counts:
-                    counts[pid] = cnt
-
-            free_accounts = (
-                await session.execute(
-                    select(Account).where(
-                        Account.photo_package_id.is_(None),
-                        Account.is_banned == False,
-                    )
-                )
-            ).scalars().all()
-            
-            # ⚡️ جمع‌آوری ID اکانت‌هایی که پکیج دریافت می‌کنند
-            assigned_ids = []
-            for acc in free_accounts:
-                best = min(complete, key=lambda p: counts[p.id])
-                acc.photo_package_id = best.id
-                counts[best.id] += 1
-                assigned_ids.append(acc.id)
-
-            name_by_id = {p.id: p.name for p in complete}
-            assigned_count = len(free_accounts)
-            await session.commit()
-            
-    except Exception as e:
-        logger.error(f"DB Error in auto_assign_packages: {e}")
-        return await report_db_error(callback, e)
-
-    if assigned_count == 0:
-        return await safe_edit_or_answer(
-            callback.message,
-            "ℹ️ همه‌ی اکانت‌ها (غیربن) پکیج دارند؛ چیزی برای تخصیص نبود.",
-            reply_markup=get_photo_panel_keyboard(),
-        )
-
-    # ⚡️ اجرای فرآیند تغییر عکس‌ها در پس‌زمینه برای تمام اکانت‌های جدید
-    if assigned_ids:
-        try:
-            from workers.session_manager import apply_photo_package_now
-            for a_id in assigned_ids:
-                asyncio.create_task(apply_photo_package_now(a_id))
-        except Exception as e:
-            logger.warning(f"Failed to trigger auto-apply background tasks: {e}")
-
-    dist = "\n".join(f"• «{html.escape(name_by_id[pid])}»: {cnt} اکانت" for pid, cnt in counts.items())
+    # ⏳ ۱. نمایش پیام انتظار به کاربر
     await safe_edit_or_answer(
         callback.message,
-        f"⚡️ <b>تخصیص خودکار انجام شد</b>\n\n"
-        f"🔗 {assigned_count} اکانتِ بدون پکیج متصل شدند.\n"
-        f"⏳ <i>(عملیات اعمال عکس‌ها روی تلگرام در پس‌زمینه آغاز شد...)</i>\n\n"
-        f"<b>توزیع نهایی (کل اتصال‌ها):</b>\n{dist}",
-        reply_markup=get_photo_panel_keyboard(),
+        "⏳ <b>در حال تخصیص پکیج به اکانت...</b>\n\nلطفاً چند لحظه منتظر بمانید."
+    )
+
+    # ۲. ثبت در دیتابیس
+    try:
+        async with async_session_maker() as session:
+            account = await session.get(Account, acc_id)
+            if not account:
+                return await safe_edit_or_answer(
+                    callback.message, 
+                    "⚠️ اکانت یافت نشد.",
+                    reply_markup=get_photo_panel_keyboard()
+                )
+            
+            account.photo_package_id = pkg_id
+            await session.commit()
+    except Exception as e:
+        logger.error(f"DB Error in set_package_for_account: {e}")
+        return await report_db_error(callback, e)
+
+    # ۳. اجرای فرآیند تغییر عکس‌ها در پس‌زمینه (بدون بلاک کردن ربات)
+    try:
+        from workers.session_manager import apply_photo_package_now
+        asyncio.create_task(apply_photo_package_now(acc_id))
+    except Exception as e:
+        logger.warning(f"Failed to trigger apply_photo_package_now: {e}")
+
+    # ۴. پیام موفقیت نهایی
+    await safe_edit_or_answer(
+        callback.message,
+        "✅ <b>تخصیص با موفقیت انجام شد!</b>\n\n"
+        "⏳ <i>ربات در پس‌زمینه در حال اعمال عکس‌ها روی سرور تلگرام است. نیازی نیست در این صفحه بمانید.</i>",
+        reply_markup=get_photo_panel_keyboard()
     )
 
 
@@ -740,7 +707,15 @@ async def unassign_package_from_account(callback: types.CallbackQuery) -> None:
         logger.error(f"DB Error in unassign_package_from_account: {e}")
         return await report_db_error(callback, e)
         
-    await callback.answer("✅ تخصیص حذف شد.", show_alert=True)
+    # --- بخش جدید: اجرای پاکسازی در پس‌زمینه ---
+    try:
+        from workers.session_manager import clear_profile_photos_now
+        asyncio.create_task(clear_profile_photos_now(acc_id))
+    except Exception as e:
+        logger.warning(f"Failed to trigger clear_profile_photos_now: {e}")
+    # ----------------------------------------
+        
+    await callback.answer("✅ تخصیص در دیتابیس حذف شد و عکس‌ها در پس‌زمینه پاک می‌شوند.", show_alert=True)
     await _send_accounts_page(callback.message, page=0)
 
 
@@ -759,11 +734,14 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
 
     try:
         async with async_session_maker() as session:
+            # واکشی تمامی پکیج‌ها به همراه عکس‌های آن‌ها
             packages = (
                 await session.execute(
                     select(ProfilePhotoPackage).options(selectinload(ProfilePhotoPackage.photos))
                 )
             ).scalars().all()
+            
+            # فیلتر کردن پکیج‌هایی که کامل هستند (دارای تعداد عکس مجاز)
             complete = [p for p in packages if len(p.photos) == PACKAGE_PHOTO_COUNT]
 
             if not complete:
@@ -773,6 +751,7 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
                     reply_markup=get_photo_panel_keyboard(),
                 )
 
+            # محاسبه تعداد اکانت‌های متصل به هر پکیج
             counts = {p.id: 0 for p in complete}
             rows = (
                 await session.execute(
@@ -781,10 +760,12 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
                     .group_by(Account.photo_package_id)
                 )
             ).all()
+            
             for pid, cnt in rows:
                 if pid in counts:
                     counts[pid] = cnt
 
+            # واکشی اکانت‌های آزاد (بدون پکیج و بن نشده)
             free_accounts = (
                 await session.execute(
                     select(Account).where(
@@ -797,6 +778,7 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
             # جمع‌آوری اکانت‌هایی که پکیج جدید می‌گیرند
             assigned_ids = []
             for acc in free_accounts:
+                # انتخاب پکیجی که کمترین استفاده را داشته است
                 best = min(complete, key=lambda p: counts[p.id])
                 acc.photo_package_id = best.id
                 counts[best.id] += 1
@@ -804,12 +786,15 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
 
             name_by_id = {p.id: p.name for p in complete}
             assigned_count = len(free_accounts)
+            
+            # ذخیره تغییرات در دیتابیس
             await session.commit()
             
     except Exception as e:
         logger.error(f"DB Error in auto_assign_packages: {e}")
         return await report_db_error(callback, e)
 
+    # بررسی اینکه آیا اصلا اکانتی برای تخصیص وجود داشته است یا خیر
     if assigned_count == 0:
         return await safe_edit_or_answer(
             callback.message,
@@ -817,12 +802,16 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
             reply_markup=get_photo_panel_keyboard(),
         )
 
-    # اجرای فرآیند تغییر عکس‌ها در پس‌زمینه
+    # اجرای فرآیند تغییر عکس‌ها در پس‌زمینه با استفاده از asyncio.gather برای مدیریت بهتر تسک‌ها
     if assigned_ids:
         try:
             from workers.session_manager import apply_photo_package_now
-            for a_id in assigned_ids:
-                asyncio.create_task(apply_photo_package_now(a_id))
+            
+            async def trigger_tasks():
+                 tasks = [apply_photo_package_now(a_id) for a_id in assigned_ids]
+                 await asyncio.gather(*tasks, return_exceptions=True)
+                 
+            asyncio.create_task(trigger_tasks())
         except Exception as e:
             logger.warning(f"Failed to trigger auto-apply background tasks: {e}")
 
@@ -836,8 +825,6 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
         f"<b>توزیع نهایی (کل اتصال‌ها):</b>\n{dist}",
         reply_markup=get_photo_panel_keyboard(),
     )
-
-
 # ==========================================
 # 🏠 باگ ۷ — هندلر دکمه متنی منوی اصلی
 # مسیر: (اضافه شود به بخش PANEL یا انتهای فایل)
@@ -1020,4 +1007,45 @@ async def process_replace_photo(message: types.Message, state: FSMContext) -> No
         
     await state.clear()
     await message.answer(f"✅ عکس {pos} با موفقیت جایگزین شد.", reply_markup=get_photo_finish_keyboard())
+
+
+from aiogram.filters import Command
+from pyrogram.errors import FloodWait
+import asyncio
+
+@router.message(Command("wipe_all_photos"))
+async def wipe_all_workers_photos(message: types.Message):
+    # بررسی امنیت: فقط ادمین اصلی بتواند اجرا کند
+    if str(message.from_user.id) != str(config.ADMIN_ID):
+        return
+        
+    await message.answer("🧹 <b>در حال پاکسازی تهاجمی...</b>\nربات در حال شخم زدن پروفایل تمام ورکرهاست. این عملیات ممکن است چند دقیقه طول بکشد.")
+    
+    from workers.session_manager import worker_pool
+    total_wiped = 0
+    
+    for account_id, client in worker_pool.items():
+        if not getattr(client, "is_connected", False):
+            continue
+        try:
+            # حلقه بی‌نهایت تا زمانی که هیچ عکسی نماند
+            while True:
+                photos = [p async for p in client.get_chat_photos("me", limit=5)]
+                if not photos:
+                    break # کاملاً خالی شد
+                    
+                for photo in photos:
+                    try:
+                        # ارسال در قالب لیست یک‌عضوی برای جلوگیری از باگ Pyrogram
+                        await client.delete_profile_photos([photo.file_id])
+                        total_wiped += 1
+                        await asyncio.sleep(1.5)
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 1)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"Wipe error for user_{account_id}: {e}")
+            
+    await message.answer(f"✅ <b>پاکسازی کامل شد!</b>\nمجموعاً <code>{total_wiped}</code> عکس از کل ورکرها به صورت قطعی حذف گردید.")
     

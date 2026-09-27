@@ -895,17 +895,13 @@ async def process_send_method_selection(message: types.Message, state: FSMContex
         await message.answer(
             with_cancel_hint(
                 "📋 <b>کپی از کانال مبدا</b>\n\n"
-                "شناسه‌ی عددی یا یوزرنیم کانال مبدا را ارسال کنید:\n\n"
-                "✅ یوزرنیم: <code>@mychannel</code>\n"
-                "✅ لینک عمومی: <code>https://t.me/mychannel</code>\n"
-                "✅ شناسه‌ی عددی: <code>-1001234567890</code>\n"
-                "✅ لینک خصوصی: <code>https://t.me/c/1234567890</code>\n\n"
-                "⚠️ حداقل یکی از اکانت‌های ورکر باید به این کانال دسترسی داشته باشد "
-                "(برای کانال‌های خصوصی یعنی عضویت) — در غیر این صورت کپی ممکن نیست."
+                "برای معرفی کانال مبدا، یکی از روش‌های زیر را انجام دهید:\n\n"
+                "🔓 <b>کانال‌های عمومی:</b> یوزرنیم کانال را بفرستید (مثال: <code>@mychannel</code>)\n\n"
+                "🔒 <b>کانال‌های خصوصی:</b>\n"
+                "لینک دعوت کانال (Invite Link) را همینجا ارسال کنید."
             ),
             reply_markup=get_flow_nav_keyboard(),
         )
-
 
 @router.message(CreateOrderStates.waiting_for_send_method)
 async def send_method_text_fallback(message: types.Message, state: FSMContext) -> None:
@@ -1004,6 +1000,74 @@ def _get_connected_worker_clients() -> list:
     except Exception:
         return []
 
+
+from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, IS_NOT_MEMBER, ADMINISTRATOR
+from aiogram.types import ChatMemberUpdated
+
+# این هندلر زمانی اجرا می‌شود که ربات در یک کانال ادمین شود
+@router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> ADMINISTRATOR))
+async def auto_detect_private_channel(event: ChatMemberUpdated, state: FSMContext, session: AsyncSession, bot: Bot):
+    chat = event.chat
+    if chat.type != "channel":
+        return
+
+    user_id = event.from_user.id
+    
+    # بررسی می‌کنیم آیا کاربر در مرحله ثبت سفارش و منتظر وارد کردن کانال مبدا است؟
+    current_state = await state.get_state()
+    if current_state == CreateOrderStates.waiting_for_source_channel.state:
+        
+        # ۱. استخراج اتوماتیک آیدی کانال
+        channel_id_str = str(chat.id)
+        
+        # ۲. ارسال پیام به کاربر که کانال به صورت خودکار شناخته شد
+        wait_msg = await bot.send_message(
+            chat_id=user_id, 
+            text=f"✅ <b>عالی!</b> ربات در کانال <b>{chat.title}</b> ادمین شد.\n"
+                 f"شناسه کانال شما (<code>{chat.id}</code>) به صورت خودکار ثبت شد.\n"
+                 "⏳ در حال بررسی دسترسی ورکرها..."
+        )
+        
+        # ۳. تولید لینک دعوت برای ورکرها (چون ربات حالا ادمین است)
+        invite = await bot.create_chat_invite_link(chat_id=channel_id_str)
+        source_invite_link = invite.invite_link
+        
+        # ۴. فراخوانی منطق بررسی ورکرها که از قبل نوشته‌اید
+        fsm_data = await state.get_data()
+        category_ids = fsm_data.get("selected_categories", [])
+        
+        # لاجیک کش و جوین ورکرها
+        await invalidate_source_channel_cache(channel_id_str)
+        validated_chat, error_text = await check_source_channel_access(source_invite_link, session, category_ids)
+        
+        await wait_msg.delete()
+        
+        if validated_chat is None:
+            return await bot.send_message(
+                chat_id=user_id,
+                text=with_cancel_hint(error_text or "⚠️ اتصال ورکرها به این کانال ناموفق بود. لطفاً دوباره تلاش کنید."),
+                reply_markup=get_flow_nav_keyboard()
+            )
+            
+        # ۵. هدایت اتوماتیک کاربر به مرحله بعدی (فوروارد پیام نمونه)
+        await state.update_data(
+            source_channel_id=validated_chat.id,
+            source_channel_title=validated_chat.title,
+            source_channel_username=validated_chat.username,
+            source_invite_link=source_invite_link,
+            source_message_ids=[],
+        )
+        await state.set_state(CreateOrderStates.waiting_for_source_messages)
+
+        await bot.send_message(
+            chat_id=user_id,
+            text=with_cancel_hint(
+                f"✅ کانال مبدا تأیید و ورکرها متصل شدند: <b>{validated_chat.title}</b>\n\n"
+                "📥 حالا <b>پیام(های) نمونه</b> را از همین کانال در این چت فوروارد کنید:\n\n"
+                "• حداکثر <b>{MAX_SOURCE_MESSAGES}</b> پیام (برای هر تارگت یکی از آن‌ها به‌صورت تصادفی کپی می‌شود)"
+            ),
+            reply_markup=get_end_collection_keyboard(),
+        )
 
 async def _check_channel_with_worker_sessions(
     channel_input: str,
@@ -1164,7 +1228,15 @@ async def check_source_channel_access(
     if connected_workers:
         for client in connected_workers:
             try:
-                chat = await asyncio.wait_for(client.get_chat(channel_input), timeout=30)
+                # 🟢 پشتیبانی از جوین خودکار با لینک
+                if "+" in channel_input or "joinchat" in channel_input:
+                    try:
+                        chat = await asyncio.wait_for(client.join_chat(channel_input), timeout=30)
+                    except UserAlreadyParticipant:
+                        chat = await asyncio.wait_for(client.get_chat(channel_input), timeout=30)
+                else:
+                    chat = await asyncio.wait_for(client.get_chat(channel_input), timeout=30)
+                
                 error_msg = None # کانال با موفقیت پیدا شد
                 break # نیازی به بررسی بقیه ورکرها نیست
             except (UsernameInvalid, UsernameNotOccupied):
@@ -1228,44 +1300,58 @@ async def check_source_channel_access(
 # 📋 STATE: دریافت شناسه/یوزرنیم کانال مبدا
 # ==========================================
 @router.message(CreateOrderStates.waiting_for_source_channel)
-async def process_source_channel(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text:
-        return await message.answer(
-            with_cancel_hint("⚠️ لطفاً شناسه‌ی عددی یا یوزرنیم کانال مبدا را به‌صورت متن ارسال کنید."),
-            reply_markup=get_flow_nav_keyboard(),
-        )
+async def process_source_channel(message: types.Message, state: FSMContext, session: AsyncSession, bot: Bot) -> None:
+    channel_input = None
+    is_invite_link = False
 
-    channel_input = _normalize_channel_input(message.text)
+    # ۱. بررسی اینکه آیا کاربر پیامی را از کانال فوروارد کرده است؟
+    fwd_chat_id, _ = _extract_forward_source(message)
+    if fwd_chat_id:
+        channel_input = str(fwd_chat_id)
+    # ۲. در غیر این صورت، بررسی متن ورودی (یوزرنیم یا لینک دعوت)
+    elif message.text:
+        channel_input = _normalize_channel_input(message.text)
+        if channel_input and ("+" in channel_input or "joinchat" in channel_input):
+            is_invite_link = True
 
-    if channel_input is None:
+    if not channel_input:
         return await message.answer(
             with_cancel_hint(
                 "⚠️ فرمت ورودی نامعتبر است.\n\n"
-                "✅ یوزرنیم: <code>@mychannel</code>\n"
-                "✅ لینک عمومی: <code>https://t.me/mychannel</code>\n"
-                "✅ شناسه‌ی عددی: <code>-1001234567890</code>\n"
-                "✅ لینک خصوصی: <code>https://t.me/c/1234567890</code>"
+                "✅ <b>کانال عمومی:</b> یوزرنیم بفرستید (مثال: <code>@mychannel</code>)\n"
+                "✅ <b>کانال خصوصی:</b> لینک دعوت (Invite Link) بفرستید.\n"
+                "✅ <b>فوروارد پیام:</b> همچنین می‌توانید یک پیام از کانال (عمومی) به اینجا فوروارد کنید."
             ),
             reply_markup=get_flow_nav_keyboard(),
         )
 
-    wait_msg = await message.answer("⏳ در حال بررسی دسترسی به کانال مبدا با یکی از اکانت‌های ورکر...")
+    wait_msg = await message.answer("⏳ در حال بررسی و اتصال ورکرها به کانال مبدا...")
 
     fsm_data = await state.get_data()
     category_ids = fsm_data.get("selected_categories", [])
 
-    # 🟢 فاز ۶: قبل از بررسی، cache مربوط به این ورودی را invalidate می‌کنیم
-    # تا اگر دسترسی از آخرین بررسی تغییر کرده، متوجه شویم.
     await invalidate_source_channel_cache(channel_input)
 
+    # تست دسترسی ورکرها (اگر لینک دعوت باشد، ورکر خودکار جوین می‌شود)
     chat, error_text = await check_source_channel_access(channel_input, session, category_ids)
 
     with suppress(TelegramBadRequest):
         await wait_msg.delete()
 
+    # اگر ورکر نتوانست دسترسی پیدا کند
     if chat is None:
+        # اگر کاربر پیام فوروارد کرده بود (آیدی خصوصی داشتیم) اما لینک دعوت نداده بود
+        if not is_invite_link and channel_input.startswith("-100"):
+            error_msg = (
+                "⚠️ <b>ورکرها به این کانال خصوصی دسترسی ندارند.</b>\n\n"
+                "برای کانال‌های خصوصی، فوروارد پیام کافی نیست (چون ربات عضو کانال شما نیست).\n"
+                "🔗 <b>لطفاً لینک دعوت کانال (Invite Link) را کپی کرده و اینجا ارسال کنید</b> تا ورکرها بتوانند عضو شوند."
+            )
+        else:
+            error_msg = error_text or "⚠️ بررسی کانال مبدا ناموفق بود."
+            
         return await message.answer(
-            with_cancel_hint(error_text or "⚠️ بررسی کانال مبدا ناموفق بود. لطفاً دوباره تلاش کنید."),
+            with_cancel_hint(error_msg),
             reply_markup=get_flow_nav_keyboard(),
         )
 
@@ -1275,15 +1361,15 @@ async def process_source_channel(message: types.Message, state: FSMContext, sess
     protected_warning = ""
     if getattr(chat, "has_protected_content", False):
         protected_warning = (
-            "\n\n🚨 <b>هشدار مهم:</b> «حفاظت از محتوا» (Restrict Saving) در این کانال "
-            "فعال است و تلگرام کپی پیام‌های آن را با خطای ChatForwardsRestricted "
-            "مسدود می‌کند. قویاً توصیه می‌شود کانال دیگری انتخاب کنید."
+            "\n\n🚨 <b>هشدار مهم:</b> «حفاظت از محتوا» در این کانال فعال است و "
+            "تلگرام کپی پیام‌های آن را مسدود می‌کند. توصیه می‌شود کانال دیگری انتخاب کنید."
         )
 
     await state.update_data(
         source_channel_id=chat.id,
         source_channel_title=channel_title,
         source_channel_username=chat.username,
+        source_invite_link=channel_input if is_invite_link else None, # ذخیره لینک کاربر برای دیتابیس
         source_message_ids=[],
     )
     await state.set_state(CreateOrderStates.waiting_for_source_messages)
@@ -1295,14 +1381,10 @@ async def process_source_channel(message: types.Message, state: FSMContext, sess
             f"🆔 شناسه‌ی ذخیره‌شده: <code>{chat.id}</code>"
             f"{protected_warning}\n\n"
             "📥 حالا <b>پیام(های) نمونه</b> را از همین کانال در این چت فوروارد کنید:\n\n"
-            "• شناسه‌ی کانال و id پیام به‌صورت خودکار از روی فوروارد استخراج می‌شود\n"
-            f"• حداکثر <b>{MAX_SOURCE_MESSAGES}</b> پیام (برای هر تارگت یکی از آن‌ها به‌صورت تصادفی کپی می‌شود)\n"
-            "• در حالت کپی، متن سفارش اختیاری است"
+            f"• حداکثر <b>{MAX_SOURCE_MESSAGES}</b> پیام (برای هر تارگت یکی از آن‌ها به‌صورت تصادفی کپی می‌شود)"
         ),
         reply_markup=get_end_collection_keyboard(),
     )
-
-
 # ==========================================
 # 📋 استخراج مبدأ فوروارد (بدون تغییر)
 # ==========================================
@@ -2665,13 +2747,19 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
     source_message_ids_list = fsm_data.get("source_message_ids") or []
     forward_style = fsm_data.get("forward_style", "copy") 
     
+    # 🟢 دریافت و ذخیره لینک دعوت
     source_channel_username = fsm_data.get("source_channel_username")
+    source_invite_link = fsm_data.get("source_invite_link") 
+    
     source_message_ids_str = None
     if source_message_ids_list:
         joined_ids = ",".join(str(mid) for mid in source_message_ids_list)
         source_message_ids_str = f"{joined_ids}|{forward_style}"
-        if source_channel_username:
-            source_message_ids_str += f"|@{source_channel_username}"
+        if source_channel_username or source_invite_link:
+            # اگر یوزرنیم نبود ولی لینک دعوت بود، جایگاه یوزرنیم خالی می‌ماند
+            source_message_ids_str += f"|{source_channel_username or ''}"
+            if source_invite_link:
+                source_message_ids_str += f"|{source_invite_link}"
 
     if not messages and not source_message_ids_list and not use_banner_pool:
         await cleanup_fsm_temp_files(state)
@@ -2695,7 +2783,7 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
         source_channel_id=source_channel_id,
         source_message_ids=source_message_ids_str,
         is_approved=False,
-        user_id=message.from_user.id
+        user_id=message.chat.id  # 🟢 اصلاح شد: استخراج آیدی کاربر (جلوگیری از ثبت آیدی ربات)
     )
 
     if len(messages) > 0:
@@ -2750,6 +2838,10 @@ async def _finalize_order(message: types.Message, state: FSMContext, session: As
     target_display = target_data if order_type == "link" else "📁 فایل متنی (TXT)"
     if order_type == "link" and target_display and not target_display.startswith("http"):
         target_display = f"🔗 https://t.me/{target_display.replace('@', '')}"
+        
+    # 🟢 اصلاح شد: جلوگیری از خطای سقف کاراکتر (Silent Failure) در ارسال پیام به ادمین
+    if len(target_display) > 60:
+        target_display = target_display[:60] + " ... (خلاصه شده)"
         
     banner_pool_note = "\n🎨 استفاده از مخزن بنر: <b>فعال ✅</b>" if use_banner_pool else ""
     copy_source_note = ""
@@ -3089,6 +3181,11 @@ async def generate_dashboard_data(
             target_display = f"🔗 https://t.me/{target_display.replace('@', '')}"
         else:
             target_display = f"🔗 {target_display}"
+            
+        # 🟢 اصلاح شد: جلوگیری از خطای سقف کاراکتر هنگام رندر کردن داشبورد سفارش
+        if len(target_display) > 60:
+            target_display = target_display[:60] + " ... (خلاصه شده)"
+            
     elif order.order_type == "list":
         target_display = "📁 فایل متنی (TXT)"
     else: # استخراج و مدیریت سقف رشته

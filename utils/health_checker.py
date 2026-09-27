@@ -460,17 +460,30 @@ async def auto_reconnect_loop(worker_pool: dict, bot: Bot) -> None:
 
 async def check_proxy_health(proxy_string: str, timeout: float = 3.0) -> tuple[bool, int | None]:
     """
-    بررسی سلامت دومرحله‌ای (تست واقعی):
-    مرحله ۱: اتصال TCP به پروکسی
-    مرحله ۲: تونل‌زنی SOCKS5/4 و اتصال به IP یکی از دیتاسنترهای تلگرام (DC4) برای گرفتن Latency واقعی
+    بررسی سلامت دومرحله‌ای (تست واقعی) با پشتیبانی از فرمت‌های متنوع socks5
     """
     if not proxy_string:
         return False, None
 
+    # پارس کردن پراکسی با استفاده از تابع هوشمندمون
+    parsed = parse_proxy_string(proxy_string)
+    if not parsed:
+        return False, None
+
+    # ساخت یک URL کاملاً استاندارد برای ماژول python_socks
+    from urllib.parse import quote
+    auth = ""
+    if parsed.get("username") and parsed.get("password"):
+        auth = f"{quote(parsed['username'])}:{quote(parsed['password'])}@"
+    elif parsed.get("username"):
+        auth = f"{quote(parsed['username'])}@"
+        
+    standard_url = f"socks5://{auth}{parsed['hostname']}:{parsed['port']}"
+
     start_time = time.perf_counter()
     try:
-        # ساخت کلاینت پراکسی
-        proxy = AsyncProxy.from_url(proxy_string)
+        # ساخت کلاینت پراکسی با فرمت استانداردشده
+        proxy = AsyncProxy.from_url(standard_url)
         
         # IP یکی از سرورهای تلگرام (DC 4 - 149.154.167.50:443)
         sock = await asyncio.wait_for(
@@ -486,6 +499,7 @@ async def check_proxy_health(proxy_string: str, timeout: float = 3.0) -> tuple[b
     except Exception as e:
         logger.debug(f"Unexpected health check error for {proxy_string}: {e}")
         return False, None
+    
 
 # بازنویسی کامل: report_proxy_result — utils/health_checker.py
 async def report_proxy_result(proxy_string: str, is_success: bool, latency_ms: int = None) -> None:

@@ -849,20 +849,97 @@ async def toggle_sender_proxy_handler(callback: types.CallbackQuery, state: FSMC
 # EDIT SEND LIMIT FLOW
 # ==========================================
 @router.callback_query(F.data == "settings_edit_limit/")
-async def ask_for_send_limit(callback: types.CallbackQuery, state: FSMContext) -> None:
+async def ask_for_send_limit(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     await callback.answer()
 
     await cleanup_fsm_temp_files(state)
     await state.clear()
 
+    # ۱. خواندن مقدار الان از دیتابیس MySQL
+    try:
+        settings = await session.scalar(select(GlobalSettings).limit(1))
+        current_limit = settings.send_limit_per_run if settings and settings.send_limit_per_run else 10
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(
+            callback, report_db_error("تنظیمات", e), get_settings_return_keyboard()
+        )
+
+    # ۲. خواندن مقدار قبلی از Redis
+    previous_limit = "ثبت نشده (اولین تغییر)"
+    try:
+        from workers.sender import _get_redis
+        redis_client = _get_redis()
+        prev_val = await redis_client.get("settings:previous_send_limit")
+        if prev_val:
+            previous_limit = int(prev_val)
+    except Exception:
+        pass
+
     await state.set_state(SettingsStates.waiting_for_send_limit)
     await safe_edit_or_answer(
         callback.message,
         with_cancel_hint(
-            "⚙️ <b>تغییر ظرفیت ارسال</b>\n\n"
-            "لطفاً یک عدد وارد کنید (تعداد پیامی که هر ورکر در یک دوره اجرای سفارش ارسال می‌کند، پیش‌فرض ۱۰ و حداکثر ۵۰):"
+            f"⚙️ <b>تغییر ظرفیت ارسال</b>\n\n"
+            f"🔹 <b>مقدار الان:</b> <code>{current_limit}</code> پیام\n"
+            f"🔸 <b>مقدار قبلی:</b> <code>{previous_limit}</code>\n\n"
+            "لطفاً یک عدد جدید وارد کنید (تعداد پیامی که هر ورکر در یک دوره اجرای سفارش ارسال می‌کند، پیش‌فرض ۱۰ و حداکثر ۵۰):"
         ),
         reply_markup=get_settings_cancel_keyboard()
+    )
+
+
+@router.message(SettingsStates.waiting_for_send_limit, F.text)
+async def process_new_send_limit(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
+    if not message.text.isdecimal():
+        return await message.answer(
+            with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
+            reply_markup=get_settings_cancel_keyboard()
+        )
+
+    new_limit = int(message.text)
+
+    if not (1 <= new_limit <= 50):
+        return await message.answer(
+            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۱ تا ۵۰ باشد."),
+            reply_markup=get_settings_cancel_keyboard()
+        )
+
+    old_limit = 10
+
+    try:
+        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
+        if settings is None:
+            await state.clear()
+            return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
+        
+        # ذخیره مقدار فعلی به عنوان مقدار قدیمی
+        if settings.send_limit_per_run:
+            old_limit = settings.send_limit_per_run
+            
+        settings.send_limit_per_run = new_limit
+        await session.commit()
+        
+        # ۳. ذخیره مقدار قدیمی در Redis برای دفعات بعد
+        try:
+            from workers.sender import _get_redis
+            redis_client = _get_redis()
+            await redis_client.set("settings:previous_send_limit", old_limit)
+        except Exception as e:
+            logger.warning(f"Failed to save previous limit to redis: {e}")
+
+    except Exception as e:
+        await session.rollback()
+        await state.clear()
+        return await message.answer(
+            report_db_error("تنظیمات", e),
+            reply_markup=get_settings_return_keyboard()
+        )
+
+    await state.clear()
+    await message.answer(
+        f"✅ محدودیت ارسال هر ورکر از <b>{old_limit}</b> به <b>{new_limit}</b> تغییر یافت.",
+        reply_markup=get_settings_return_keyboard()
     )
 
 @router.message(SettingsStates.waiting_for_send_limit, F.text)
@@ -881,14 +958,29 @@ async def process_new_send_limit(message: types.Message, state: FSMContext, sess
             reply_markup=get_settings_cancel_keyboard()
         )
 
+    old_limit = 10
+
     try:
         settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
         if settings is None:
             await state.clear()
             return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
         
+        # ذخیره مقدار فعلی به عنوان مقدار قدیمی
+        if settings.send_limit_per_run:
+            old_limit = settings.send_limit_per_run
+            
         settings.send_limit_per_run = new_limit
         await session.commit()
+        
+        # ۳. ذخیره مقدار قدیمی در Redis برای دفعات بعد
+        try:
+            from workers.sender import _get_redis
+            redis_client = _get_redis()
+            await redis_client.set("settings:previous_send_limit", old_limit)
+        except Exception as e:
+            logger.warning(f"Failed to save previous limit to redis: {e}")
+
     except Exception as e:
         await session.rollback()
         await state.clear()
@@ -899,11 +991,14 @@ async def process_new_send_limit(message: types.Message, state: FSMContext, sess
 
     await state.clear()
     await message.answer(
-        f"✅ محدودیت ارسال هر ورکر به <b>{new_limit}</b> تغییر یافت.",
+        f"✅ محدودیت ارسال هر ورکر از <b>{old_limit}</b> به <b>{new_limit}</b> تغییر یافت.",
         reply_markup=get_settings_return_keyboard()
     )
 
 
+# ==========================================
+# پردازش فرم ظرفیت API
+# ==========================================
 @router.message(SettingsStates.waiting_for_max_accounts_api, F.text)
 async def process_max_accounts_api(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
     if not message.text.isdecimal():
@@ -920,53 +1015,29 @@ async def process_max_accounts_api(message: types.Message, state: FSMContext, se
             reply_markup=get_settings_cancel_keyboard()
         )
 
+    old_limit = 1 # پیش‌فرض
+
     try:
         settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
         if settings is None:
             await state.clear()
             return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
         
+        # استخراج مقدار فعلی برای ذخیره به عنوان تاریخچه
+        if settings.max_accounts_per_api is not None:
+            old_limit = settings.max_accounts_per_api
+            
         settings.max_accounts_per_api = new_value
         await session.commit()
-    except Exception as e:
-        await session.rollback()
-        await state.clear()
-        return await message.answer(
-            report_db_error("تنظیمات", e),
-            reply_markup=get_settings_return_keyboard()
-        )
-
-    await state.clear()
-    await message.answer(
-        f"✅ ظرفیت ثبت‌نام روی هر API به <b>{new_value}</b> تغییر یافت.",
-        reply_markup=get_settings_return_keyboard()
-    )
-
-@router.message(SettingsStates.waiting_for_cooldown_hours, F.text)
-async def process_cooldown_hours(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text.lstrip('-').isdecimal():
-        return await message.answer(
-            with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
-            reply_markup=get_settings_cancel_keyboard()
-        )
-
-    new_value = int(message.text)
-
-    # 🛡 اعتبارسنجی سمت سرور: جلوگیری قطعی از مقدار ۰ یا منفی
-    if not (1 <= new_value <= 720):
-        return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۱ تا ۷۲۰ ساعت باشد (مقدار ۰ غیرمجاز است)."),
-            reply_markup=get_settings_cancel_keyboard()
-        )
-
-    try:
-        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
-        if settings is None:
-            await state.clear()
-            return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
         
-        settings.cooldown_hours = new_value
-        await session.commit()
+        # ذخیره در ردیس (حتماً به شکل string تبدیل می‌کنیم تا ارور ندهد)
+        try:
+            from workers.sender import _get_redis
+            redis_client = _get_redis()
+            await redis_client.set("settings:previous_max_accounts_api", str(old_limit))
+        except Exception as e:
+            logger.warning(f"Failed to save previous api limit to redis: {e}")
+
     except Exception as e:
         await session.rollback()
         await state.clear()
@@ -977,14 +1048,17 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
 
     await state.clear()
     await message.answer(
-        f"✅ زمان استراحت دوره‌ای اکانت‌ها به <b>{new_value} ساعت</b> تغییر یافت.",
+        f"✅ ظرفیت ثبت‌نام روی هر API از <b>{old_limit}</b> به <b>{new_value}</b> تغییر یافت.",
         reply_markup=get_settings_return_keyboard()
     )
 
 
+# ==========================================
+# پردازش فرم جریمه اسپم
+# ==========================================
 @router.message(SettingsStates.waiting_for_spam_penalty, F.text)
 async def process_spam_penalty(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text.lstrip('-').isdecimal():
+    if not message.text.isdecimal():
         return await message.answer(
             with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
             reply_markup=get_settings_cancel_keyboard()
@@ -992,12 +1066,13 @@ async def process_spam_penalty(message: types.Message, state: FSMContext, sessio
 
     new_value = int(message.text)
 
-    # 🛡 اعتبارسنجی سمت سرور: حداقل ۱ روز اجباری است
-    if not (1 <= new_value <= 30):
+    if not (0 <= new_value <= 30):
         return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید حداقل ۱ و حداکثر ۳۰ روز باشد."),
+            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۰ تا ۳۰ باشد."),
             reply_markup=get_settings_cancel_keyboard()
         )
+        
+    old_penalty = 1 # پیش‌فرض
 
     try:
         settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
@@ -1005,8 +1080,21 @@ async def process_spam_penalty(message: types.Message, state: FSMContext, sessio
             await state.clear()
             return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
         
+        # استخراج مقدار فعلی برای ذخیره به عنوان تاریخچه
+        if settings.spam_penalty_days is not None:
+            old_penalty = settings.spam_penalty_days
+            
         settings.spam_penalty_days = new_value
         await session.commit()
+        
+        # ذخیره در ردیس
+        try:
+            from workers.sender import _get_redis
+            redis_client = _get_redis()
+            await redis_client.set("settings:previous_spam_penalty", str(old_penalty))
+        except Exception as e:
+            logger.warning(f"Failed to save previous spam penalty to redis: {e}")
+
     except Exception as e:
         await session.rollback()
         await state.clear()
@@ -1016,11 +1104,15 @@ async def process_spam_penalty(message: types.Message, state: FSMContext, sessio
         )
 
     await state.clear()
+    success_text = f"✅ مدت زمان جریمه اسپم از <b>{old_penalty}</b> به <b>{new_value} روز</b> تغییر یافت."
+    if new_value == 0:
+        success_text += "\n⚠️ مقدار ۰ یعنی جریمهٔ FloodWait عملاً غیرفعال می‌شود."
+        
     await message.answer(
-        f"✅ مدت زمان جریمه اسپم به <b>{new_value} روز</b> تغییر یافت.",
+        success_text,
         reply_markup=get_settings_return_keyboard()
     )
-    
+ 
 # ==========================================
 # REPORTS & MANAGEMENT: CATEGORIES LIST
 # (📄 فاز ۲: صفحه‌بندی استاندارد + دکمه‌های «✏️ ویرایش» و «🗑 حذف»)
@@ -1530,58 +1622,48 @@ async def cancel_delete_category_confirmation(callback: types.CallbackQuery, sta
 # EDIT MAX ACCOUNTS PER API
 # ==========================================
 @router.callback_query(F.data == "settings_edit_max_api/")
-async def ask_max_accounts_api(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+async def ask_max_accounts_api(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    # 🛡 فاز ۲: safe_callback_answer
+    await safe_callback_answer(callback)
 
     await cleanup_fsm_temp_files(state)
     await state.clear()
+
+    # ۱. خواندن مقدار الان از دیتابیس MySQL (مقدار پیش‌فرض: ۱)
+    try:
+        settings = await session.scalar(select(GlobalSettings).limit(1))
+        current_limit = settings.max_accounts_per_api if settings and settings.max_accounts_per_api else 1
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(
+            callback, report_db_error("تنظیمات", e), get_settings_return_keyboard()
+        )
+
+    # ۲. خواندن مقدار قبلی از Redis
+    previous_limit = "ثبت نشده (اولین تغییر)"
+    try:
+        from workers.sender import _get_redis
+        redis_client = _get_redis()
+        prev_val = await redis_client.get("settings:previous_max_accounts_api")
+        
+        if prev_val is not None:
+            # اگر دیتای ردیس به صورت بایت (bytes) بود تبدیلش میکنیم
+            if isinstance(prev_val, bytes):
+                prev_val = prev_val.decode('utf-8')
+            previous_limit = f"{int(prev_val)} عدد"
+    except Exception as e:
+        logger.warning(f"Failed to read previous api limit from redis: {e}")
 
     await state.set_state(SettingsStates.waiting_for_max_accounts_api)
     await safe_edit_or_answer(
         callback.message,
         with_cancel_hint(
-            "⚙️ <b>تنظیم ظرفیت API</b>\n\n"
-            "حداکثر تعداد اکانتی که مجاز است روی یک API لاگین کند را وارد کنید (توصیه: ۱):"
+            f"⚙️ <b>تنظیم ظرفیت API</b>\n\n"
+            f"🔹 <b>مقدار الان:</b> <code>{current_limit}</code> عدد\n"
+            f"🔸 <b>مقدار قبلی:</b> <code>{previous_limit}</code>\n\n"
+            "حداکثر تعداد اکانتی که مجاز است روی یک API لاگین کند را وارد کنید (پیش‌فرض و توصیه: ۱، حداکثر ۱۰۰):"
         ),
         reply_markup=get_settings_cancel_keyboard()
-    )
-
-@router.message(SettingsStates.waiting_for_max_accounts_api, F.text)
-async def process_max_accounts_api(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text.isdecimal():
-        return await message.answer(
-            with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
-            reply_markup=get_settings_cancel_keyboard()
-        )
-
-    new_value = int(message.text)
-
-    if not (1 <= new_value <= 100):
-        return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۱ تا ۱۰۰ باشد."),
-            reply_markup=get_settings_cancel_keyboard()
-        )
-
-    try:
-        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
-        if settings is None:
-            await state.clear()
-            return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
-        
-        settings.max_accounts_per_api = new_value
-        await session.commit()
-    except Exception as e:
-        await session.rollback()
-        await state.clear()
-        return await message.answer(
-            report_db_error("تنظیمات", e),
-            reply_markup=get_settings_return_keyboard()
-        )
-
-    await state.clear()
-    await message.answer(
-        f"✅ ظرفیت ثبت‌نام روی هر API به <b>{new_value}</b> تغییر یافت.",
-        reply_markup=get_settings_return_keyboard()
     )
 
 
@@ -1607,7 +1689,7 @@ async def ask_cooldown_hours(callback: types.CallbackQuery, state: FSMContext) -
 
 @router.message(SettingsStates.waiting_for_cooldown_hours, F.text)
 async def process_cooldown_hours(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text.isdecimal():
+    if not message.text.lstrip('-').isdecimal():
         return await message.answer(
             with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
             reply_markup=get_settings_cancel_keyboard()
@@ -1615,9 +1697,10 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
 
     new_value = int(message.text)
 
-    if not (0 <= new_value <= 720):
+    # 🛡 اعتبارسنجی سمت سرور: جلوگیری از وارد کردن مقدار زیر ۲۴ ساعت (یک روز)
+    if not (24 <= new_value <= 720):
         return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۰ تا ۷۲۰ باشد."),
+            with_cancel_hint("⚠️ مقدار وارد شده باید حداقل ۲۴ (یک روز) و حداکثر ۷۲۰ ساعت باشد."),
             reply_markup=get_settings_cancel_keyboard()
         )
 
@@ -1625,7 +1708,10 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
         settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
         if settings is None:
             await state.clear()
-            return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
+            return await message.answer(
+                "❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", 
+                reply_markup=get_settings_return_keyboard()
+            )
         
         settings.cooldown_hours = new_value
         await session.commit()
@@ -1638,12 +1724,8 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
         )
 
     await state.clear()
-    success_text = f"✅ زمان استراحت دوره‌ای اکانت‌ها به <b>{new_value} ساعت</b> تغییر یافت."
-    if new_value == 0:
-        success_text += "\n⚠️ مقدار ۰ یعنی استراحت دوره‌ای بین chunkها خاموش می‌شود."
-        
     await message.answer(
-        success_text,
+        f"✅ زمان استراحت دوره‌ای اکانت‌ها به <b>{new_value} ساعت</b> تغییر یافت.",
         reply_markup=get_settings_return_keyboard()
     )
 
@@ -1652,63 +1734,49 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
 # EDIT SPAM PENALTY DAYS
 # ==========================================
 @router.callback_query(F.data == "settings_edit_penalty/")
-async def ask_spam_penalty(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+async def ask_spam_penalty(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    # 🛡 استفاده از تابع امن برای پاسخ به کال‌بک
+    await safe_callback_answer(callback)
 
     await cleanup_fsm_temp_files(state)
     await state.clear()
+
+    # ۱. خواندن مقدار الان از دیتابیس MySQL (مقدار پیش‌فرض: ۱)
+    try:
+        settings = await session.scalar(select(GlobalSettings).limit(1))
+        current_penalty = settings.spam_penalty_days if settings and settings.spam_penalty_days is not None else 1
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(
+            callback, report_db_error("تنظیمات", e), get_settings_return_keyboard()
+        )
+
+    # ۲. خواندن مقدار قبلی از Redis
+    previous_penalty = "ثبت نشده (اولین تغییر)"
+    try:
+        from workers.sender import _get_redis
+        redis_client = _get_redis()
+        prev_val = await redis_client.get("settings:previous_spam_penalty")
+        
+        if prev_val is not None:
+            # اگر دیتای ردیس به صورت بایت (bytes) بود تبدیلش می‌کنیم
+            if isinstance(prev_val, bytes):
+                prev_val = prev_val.decode('utf-8')
+            previous_penalty = f"{int(prev_val)} روز"
+    except Exception as e:
+        logger.warning(f"Failed to read previous spam penalty from redis: {e}")
 
     await state.set_state(SettingsStates.waiting_for_spam_penalty)
     await safe_edit_or_answer(
         callback.message,
         with_cancel_hint(
-            "⚙️ <b>تنظیم جریمه اسپم</b>\n\n"
-            "وقتی اکانتی ارور FloodWait دریافت می‌کند، چند روز از چرخه ارسال خارج شود؟ (توصیه: ۱):"
+            f"⚙️ <b>تنظیم جریمه اسپم</b>\n\n"
+            f"🔹 <b>مقدار الان:</b> <code>{current_penalty}</code> روز\n"
+            f"🔸 <b>مقدار قبلی:</b> <code>{previous_penalty}</code>\n\n"
+            "وقتی اکانتی ارور FloodWait دریافت می‌کند، چند روز از چرخه ارسال خارج شود؟ (پیش‌فرض و توصیه: ۱):"
         ),
         reply_markup=get_settings_cancel_keyboard()
     )
-@router.message(SettingsStates.waiting_for_spam_penalty, F.text)
-async def process_spam_penalty(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text.isdecimal():
-        return await message.answer(
-            with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
-            reply_markup=get_settings_cancel_keyboard()
-        )
-
-    new_value = int(message.text)
-
-    if not (0 <= new_value <= 30):
-        return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۰ تا ۳۰ باشد."),
-            reply_markup=get_settings_cancel_keyboard()
-        )
-
-    try:
-        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
-        if settings is None:
-            await state.clear()
-            return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
-        
-        settings.spam_penalty_days = new_value
-        await session.commit()
-    except Exception as e:
-        await session.rollback()
-        await state.clear()
-        return await message.answer(
-            report_db_error("تنظیمات", e),
-            reply_markup=get_settings_return_keyboard()
-        )
-
-    await state.clear()
-    success_text = f"✅ مدت زمان جریمه اسپم به <b>{new_value} روز</b> تغییر یافت."
-    if new_value == 0:
-        success_text += "\n⚠️ مقدار ۰ یعنی جریمهٔ FloodWait عملاً غیرفعال می‌شود."
-        
-    await message.answer(
-        success_text,
-        reply_markup=get_settings_return_keyboard()
-    )
-
 # ==========================================
 # 🟠 فاز ۳ — مرحله ۱ (مسیر کامند متنی): DELETE CATEGORY COMMAND
 # ==========================================

@@ -1433,6 +1433,127 @@ async def download_account_session_file(message: types.Message, session: AsyncSe
         except OSError as e:
             logger.warning(f"dl_session: حذف فایل موقت سشن اکانت {acc_id} ناموفق بود: {e}")
 
+# ==========================================
+# ⬇️ دانلود گروهی تمام فایل‌های .session (دسترسی برای همه ادمین‌ها)
+# ==========================================
+@router.message(F.text == "/dl_all_sessions")
+async def download_all_sessions_zip(message: types.Message, session: AsyncSession) -> None:
+    """
+    ⬇️ استخراج و ارسال تمام سشن‌های ثبت‌نام شده به صورت یک فایل زیپ.
+    - پیام حاوی فایل زیپ به دلایل امنیتی پس از ۶۰ ثانیه خودکار پاک می‌شود.
+    - سازگار با ویندوز و لینوکس در مدیریت فایل‌های موقت.
+    """
+    wait_msg = await message.answer("⏳ در حال استخراج و فشرده‌سازی تمامی سشن‌ها... لطفاً شکیبا باشید.")
+
+    # ── ۱) واکشی تمام اکانت‌های ثبت‌نام شده (دارای سشن) ──
+    try:
+        stmt = select(Account).where(Account.session_string.is_not(None))
+        result = await session.execute(stmt)
+        accounts = result.scalars().all()
+    except Exception as e:
+        await session.rollback()
+        return await safe_edit_message(
+            wait_msg,
+            report_db_error("اکانت‌ها", e),
+            reply_markup=get_back_keyboard()
+        )
+
+    if not accounts:
+        return await safe_edit_message(
+            wait_msg,
+            "⚠️ هیچ اکانت ثبت‌نام شده‌ای در سیستم وجود ندارد.",
+            reply_markup=get_back_keyboard()
+        )
+
+    import zipfile
+    import tempfile
+    import shutil
+    import os
+    import time
+    from contextlib import suppress
+    import asyncio
+    import re
+    
+    # استفاده از مسیر امن برای ویندوز/لینوکس
+    temp_dir = tempfile.mkdtemp(prefix="bulk_export_")
+    zip_filename = f"all_sessions_{int(time.time())}.zip"
+    zip_filepath = os.path.join(temp_dir, zip_filename)
+
+    success_count = 0
+    error_count = 0
+
+    try:
+        # ── ۲) ساخت فایل زیپ و تزریق سشن‌ها ──
+        with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for acc in accounts:
+                try:
+                    # رمزگشایی سشن
+                    session_string = decrypt_session(acc.session_string)
+                    if not session_string:
+                        error_count += 1
+                        continue
+                    
+                    # نام‌گذاری فایل با شماره یا آیدی
+                    safe_phone = re.sub(r"\D", "", str(acc.phone_number or ""))
+                    file_stem = safe_phone if safe_phone else f"account_{acc.id}"
+                    temp_session_path = os.path.join(temp_dir, f"{file_stem}.session")
+                    
+                    # ساخت فایل SQLite
+                    build_session_file(session_string, temp_session_path)
+                    
+                    # اضافه کردن به زیپ
+                    zipf.write(temp_session_path, arcname=f"{file_stem}.session")
+                    
+                    # نکته برای ویندوز: فایل موقت را اینجا به صورت تکی پاک نمی‌کنیم 
+                    # تا درگیر خطای PermissionError (قفل بودن فایل توسط پروسه دیگر) نشویم.
+                    # کل پوشه در بلاک finally یکجا پاک خواهد شد.
+                    
+                    success_count += 1
+                except Exception as e:
+                    logger.error(f"Error exporting session for acc {acc.id}: {e}")
+                    error_count += 1
+        
+        if success_count == 0:
+            return await safe_edit_message(
+                wait_msg,
+                "❌ استخراج هیچ‌کدام از سشن‌ها موفقیت‌آمیز نبود (احتمالاً کلید FERNET_KEY تغییر کرده است).",
+                reply_markup=get_back_keyboard()
+            )
+
+        # ── ۳) ارسال فایل زیپ به ادمین ──
+        caption = (
+            f"📦 <b>آرشیو کامل سشن‌های سیستم</b>\n\n"
+            f"✅ استخراج موفق: <code>{success_count}</code> اکانت\n"
+            f"❌ خطا/نامعتبر: <code>{error_count}</code> اکانت\n\n"
+            "⚠️ <b>این فایل به‌شدت محرمانه است و معادلِ دسترسی کامل به تمامی اکانت‌های ربات است.</b>\n"
+            f"🕒 این پیام تا {SESSION_FILE_MESSAGE_TTL} ثانیهٔ دیگر به‌صورت خودکار حذف می‌شود — "
+            "فایل را همین حالا در جای امن ذخیره کنید.\n"
+        )
+
+        sent_msg = await message.answer_document(
+            document=types.FSInputFile(path=zip_filepath, filename=zip_filename),
+            caption=caption,
+        )
+        
+        # حذف پیام حالت انتظار
+        with suppress(Exception):
+            await wait_msg.delete()
+
+        # 🕒 حذف خودکار پیامِ حاوی فایل زیپ
+        asyncio.create_task(_delete_message_later(sent_msg))
+
+    except Exception as e:
+        logger.error(f"Bulk export zip error: {e}")
+        await safe_edit_message(
+            wait_msg,
+            "❌ خطا در ساخت یا ارسال فایل زیپ. لطفاً لاگ سرور را بررسی کنید.",
+            reply_markup=get_back_keyboard()
+        )
+    finally:
+        # 🧹 پاکسازی قطعی پوشه موقت (حتی در ویندوز با دستور ignore_errors پوشه و متعلقات با موفقیت پاک می‌شوند)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 @router.callback_query(F.data.startswith("show_creds_") & F.data.endswith("/"))
 async def show_account_credentials(callback: types.CallbackQuery, session: AsyncSession) -> None:
     """
