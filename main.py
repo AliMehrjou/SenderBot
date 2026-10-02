@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from contextlib import suppress
+from utils.error_aggregator import report_admin_error
 from aiogram import types
 from dotenv import load_dotenv
 load_dotenv()
@@ -241,6 +242,7 @@ async def main() -> None:
         host=config.REDIS_HOST,
         port=config.REDIS_PORT,
         db=config.REDIS_DB,
+        username=config.REDIS_USER or None,
         password=config.REDIS_PASS or None,
         decode_responses=True,
     )
@@ -272,6 +274,8 @@ async def main() -> None:
         logger.error(f"Unhandled handler error: {event.exception}", exc_info=event.exception)
         
         # ارسال بی‌درنگ و امنِ خطای بحرانی به بافر ردیس تا اسپم نشود
+        error_summary = f"💥 Unhandled Exception: {type(event.exception).__name__}\nDetail: {str(event.exception)[:150]}"
+        asyncio.create_task(report_admin_error(error_summary))
         
         try:
             if event.update.callback_query:

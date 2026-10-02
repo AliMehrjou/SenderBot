@@ -80,12 +80,6 @@ def get_main_menu_reply_keyboard() -> ReplyKeyboardMarkup:
         input_field_placeholder="🏢 Master Control Panel...",
     )
     
-    return ReplyKeyboardMarkup(
-        keyboard=keyboard,
-        resize_keyboard=True,
-        is_persistent=True, # این گزینه کیبورد را همیشه پایین صفحه نگه می‌دارد
-        input_field_placeholder="🏢 Master Control Panel...",
-    )
 
 # ==========================================
 # Phase 5 — live progress reporting (settings toggle helpers)

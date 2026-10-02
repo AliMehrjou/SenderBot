@@ -108,6 +108,7 @@ def _get_redis() -> aioredis.Redis:
             _redis_client = aioredis.Redis(
                 host=os.getenv("REDIS_HOST", "127.0.0.1"),
                 port=int(os.getenv("REDIS_PORT", 6379)),
+                username=os.getenv("REDIS_USER") or None,
                 password=os.getenv("REDIS_PASS") or None,
                 decode_responses=True,
                 socket_timeout=2,

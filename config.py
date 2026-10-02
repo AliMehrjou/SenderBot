@@ -29,6 +29,7 @@ class Config:
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
     REDIS_PASS: str = os.getenv("REDIS_PASS", "")
+    REDIS_USER: str = os.getenv("REDIS_USER", "")
 
     # Telegram API Settings
     API_ID: int = int(os.getenv("API_ID", "0"))
@@ -151,9 +152,16 @@ class Config:
 
     @property
     def REDIS_URL(self) -> str:
-        if self.REDIS_PASS:
-            return f"redis://:{self.REDIS_PASS}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
-        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+        from urllib.parse import quote_plus
+        auth = ""
+        if self.REDIS_USER:
+            auth = quote_plus(self.REDIS_USER)
+            if self.REDIS_PASS:
+                auth += f":{quote_plus(self.REDIS_PASS)}"
+            auth += "@"
+        elif self.REDIS_PASS:
+            auth = f":{quote_plus(self.REDIS_PASS)}@"
+        return f"redis://{auth}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
 
 
 # سازگاری با ماژول‌های دیگری که مستقیما این نام را ایمپورت می‌کنند
