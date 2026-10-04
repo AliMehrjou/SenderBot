@@ -1414,17 +1414,47 @@ async def execute_bulk_send(
 
         except Exception as e:
             err_type = e.__class__.__name__
+            error_str = str(e).lower()
+
+            fatal_message_errors = [
+                "MessageEmpty", "MessageInvalid", "MessageTooLong", 
+                "MediaEmpty", "MediaInvalid", "WebpageMediaEmpty", 
+                "WebpageCurlFailed", "MessageAuthorRequired"
+            ]
+            is_fatal_message_error = (
+                err_type in fatal_message_errors or
+                "entity_bounds_invalid" in error_str or
+                "message_invalid" in error_str or
+                "media_invalid" in error_str or
+                "message is empty" in error_str
+            )
+            
+            if is_fatal_message_error:
+                log_status = "partial" if stage_1_delivered else "error"
+                log_msg = _log_attempt(log_status, err_type, f"خطای ساختاری پیام/مدیا: {str(e)[:100]}")
+                
+                session.add(OrderLog(
+                    order_id=order.id, account_id=account_db_id, target=target,
+                    status=log_status, error_message=log_msg,
+                ))
+                await session.commit()
+                stop_reason = "fatal_message_error"
+                unsent.extend(targets[position:])
+                dismiss_seen_event(client, peer_id)
+                break
             
             target_errors = [
                 "InputUserDeactivated", "ChatWriteForbidden", "UserNotMutualContact", 
                 "UserPrivacyRestricted", "YouBlockedUser", "ChannelPrivate", "ChatAdminRequired",
                 "NotAcceptable", "BadRequest"
             ]
-            error_str = str(e).lower()
+            
             is_target_error = (
                 err_type in target_errors or 
                 "not occupied" in error_str or 
-                "invalid" in error_str or 
+                "peer_id_invalid" in error_str or 
+                "username_invalid" in error_str or 
+                "user_is_blocked" in error_str or
                 "not found" in error_str or 
                 "deactivated" in error_str or
                 "not acceptable" in error_str

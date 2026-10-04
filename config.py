@@ -24,6 +24,8 @@ class Config:
     DB_PORT: int = int(os.getenv("DB_PORT", "3306"))
     DB_NAME: str = os.getenv("DB_NAME", "telegram_bulk_db")
 
+
+    VIDEO_LINK: str = os.getenv("VIDEO_LINK", "")
     # Redis Settings
     REDIS_HOST: str = os.getenv("REDIS_HOST", "127.0.0.1")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))

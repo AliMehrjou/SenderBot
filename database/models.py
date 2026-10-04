@@ -326,6 +326,7 @@ class GlobalSettings(Base):
     cooldown_hours: Mapped[int] = mapped_column(default=24, nullable=False)     # تغییر به 24
     spam_penalty_days: Mapped[int] = mapped_column(default=1, nullable=False)
     
+    enable_crm_reply: Mapped[bool] = mapped_column(default=False, nullable=False)
     auto_set_2fa: Mapped[bool] = mapped_column(default=True, nullable=False)         
     terminate_sessions: Mapped[bool] = mapped_column(default=False, nullable=False)    
     auto_set_bio: Mapped[bool] = mapped_column(default=True, nullable=False)

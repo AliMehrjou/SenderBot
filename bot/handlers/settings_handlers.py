@@ -149,6 +149,9 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
         btn_photo = "✅ 🖼 تنظیم عکس پروفایل" if settings.auto_set_photo else "❌ 🖼 تنظیم عکس پروفایل"
         btn_access = "✅ 🌐 دسترسی عمومی به کد سفارش" if settings.public_order_access else "❌ 🌐 دسترسی عمومی به کد سفارش"
         
+        # 🛡 خواندن وضعیت دکمه CRM
+        btn_crm = "✅ 📥 صندوق پیام دوطرفه" if getattr(settings, "enable_crm_reply", True) else "❌ 📥 صندوق پیام دوطرفه"
+        
         # 🛡 رفع باگ: خواندن تنظیمات ضدبن هوشمند از Redis به دلیل عدم وجود ستون در جدول اصلی
         anti_ban_active = True
         try:
@@ -164,7 +167,8 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
         builder.button(text=btn_bio, callback_data="toggle_auto_set_bio/")
         builder.button(text=btn_photo, callback_data="toggle_auto_set_photo/")
         builder.button(text=btn_access, callback_data="toggle_public_order_access/")
-        builder.button(text=btn_antiban, callback_data="toggle_smart_anti_ban/") # دکمه اضافه شد
+        builder.button(text=btn_antiban, callback_data="toggle_smart_anti_ban/") 
+        builder.button(text=btn_crm, callback_data="toggle_enable_crm_reply/") # 👈 دکمه اضافه شد
         builder.button(text="🌐 مدیریت پروکسی‌ها", callback_data="menu_proxies/")
         builder.button(text="🩺 وضعیت سلامت اکانت‌ها", callback_data="menu_account_health_page_1/")
     # ------------------------------------
@@ -271,6 +275,7 @@ TOGGLE_FIELD_LABELS = {
     "auto_set_photo": "تنظیم عکس پروفایل",
     "public_order_access": "دسترسی عمومی به کد سفارش",
     "smart_anti_ban": "محافظت هوشمند ضدبن",
+    "enable_crm_reply": "صندوق پیام دوطرفه (CRM)",
 }
 
 _propagation_tasks = {}
@@ -1671,18 +1676,46 @@ async def ask_max_accounts_api(callback: types.CallbackQuery, state: FSMContext,
 # EDIT COOLDOWN HOURS
 # ==========================================
 @router.callback_query(F.data == "settings_edit_cooldown/")
-async def ask_cooldown_hours(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+async def ask_cooldown_hours(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await safe_callback_answer(callback)
 
     await cleanup_fsm_temp_files(state)
     await state.clear()
+
+    # ۱. خواندن مقدار الان از دیتابیس MySQL (مقدار پیش‌فرض: ۲۴)
+    try:
+        settings = await session.scalar(select(GlobalSettings).limit(1))
+        current_cooldown = settings.cooldown_hours if settings and settings.cooldown_hours is not None else 24
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(
+            callback, report_db_error("تنظیمات", e), get_settings_return_keyboard()
+        )
+
+    # ۲. خواندن مقدار قبلی از Redis
+    previous_cooldown = "ثبت نشده (اولین تغییر)"
+    try:
+        from workers.sender import _get_redis
+        redis_client = _get_redis()
+        prev_val = await redis_client.get("settings:previous_cooldown_hours")
+        
+        if prev_val is not None:
+            # اگر دیتای ردیس به صورت بایت (bytes) بود تبدیلش می‌کنیم
+            if isinstance(prev_val, bytes):
+                prev_val = prev_val.decode('utf-8')
+            previous_cooldown = f"{int(prev_val)} ساعت"
+    except Exception as e:
+        logger.warning(f"Failed to read previous cooldown from redis: {e}")
 
     await state.set_state(SettingsStates.waiting_for_cooldown_hours)
     await safe_edit_or_answer(
         callback.message,
         with_cancel_hint(
-            "⚙️ <b>تنظیم زمان استراحت دوره‌ای</b>\n\n"
-            "اکانت‌ها هر چند ساعت یک‌بار مجاز به استفاده مجدد باشند؟ (مثلاً ۲۶):"
+            f"⚙️ <b>تنظیم زمان استراحت دوره‌ای</b>\n\n"
+            f"🔹 <b>مقدار الان:</b> <code>{current_cooldown}</code> ساعت\n"
+            f"🔸 <b>مقدار قبلی:</b> <code>{previous_cooldown}</code>\n\n"
+            "اکانت‌ها هر چند ساعت یک‌بار مجاز به استفاده مجدد باشند؟\n"
+            "⚠️ <i>توجه: این مقدار نمی‌تواند کمتر از ۲۴ ساعت (یک روز) باشد.</i>"
         ),
         reply_markup=get_settings_cancel_keyboard()
     )
@@ -1704,6 +1737,8 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
             reply_markup=get_settings_cancel_keyboard()
         )
 
+    old_cooldown = 24 # پیش‌فرض
+
     try:
         settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
         if settings is None:
@@ -1713,8 +1748,21 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
                 reply_markup=get_settings_return_keyboard()
             )
         
+        # استخراج مقدار فعلی برای ذخیره به عنوان تاریخچه در ردیس
+        if settings.cooldown_hours is not None:
+            old_cooldown = settings.cooldown_hours
+            
         settings.cooldown_hours = new_value
         await session.commit()
+        
+        # ذخیره در ردیس (به عنوان تاریخچه تغییرات)
+        try:
+            from workers.sender import _get_redis
+            redis_client = _get_redis()
+            await redis_client.set("settings:previous_cooldown_hours", str(old_cooldown))
+        except Exception as e:
+            logger.warning(f"Failed to save previous cooldown to redis: {e}")
+
     except Exception as e:
         await session.rollback()
         await state.clear()
@@ -1725,7 +1773,7 @@ async def process_cooldown_hours(message: types.Message, state: FSMContext, sess
 
     await state.clear()
     await message.answer(
-        f"✅ زمان استراحت دوره‌ای اکانت‌ها به <b>{new_value} ساعت</b> تغییر یافت.",
+        f"✅ زمان استراحت دوره‌ای اکانت‌ها از <b>{old_cooldown}</b> به <b>{new_value} ساعت</b> تغییر یافت.",
         reply_markup=get_settings_return_keyboard()
     )
 

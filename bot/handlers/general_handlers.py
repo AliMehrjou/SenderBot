@@ -60,6 +60,9 @@ HELP_DATA = {
     "text": "به راهنمای جامع ربات ما خوش آمدید! 🌸\nما تمام تلاشمان را کرده‌ایم تا فرآیندهای ارسال انبوه، استخراج ممبر و مدیریت اکانت‌ها را به هوشمندانه‌ترین و ساده‌ترین شکل ممکن طراحی کنیم. هدف ما این است که بدون درگیر شدن با تنظیمات پیچیده، بالاترین بازدهی را با خیالی آسوده تجربه کنید.\n\nبرای آشنایی بیشتر با هر بخش، لطفاً روی دکمه دلخواهتان کلیک بفرمایید: 👇",
     "buttons": [
       [
+        {"text": "🎥 تماشای فیلم آموزش کار با ربات", "url": config.VIDEO_LINK, "style": "danger"}
+      ],
+      [
         {"text": "📋 دستورات و میانبرها", "callback_data": "help:shortcuts"},
         {"text": "🚀 ثبت سفارش و ارسال", "callback_data": "help:orders"}
       ],
@@ -163,7 +166,21 @@ def get_help_main_keyboard():
     # چیدمان کاملاً داینامیک بر اساس ردیف‌های تعیین شده در دیکشنری
     for row in buttons_layout:
         for btn in row:
-            builder.button(text=btn["text"], callback_data=btn["callback_data"])
+            # ایجاد یک دیکشنری از آرگومان‌ها برای ساخت دکمه
+            kwargs = {"text": btn["text"]}
+            
+            # بررسی نوع عملکرد دکمه (لینک یا کال‌بک)
+            if "url" in btn:
+                kwargs["url"] = btn["url"]
+            elif "callback_data" in btn:
+                kwargs["callback_data"] = btn["callback_data"]
+                
+            # اعمال استایل در صورت وجود (مثل style="danger" برای قرمز شدن دکمه)
+            if "style" in btn:
+                kwargs["style"] = btn["style"]
+                
+            # ساخت دکمه با آرگومان‌های استخراج‌شده
+            builder.button(**kwargs)
             
     # محاسبه تعداد دکمه در هر ردیف برای adjust شدن دقیق
     builder.adjust(*[len(row) for row in buttons_layout])

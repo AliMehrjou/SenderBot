@@ -120,12 +120,7 @@ async def process_admin_id(message: types.Message, state: FSMContext, session: A
 
     new_admin_id = int(admin_id_text)
 
-    if new_admin_id == config.ADMIN_ID:
-        return await message.answer(
-            with_cancel_hint("⚠️ این آیدی متعلق به ادمین اصلی سیستم است. لطفاً آیدی دیگری ارسال کنید."),
-            reply_markup=get_admin_add_cancel_keyboard()
-        )
-
+    # 🟢 مسدودسازی ادمین اصلی برداشته شد تا بتواند در لیست مدیریت حضور داشته باشد
     new_admin = Admin(telegram_id=new_admin_id)
 
     try:
@@ -187,10 +182,8 @@ async def render_admins_list(
     📄 فاز ۱: رندر لیست ادمین‌های فرعی با صفحه‌بندی استاندارد.
     """
     try:
-        # 🟢 پنهان کردن ادمین اصلی از آمار و لیست ادمین‌های فرعی
-        total_count = await session.scalar(
-            select(func.count(Admin.id)).where(Admin.telegram_id != config.ADMIN_ID)
-        ) or 0
+        # 🟢 نمایش تمام ادمین‌ها
+        total_count = await session.scalar(select(func.count(Admin.id))) or 0
         total_pages = calculate_total_pages(total_count)
 
         page = clamp_page(page, total_pages)
@@ -199,7 +192,6 @@ async def render_admins_list(
         admins = (
             await session.scalars(
                 select(Admin)
-                .where(Admin.telegram_id != config.ADMIN_ID)
                 .order_by(Admin.id.asc())
                 .offset(offset)
                 .limit(PAGINATION_SIZE)
@@ -235,13 +227,23 @@ async def render_admins_list(
     # دکمه ارسال پیام در بالا قرار می‌گیرد
     builder.button(text="📨 پیام به ادمین‌ها", callback_data="menu_admin_message/")
 
+    caller_id = callback.from_user.id
+    is_main_admin = (caller_id == config.ADMIN_ID)
+
     for idx, adm in enumerate(admins, start=offset + 1):
-        text += f"{idx}. 🆔 <code>{adm.telegram_id}</code>\n"
+        role_label = " 👑" if adm.telegram_id == config.ADMIN_ID else ""
+        you_label = " 👤 (شما)" if adm.telegram_id == caller_id else ""
+        text += f"{idx}. 🆔 <code>{adm.telegram_id}</code>{role_label}{you_label}\n"
 
         id_label = str(adm.telegram_id)
         if len(id_label) > 12:
             id_label = id_label[:11] + "…"
-        builder.button(text=f"🗑 حذف {id_label}", callback_data=f"del_admin_{adm.id}/")
+
+        # 🔒 گارد ظاهری: دکمه حذف فقط برای ادمین اصلی و آن هم برای سایر ادمین‌ها نمایش داده می‌شود
+        if is_main_admin and adm.telegram_id != config.ADMIN_ID:
+            builder.button(text=f"🗑 حذف {id_label}", callback_data=f"del_admin_{adm.id}/")
+        else:
+            builder.button(text=f"🔒 {id_label}", callback_data="no_access_btn/")
 
     # تنظیم چیدمان: ردیف اول 1 دکمه (پیام)، ردیف‌های بعد 2 دکمه (حذف)
     builder.adjust(1, 2)
@@ -342,6 +344,24 @@ async def ask_delete_admin_confirmation(callback: types.CallbackQuery, state: FS
             page=fsm_data.get("admins_list_page", 1)
         )
 
+    # 🔒 گارد امنیتی بک‌اند: بررسی دسترسی حذف / گارد امنیتی نهایی
+    caller_id = callback.from_user.id
+    is_main_admin = (caller_id == config.ADMIN_ID)
+    
+    if not is_main_admin:
+        return await safe_callback_answer(
+            callback, 
+            "⛔️ شما دسترسی ندارید! فقط ادمین اصلی می‌تواند ادمین‌های فرعی را حذف کند.", 
+            show_alert=True
+        )
+        
+    if admin_obj.telegram_id == config.ADMIN_ID:
+        return await safe_callback_answer(
+            callback, 
+            "⛔️ ادمین اصلی سیستم به هیچ‌وجه قابل حذف نیست!", 
+            show_alert=True
+        )
+
     await safe_callback_answer(callback)
 
     fsm_data = await state.get_data()
@@ -405,6 +425,17 @@ async def confirm_delete_admin_handler(callback: types.CallbackQuery, state: FSM
         await state.clear()
         await safe_callback_answer(callback, "⚠️ این ادمین قبلاً حذف شده است.", show_alert=True)
         return await render_admins_list(callback, session, state=state, page=return_page)
+
+    # 🔒 گارد امنیتی نهایی
+    caller_id = callback.from_user.id
+    is_main_admin = (caller_id == config.ADMIN_ID)
+    
+    if not is_main_admin and caller_id != admin_obj.telegram_id:
+        return await safe_callback_answer(
+            callback, 
+            "⛔️ شما دسترسی ندارید! ادمین‌های فرعی فقط می‌توانند خودشان را حذف کنند.", 
+            show_alert=True
+        )
 
     try:
         # Invalidation کش بلافاصله بعد از حذف موفق
@@ -750,3 +781,14 @@ async def unblock_account_handler(callback: types.CallbackQuery, session: AsyncS
         
     # رفرش پنل وضعیت
     await account_health_panel(callback, session)
+
+# ==========================================
+# هندلر دکمه‌های فاقد دسترسی
+# ==========================================
+@router.callback_query(F.data == "no_access_btn/")
+async def no_access_btn_handler(callback: types.CallbackQuery):
+    await safe_callback_answer(
+        callback, 
+        "⛔️ فقط ادمین اصلی دسترسی حذف کاربران را دارد و ادمین اصلی نیز قابل حذف نیست.", 
+        show_alert=True
+    )

@@ -2221,6 +2221,33 @@ async def background_order_execution(
                             await broadcast_to_admins(bot, text=f"🏁 <b>پایان سفارش (کمبود ورکر)</b>\n\nسفارش: <code>{order_id}</code>\n{finish_msg}")
                     break
 
+            elif stop_reason == "fatal_message_error":
+                async with session_maker() as session:
+                    db_order = await session.get(Order, order_id)
+                    if db_order:
+                        db_order.status = OrderStatus.error
+                        db_order.scheduled_for = None
+                        session.add(OrderLog(
+                            order_id=db_order.id, 
+                            target="System", 
+                            status="error",
+                            error_message="محتوای پیام یا مدیا نامعتبر است (Message/Media Invalid) — سفارش متوقف شد"
+                        ))
+                        await session.commit()
+                        unsent_targets = []
+                        
+                task_type = "extract" if order and _is_extract_order(order) else "order"
+                if reporter := _progress_reporters.get(f"{task_type}:{order_id}"):
+                    await reporter.fail("⛔️ <b>توقف سفارش</b>\n\nمحتوای پیام، مدیا یا فرمت متن (مانند اسپینتکس یا لینک‌ها) نامعتبر است و ارسال برای هیچ کاربری ممکن نیست. سفارش لغو شد.")
+                    _pop_progress_reporter(task_type, order_id)
+                
+                try:
+                    from utils.admin_broadcast import broadcast_to_admins
+                    await broadcast_to_admins(bot, text=f"⛔ <b>توقف سفارش</b>\n\nسفارش <code>{order_id}</code> به دلیل خطای ساختاری محتوا (Message/Media Invalid) به طور کامل متوقف شد.")
+                except Exception:
+                    pass
+                break
+
             elif stop_reason == "media_missing":
                 async with session_maker() as session:
                     db_order = await session.get(Order, order_id)

@@ -184,6 +184,16 @@ async def incoming_message_handler(client: Client, message: Message) -> None:
     if not message.from_user or message.from_user.is_self or message.from_user.is_bot:
         return
 
+    # 👈 بررسی وضعیت صندوق پیام در دیتابیس (اگر خاموش بود، کلاً پیام شکار نمی‌شود)
+    try:
+        from database.models import GlobalSettings
+        async with async_session() as db_session:
+            settings = await db_session.scalar(select(GlobalSettings).limit(1))
+            if settings and not getattr(settings, "enable_crm_reply", True):
+                return
+    except Exception as e:
+        logger.error(f"CRM Catcher settings check failed: {e}")
+
     # ==========================================
     # 🛡 فاز ۹ (BUG-27): فیلتر ارتباط — فقط تارگت‌های ارسالِ اخیرِ کمپین
     # ==========================================

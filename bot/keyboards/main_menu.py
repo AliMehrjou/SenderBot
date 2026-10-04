@@ -2,7 +2,7 @@ from aiogram.types import InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram import types
 
-# ساختار یکپارچه: شامل متن، کال‌بک و استایل رنگی دکمه
+# ساختار یکپارچه: شامل متن، کال‌بک و استایل رنگی دکمه (مختص کیبوردهای شیشه‌ای)
 MAIN_MENU_LAYOUT = [
     # ردیف ۱ (۲ تایی): عملیات اصلی
     [{"text": "🛍 ثبت سفارش", "cb": "menu_create_order/", "style": "success"},
@@ -41,20 +41,22 @@ MAIN_MENU_LAYOUT = [
 ]
 
 def get_main_menu_keyboard() -> types.InlineKeyboardMarkup:
+    """⌨️ کیبورد شیشه‌ای منوی اصلی"""
     builder = InlineKeyboardBuilder()
     
-    # خواندن هوشمند مقادیر و اعمال استایل روی دکمه شیشه‌ای
+    # خواندن هوشمند مقادیر و اعمال استایل روی دکمه شیشه‌ای (در صورت پشتیبانی فورک شما)
     for row in MAIN_MENU_LAYOUT:
         for btn in row:
             builder.button(
                 text=btn["text"], 
-                callback_data=btn["cb"], 
-                style=btn.get("style", "primary") # دیفالت: آبی
+                callback_data=btn["cb"],
+                # در صورتی که aiogram شما از style ایراد گرفت، خط زیر را کامنت کنید
+                style=btn.get("style", "primary")
             )
             
-    # چیدمان خودکار بر اساس طول ردیف‌ها در لیست
     builder.adjust(*[len(row) for row in MAIN_MENU_LAYOUT])
     return builder.as_markup()
+
 
 def get_main_menu_reply_keyboard() -> ReplyKeyboardMarkup:
     """⌨️ نسخه‌ی دکمه‌ای منوی اصلی — کیبورد مینیمال پایین چت"""
@@ -65,18 +67,18 @@ def get_main_menu_reply_keyboard() -> ReplyKeyboardMarkup:
         ],
         [
             KeyboardButton(text="🌐 آنالیز"),
-            KeyboardButton(text="🏛 منوی اصلی")
+            KeyboardButton(text="📲 لیست اکانت‌ها")
         ],
         [
-            KeyboardButton(text="🔄 ریستارت ربات")
+            KeyboardButton(text="🏛 منوی اصلی"),
+            KeyboardButton(text="🔄 ریستارت ربات", style="danger")
         ]
     ]
     
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
-        is_persistent=False,  # 🟢 این مقدار باید False باشد تا کاربر بتواند کیبورد را ببندد
-        # one_time_keyboard=True, # 💡 اگر می‌خواهید بعد از زدن هر دکمه، کیبورد خودکار مخفی شود این خط را از کامنت درآورید
+        is_persistent=False,  
         input_field_placeholder="🏢 Master Control Panel...",
     )
     
