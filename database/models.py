@@ -351,8 +351,11 @@ class Proxy(Base):
     __tablename__ = "proxies"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     proxy_string: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
-    is_active: Mapped[bool] = mapped_column(default=True)
-    fail_count: Mapped[int] = mapped_column(default=0)
+    # 🩹 FIX-1364: server_default برای ستون‌های NOT NULL الزامی است — سینک ربات‌ساز
+    # با raw-SQL درج می‌کند و MySQL 8 (STRICT_TRANS_TABLES) ستون NOT NULL بدون DEFAULT
+    # را در ردیف جدید رد می‌کند: "Field 'fail_count' doesn't have a default value"
+    is_active: Mapped[bool] = mapped_column(default=True, server_default="1")
+    fail_count: Mapped[int] = mapped_column(default=0, server_default="0")
 
     # 🧲 فاز ۵ (BUG-14): شمارنده‌ی اکانت‌های اشغال‌کننده‌ی این پراکسی.
     # claim اتمیک با «UPDATE ... WHERE in_use < cap» نگه داشته می‌شود و
@@ -360,7 +363,11 @@ class Proxy(Base):
     # ⚠️ برای دیتابیس‌های موجود این مهاجرت دستی لازم است (قبل از اجرا بکاپ بگیر):
     #    ALTER TABLE proxies ADD COLUMN in_use INT NOT NULL DEFAULT 0;
     #    (backfill اولیه به‌صورت خودکار توسط reconcile_proxy_usage در استارتاپ انجام می‌شود)
-    in_use: Mapped[int] = mapped_column(default=0, nullable=False)
+    # 🩹 FIX-1364: server_default="0" اضافه شد — دیتابیس‌های تازه با create_all از این پس
+    # DEFAULT واقعی می‌گیرند؛ دیتابیس‌های موجود توسط مهاجرت استارتاپی
+    # run_startup_migrations (بخش _COLUMN_DEFAULT_FIXES در database/migrations.py)
+    # خودکار اصلاح می‌شوند.
+    in_use: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
 
     # 🩺 فاز جدید: تفکیک نوع پراکسی و بررسی سلامت
     usage_type: Mapped[str] = mapped_column(String(20), default="both", server_default="'both'", nullable=False)

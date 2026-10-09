@@ -548,13 +548,17 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
 
             if attempt == 0:
                 # تلاش با یک پروکسی لاگین جایگزین در صورت بروز خطا
+                # 🩹 FIX: فیلتر health_state != 'DEAD' (همان انتخاب اولیه) — قبلاً
+                # is_healthy==True بود و پروکسی‌های WEAK سینک‌شده از ربات‌ساز را هم
+                # حذف می‌کرد ← پیام کاذب «پروکسی جایگزین سالمی یافت نشد» با وجود
+                # پروکسی‌های قابل‌استفاده.
                 stmt_retry = (
                     select(Proxy)
-                    .where(Proxy.usage_type.in_(("login", "both")), Proxy.is_active == True, Proxy.is_healthy == True, Proxy.proxy_string != proxy_string)
+                    .where(Proxy.usage_type.in_(("login", "both")), Proxy.is_active == True, Proxy.health_state != "DEAD", Proxy.proxy_string != proxy_string)
                     .order_by(func.random())
                     .limit(1)
                 )
-                # اعمال همان شروط (both و is_active) برای دریافت پراکسی جایگزین در مسیر خطا.
+                # اعمال همان شروط انتخاب اولیه (usage_type/is_active/غیرDEAD) برای دریافت پراکسی جایگزین در مسیر خطا.
                 retry_proxy = await session.scalar(stmt_retry)
                 if not retry_proxy:
                     e = Exception("پروکسی لاگین جایگزین سالمی برای تلاش مجدد یافت نشد. لطفاً در دیتابیس پراکسی جدید اضافه کنید یا متغیر LOGIN_PROXY_URL را ست کنید.")

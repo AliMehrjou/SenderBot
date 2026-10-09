@@ -161,7 +161,17 @@ HELP_DATA = {
 # 1. تابع سازنده منوی اصلی راهنما
 def get_help_main_keyboard():
     builder = InlineKeyboardBuilder()
-    buttons_layout = HELP_DATA["main_menu_help"]["buttons"]
+    # 🩹 FIX: دکمه‌های لینک‌دار با URL خالی (مثلاً وقتی VIDEO_LINK در .env تنظیم
+    # نشده) حذف می‌شوند — دکمه url خالی کل پیام را با خطای BUTTON_URL_INVALID
+    # تلگرام می‌شکند و منوی راهنما اصلاً باز نمی‌شود.
+    buttons_layout = []
+    for row in HELP_DATA["main_menu_help"]["buttons"]:
+        filtered_row = [
+            btn for btn in row
+            if not ("url" in btn and not str(btn.get("url") or "").strip())
+        ]
+        if filtered_row:
+            buttons_layout.append(filtered_row)
     
     # چیدمان کاملاً داینامیک بر اساس ردیف‌های تعیین شده در دیکشنری
     for row in buttons_layout:

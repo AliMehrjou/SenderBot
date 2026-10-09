@@ -57,6 +57,19 @@ _POST_ADD_FIXES: Dict[Tuple[str, str], str] = {
     ),
 }
 
+# 🩹 FIX-1364 — ستون‌های NOT NULL قدیمی که DEFAULT سطح دیتابیس ندارند.
+# سینک پروکسی ربات‌ساز با raw-SQL (بدون ORM) درج می‌کند؛ MySQL 8 در حالت
+# STRICT_TRANS_TABLES چنین ردیفی را با خطای (1364, "Field 'fail_count' doesn't
+# have a default value") رد می‌کند. MODIFY فقط DEFAULT اضافه می‌کند و به داده‌ها دست نمی‌زند.
+_COLUMN_DEFAULT_FIXES: Dict[Tuple[str, str], str] = {
+    ("proxies", "is_active"): "ALTER TABLE `proxies` MODIFY `is_active` TINYINT(1) NOT NULL DEFAULT 1",
+    ("proxies", "fail_count"): "ALTER TABLE `proxies` MODIFY `fail_count` INT NOT NULL DEFAULT 0",
+    ("proxies", "in_use"): "ALTER TABLE `proxies` MODIFY `in_use` INT NOT NULL DEFAULT 0",
+    # 🩹 محافظت تکمیلی در برابر 1364 روی دیتابیس‌های خیلی قدیمی:
+    ("proxies", "consecutive_successes"): "ALTER TABLE `proxies` MODIFY `consecutive_successes` INT NOT NULL DEFAULT 0",
+    ("proxies", "consecutive_failures"): "ALTER TABLE `proxies` MODIFY `consecutive_failures` INT NOT NULL DEFAULT 0",
+}
+
 
 def _sql_literal(value) -> str:
     """تبدیل امن مقدار scalar پایتونی به literal SQL (فقط برای DEFAULT ستون جدید)."""
@@ -361,6 +374,26 @@ async def run_startup_migrations() -> None:
             ))
             await session.commit()
             logger.warning("DEP-1: composite index ix_order_logs_order_status created.")
+
+        # +++ 🩹 FIX-1364: DEFAULT سطح دیتابیس برای ستون‌های NOT NULL قدیمی proxies +++
+        # سینک پروکسی ربات‌ساز (INSERT خام) بدون این DEFAULTها با خطای 1364 رد می‌شود؛
+        # پس از این مهاجرت، درج مستقیم ردیف جدید روی دیتابیس‌های موجود هم ممکن می‌شود.
+        try:
+            no_default_cols = (await session.execute(text(
+                "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() "
+                "  AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT IS NULL"
+            ))).fetchall()
+            for t_name, c_name in no_default_cols:
+                ddl = _COLUMN_DEFAULT_FIXES.get((t_name, c_name))
+                if ddl:
+                    logger.warning("FIX-1364: افزودن DEFAULT → %s", ddl)
+                    await session.execute(text(ddl))
+                    await session.commit()
+        except Exception as exc:
+            logger.warning("FIX-1364: مهاجرت DEFAULT ستون‌های proxies ناموفق: %s", exc)
+            await session.rollback()
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
     logger.info("DEP-1: بررسی مهاجرت idempotent schema تکمیل شد.")
 

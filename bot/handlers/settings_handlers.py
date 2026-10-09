@@ -824,6 +824,15 @@ async def delete_proxy_inline_handler(callback: types.CallbackQuery, session: As
             
             await session.delete(proxy)
             await session.commit()
+
+            # 🩹 FIX: اکانت‌های آزادشده (WAITING_PROXY) باید بلافاصله صف انتظار را
+            # بیدار کنند — قبلاً فقط با افزودن پروکسی جدید یا ری‌استارت، صف پردازش
+            # می‌شد و اکانت‌ها تا مدت‌ها بدون پروکسی می‌ماندند.
+            try:
+                from workers.session_manager import background_process_proxy_queue
+                asyncio.create_task(background_process_proxy_queue())
+            except Exception:
+                pass
     except Exception as e:
         await session.rollback()
         return await answer_callback_error(callback, report_db_error("پروکسی‌ها", e), get_main_menu_button())
