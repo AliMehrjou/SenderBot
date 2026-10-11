@@ -20,7 +20,6 @@ import random
 from bot.handlers import cancel_handlers
 from bot.handlers.emergency import router as emergency_router
 from bot.handlers.admin_panel import router as admin_router
-from bot.handlers.admin_crm_handlers import router as admin_crm_router
 from bot.middlewares.force_join import ForceJoinMiddleware
 from bot.handlers.general_handlers import router as general_router
 from bot.handlers.login_handlers import router as login_router
@@ -315,7 +314,7 @@ async def main() -> None:
     dp.include_router(general_router)
     dp.include_router(cleanup_router)
     dp.include_router(admin_manage_router)
-    dp.include_router(admin_crm_router)
+    # C2-fix: admin_crm_router حذف شد — CRM از طریق general_handlers (مسیر زنده) کار می‌کند
     dp.include_router(banner_router)   
     dp.include_router(extractor_router)
     dp.include_router(stats_router)

@@ -1,5 +1,8 @@
 import logging
 import html
+import os
+import time
+import tempfile
 
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
@@ -161,17 +164,7 @@ HELP_DATA = {
 # 1. تابع سازنده منوی اصلی راهنما
 def get_help_main_keyboard():
     builder = InlineKeyboardBuilder()
-    # 🩹 FIX: دکمه‌های لینک‌دار با URL خالی (مثلاً وقتی VIDEO_LINK در .env تنظیم
-    # نشده) حذف می‌شوند — دکمه url خالی کل پیام را با خطای BUTTON_URL_INVALID
-    # تلگرام می‌شکند و منوی راهنما اصلاً باز نمی‌شود.
-    buttons_layout = []
-    for row in HELP_DATA["main_menu_help"]["buttons"]:
-        filtered_row = [
-            btn for btn in row
-            if not ("url" in btn and not str(btn.get("url") or "").strip())
-        ]
-        if filtered_row:
-            buttons_layout.append(filtered_row)
+    buttons_layout = HELP_DATA["main_menu_help"]["buttons"]
     
     # چیدمان کاملاً داینامیک بر اساس ردیف‌های تعیین شده در دیکشنری
     for row in buttons_layout:
@@ -258,9 +251,16 @@ async def ignore_pagination_info(callback: types.CallbackQuery) -> None:
 
 # ==========================================
 # --- استیت‌های مربوط به CRM ---
+# (C2-fix: نسخه یکپارچه — admin_crm_handlers.py حذف شد؛ این تنها مسیر پاسخ CRM است)
 # ==========================================
 class CRMStates(StatesGroup):
     waiting_for_reply = State()
+
+# C4-fix: نشست پاسخ‌دهی حداکثر ۱۰ دقیقه اعتبار دارد (بدون TTL، state تا ابد در Redis می‌ماند)
+CRM_REPLY_TTL_SECONDS = 600
+# C5-fix: سقف حجم مدیای پاسخ (هم‌مرز سقف دانلود Bot API)
+CRM_MEDIA_MAX_BYTES = 20 * 1024 * 1024
+
 
 def get_crm_cancel_keyboard():
     builder = InlineKeyboardBuilder()
@@ -273,21 +273,25 @@ def get_crm_cancel_keyboard():
 @router.callback_query(F.data.startswith("crm_reply_"))
 async def crm_reply_callback(callback: types.CallbackQuery, state: FSMContext) -> None:
     parts = callback.data.split("_")
-    
+
     if len(parts) != 4:
         return await callback.answer("⚠️ دیتای نامعتبر.", show_alert=True)
 
     worker_id = parts[2]
     target_id = parts[3]
 
-    await state.update_data(crm_worker_id=worker_id, crm_target_id=target_id)
+    # C4-fix: ثبت زمان شروع نشست (برای TTL)
+    await state.update_data(crm_worker_id=worker_id, crm_target_id=target_id, crm_ts=time.time())
     await state.set_state(CRMStates.waiting_for_reply)
 
     await callback.message.reply(
         with_cancel_hint(
             f"✍️ <b>ارسال پاسخ به تارگت:</b> <code>{target_id}</code>\n"
             f"🤖 <b>از طریق اکانت ورکر:</b> <code>{worker_id}</code>\n\n"
-            "لطفاً متن پاسخ خود را ارسال کنید:"
+            "لطفاً پاسخ خود را ارسال کنید:\n"
+            "• متن (فورمت ضخیم/ایتالیک/کد حفظ می‌شود)\n"
+            "• عکس، ویدیو، فایل، ویس، استیکر و گیف\n\n"
+            "⌛️ نشست پس از ۱۰ دقیقه خودکار منقضی می‌شود."
         ),
         reply_markup=get_crm_cancel_keyboard()
     )
@@ -305,10 +309,10 @@ async def cancel_crm_reply(callback: types.CallbackQuery, state: FSMContext) -> 
             "🏛 شما به منوی اصلی بازگشتید.",
             reply_markup=get_main_menu_keyboard()
         )
-    
+
     await state.clear()
     await callback.answer("عملیات لغو شد.")
-    
+
     await safe_edit_or_answer(
         callback.message,
         "❌ عملیات پاسخ‌گویی لغو شد.",
@@ -316,21 +320,98 @@ async def cancel_crm_reply(callback: types.CallbackQuery, state: FSMContext) -> 
     )
 
 # ==========================================
-# هندلر دریافت متن و ارسال با Pyrogram (CRM)
+# C5-fix: ارسال مدیای پاسخ CRM از طریق ورکر
+# (دانلود با اکانت بات + ارسال مجدد از اکانت ورکر تا هویت فرستنده حفظ شود)
+# ==========================================
+async def _send_crm_media_reply(client, message: types.Message, target_id: int) -> None:
+    bot_file = None
+    kind = None
+    if message.photo:
+        bot_file, kind = message.photo[-1], "photo"
+    elif message.video:
+        bot_file, kind = message.video, "video"
+    elif message.document:
+        bot_file, kind = message.document, "document"
+    elif message.voice:
+        bot_file, kind = message.voice, "voice"
+    elif message.audio:
+        bot_file, kind = message.audio, "audio"
+    elif message.video_note:
+        bot_file, kind = message.video_note, "video_note"
+    elif message.animation:
+        bot_file, kind = message.animation, "animation"
+    elif message.sticker:
+        bot_file, kind = message.sticker, "sticker"
+    else:
+        raise ValueError("نوع مدیا پشتیبانی نمی‌شود")
+
+    size = getattr(bot_file, "file_size", 0) or 0
+    if size and size > CRM_MEDIA_MAX_BYTES:
+        raise ValueError(
+            f"حجم فایل ({size // (1024 * 1024)}MB) از سقف مجاز "
+            f"({CRM_MEDIA_MAX_BYTES // (1024 * 1024)}MB) بیشتر است"
+        )
+
+    file_name = getattr(bot_file, "file_name", None) or ""
+    suffix = os.path.splitext(file_name)[1] or ""
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="crm_reply_")
+    os.close(fd)
+    try:
+        await message.bot.download(bot_file, destination=tmp_path)
+        caption = message.html_text if message.caption else None
+        if kind == "photo":
+            await client.send_photo(target_id, tmp_path, caption=caption)
+        elif kind == "video":
+            await client.send_video(target_id, tmp_path, caption=caption)
+        elif kind == "document":
+            await client.send_document(target_id, tmp_path, caption=caption)
+        elif kind == "voice":
+            await client.send_voice(target_id, tmp_path)
+        elif kind == "audio":
+            await client.send_audio(target_id, tmp_path, caption=caption)
+        elif kind == "video_note":
+            await client.send_video_note(target_id, tmp_path)
+        elif kind == "animation":
+            await client.send_animation(target_id, tmp_path, caption=caption)
+        elif kind == "sticker":
+            await client.send_sticker(target_id, tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+# ==========================================
+# هندلر دریافت پاسخ و ارسال با Pyrogram (CRM)
 # ==========================================
 @router.message(CRMStates.waiting_for_reply)
 async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
     data = await state.get_data()
     worker_id_str = data.get("crm_worker_id")
     target_id = data.get("crm_target_id")
+    crm_ts = data.get("crm_ts")
 
     if not worker_id_str or not target_id:
         await state.clear()
         return await message.answer("⚠️ اطلاعات نشست از دست رفته است. لطفاً دوباره روی دکمه پاسخ کلیک کنید.")
 
-    reply_text = message.text or message.caption or ""
-    if not reply_text:
-        return await message.answer(with_cancel_hint("⚠️ لطفاً فقط متن ارسال کنید."))
+    # C4-fix: انقضای نشست پس از TTL
+    if crm_ts and (time.time() - float(crm_ts)) > CRM_REPLY_TTL_SECONDS:
+        await state.clear()
+        return await message.answer(
+            "⌛️ نشست پاسخ‌دهی به دلیل طولانی‌بودن (بیش از ۱۰ دقیقه) منقضی شد.\n"
+            "لطفاً دوباره روی دکمه «✉️ پاسخ به این کاربر» در پیام CRM بزنید."
+        )
+
+    # C4-fix: کامندها هرگز به مشتری ارسال نمی‌شوند
+    raw_text = message.text or message.caption or ""
+    if raw_text.startswith("/"):
+        return await message.answer(
+            "⚠️ <b>این متن به‌عنوان دستور شناخته شد و به مشتری ارسال نشد.</b>\n"
+            "برای لغو پاسخ‌دهی دکمه «❌ انصراف» یا دستور /cancel را بزنید؛\n"
+            "در غیر این صورت ادامه پاسخ را بفرستید.",
+            reply_markup=get_crm_cancel_keyboard()
+        )
 
     try:
         worker_id_int = int(worker_id_str)
@@ -339,7 +420,7 @@ async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
         return await message.answer("⚠️ خطای سیستمی: آیدی ورکر نامعتبر است.")
 
     client = worker_pool.get(worker_id_int)
-    
+
     if not client or not client.is_connected:
         await state.clear()
         return await message.answer(
@@ -347,13 +428,41 @@ async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
             f"اکانت ورکر <code>{worker_id_str}</code> در حال حاضر آفلاین است یا اتصال آن با تلگرام قطع شده است."
         )
 
+    wait_msg = await message.answer("⏳ در حال ارسال پاسخ توسط ورکر...")
+
     try:
-        await client.send_message(chat_id=int(target_id), text=reply_text)
-        await message.answer(f"✅ <b>پیام شما با موفقیت ارسال شد!</b>\n👤 <b>مقصد:</b> <code>{target_id}</code>")
+        has_media = bool(
+            message.photo or message.video or message.document or message.voice
+            or message.audio or message.video_note or message.animation or message.sticker
+        )
+        if has_media:
+            # C5-fix: پاسخ مدیایی
+            await _send_crm_media_reply(client, message, int(target_id))
+            sent_kind = "مدیا"
+        elif raw_text:
+            # C2-fix: فرمتینگ HTML ادمین حفظ می‌شود (پیش‌تر متن خام بدون فورمت ارسال می‌شد)
+            await client.send_message(chat_id=int(target_id), text=message.html_text)
+            sent_kind = "متن"
+        else:
+            return await wait_msg.edit_text(
+                "⚠️ محتوای پشتیبانی‌نشده است. لطفاً متن یا مدیا ارسال کنید."
+            )
+
+        await wait_msg.edit_text(
+            f"✅ <b>پیام شما ({sent_kind}) با موفقیت ارسال شد!</b>\n"
+            f"👤 <b>مقصد:</b> <code>{target_id}</code>\n"
+            f"🤖 <b>از طریق ورکر:</b> <code>{worker_id_str}</code>"
+        )
+    except ValueError as ve:
+        await wait_msg.edit_text(f"❌ <b>خطا در ارسال مدیا:</b>\n<code>{html.escape(str(ve))}</code>")
     except Exception as e:
-        await message.answer(f"❌ <b>خطا در ارسال پیام:</b>\n<code>{html.escape(str(e))}</code>")
+        logger.error(f"CRM reply via worker {worker_id_int} to {target_id} failed: {e}")
+        await wait_msg.edit_text(f"❌ <b>خطا در ارسال پیام:</b>\n<code>{html.escape(str(e))}</code>")
     finally:
         await state.clear()
+
+
+
 async def safe_pin_message(bot, chat_id: int, message_id: int) -> bool:
     """
     سعی می‌کند پیام را پین کند. در صورت بروز محدودیت‌های تلگرام یا خطای دسترسی،

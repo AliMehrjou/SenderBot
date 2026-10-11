@@ -128,13 +128,19 @@ def parse_proxy_string(proxy_string: str) -> Optional[dict]:
     try:
         proxy_string = proxy_string.strip()
         
-        # حذف پیشوندها برای یکسان‌سازی فرمت
-        if proxy_string.lower().startswith("socks5://"):
-            proxy_string = proxy_string[9:]
-        elif proxy_string.lower().startswith("socks5h://"):
-            proxy_string = proxy_string[10:]
-        elif "://" in proxy_string:
-            proxy_string = proxy_string.split("://", 1)[1]
+        # 🩹 FIX (B3): scheme دیگر دور انداخته نمی‌شود — اگر رشته دارای پیشوند
+        # scheme باشد (socks5:// ، http:// ، …) همان پروتکل برگردانده می‌شود.
+        # قبلاً هر پیشوندی حذف و همیشه socks5 هاردکد برمی‌گشت؛ در نتیجه پروکسی‌های
+        # HTTP استخر فکتوری (و LOGIN_PROXY_URL های http://) سمت اینستنس روی SOCKS5
+        # بسته می‌شدند و همه اتصال‌ها fail می‌کردند. رشته‌های بدون پیشوند برای
+        # سازگاری با داده‌های قدیمی، socks5 می‌مانند.
+        scheme = "socks5"
+        if "://" in proxy_string:
+            raw_scheme, _, rest = proxy_string.partition("://")
+            raw_scheme = raw_scheme.lower()
+            if raw_scheme in ("socks5", "socks5h", "socks4", "http", "https"):
+                scheme = {"socks5h": "socks5", "https": "http"}.get(raw_scheme, raw_scheme)
+            proxy_string = rest
 
         username = None
         password = None
@@ -167,7 +173,7 @@ def parse_proxy_string(proxy_string: str) -> Optional[dict]:
                 return None
 
         return {
-            "scheme": "socks5",
+            "scheme": scheme,
             "hostname": hostname,
             "port": port,
             "username": unquote(username) if username else None,

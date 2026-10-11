@@ -137,22 +137,45 @@ async def close_sender_redis() -> None:
 _crm_mark_tasks: set = set()  # مرجع GC-safe برای تسک‌های fire-and-forget
 
 
+def _coerce_crm_user_id(user_id):
+    """
+    C1-fix: تبدیل شناسه تارگت به int — تارگت‌های یوزرنیمی (@user) قابل تبدیل
+    نیستند؛ در آن حالت None برگردانده می‌شود تا کلید بی‌فایده ثبت نشود.
+    (caller باید peer_id عددی حل‌شده را ترجیحاً پاس دهد)
+    """
+    if user_id is None or isinstance(user_id, bool):
+        return None
+    if isinstance(user_id, int):
+        return user_id
+    s = str(user_id).strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return None
+
+
 async def mark_crm_recent_target(user_id) -> None:
     """
     ثبت «این peer اخیراً پیام کمپین دریافت کرده» — best-effort؛ خطا جریان
     ارسال را نمی‌شکند (فیلتر CRM به fail-open تنزل می‌کند و سقف نرخ همچنان فعال است).
+    C1-fix: فقط شناسه‌های عددی (user_id واقعی تلگرام) پذیرفته می‌شوند؛
+    یوزرنیم/رشته غیرعددی با لاگ warning رد می‌شود (قبلاً ValueError بی‌صدا قورت داده می‌شد).
     """
+    uid = _coerce_crm_user_id(user_id)
+    if uid is None:
+        logger.warning(
+            f"CRM mark skipped: non-numeric target id {user_id!r} "
+            f"(username-style target?) — caller should pass resolved peer_id."
+        )
+        return
     try:
-        if user_id is None:
-            return
         await _get_redis().set(
-            f"crm_recent_target:{int(user_id)}",
+            f"crm_recent_target:{uid}",
             "1",
             ex=max(1, int(getattr(config, "CRM_RELEVANT_WINDOW_HOURS", 72))) * 3600,
         )
     except Exception as e:
         logger.debug(
-            f"CRM recent-target mark failed for {user_id} "
+            f"CRM recent-target mark failed for {uid} "
             f"({e.__class__.__name__}); CRM filter degrades to fail-open."
         )
 
@@ -1240,7 +1263,7 @@ async def execute_bulk_send(
                 status="success", error_message=log_msg
             ))
             
-            _spawn_crm_mark(target)
+            _spawn_crm_mark(peer_id or target)  # C1-fix: peer_id عددی حل‌شده؛ تارگت یوزرنیمی هم پوشش داده می‌شود
             
             if account_row:
                 account_row.consecutive_errors = 0

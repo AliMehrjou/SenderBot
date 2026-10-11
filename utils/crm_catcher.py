@@ -137,6 +137,40 @@ async def _take_suppressed(admin_id: int) -> int:
         return 0
 
 
+# ==========================================
+# 🧹 C3-fix: کش TTL وضعیت صندوق پیام (enable_crm_reply)
+# قبلاً روی «هر پیام خصوصی» یک SELECT کامل زده می‌شد؛ حالا فقط هر ۳۰ ثانیه.
+# fail-open: خطای DB → آخرین مقدار معلوم؛ نبودِ ردیف تنظیمات → True
+# ==========================================
+_crm_enabled_cache: Tuple[Optional[bool], float] = (None, 0.0)
+CRM_ENABLED_CACHE_TTL = 30.0
+
+
+def invalidate_crm_enabled_cache() -> None:
+    """بطلان کش (بعد از toggle در پنل تنظیمات برای اعمال فوری)."""
+    global _crm_enabled_cache
+    _crm_enabled_cache = (None, 0.0)
+
+
+async def _crm_reply_enabled() -> bool:
+    """وضعیت «صندوق پیام دوطرفه» با کش ۳۰ ثانیه‌ای."""
+    global _crm_enabled_cache
+    value, fetched_at = _crm_enabled_cache
+    now = time.monotonic()
+    if value is not None and (now - fetched_at) < CRM_ENABLED_CACHE_TTL:
+        return value
+    try:
+        from database.models import GlobalSettings
+        async with async_session() as db_session:
+            settings = await db_session.scalar(select(GlobalSettings).limit(1))
+            value = True if settings is None else bool(getattr(settings, "enable_crm_reply", True))
+    except Exception as e:
+        logger.error(f"CRM Catcher settings check failed: {e}")
+        return value if value is not None else True
+    _crm_enabled_cache = (value, now)
+    return value
+
+
 # 🛡 فاز ۹ (BUG-27/BUG-29): کش TTL لیست ادمین‌ها — SELECT فقط یک‌بار در هر بازه
 _admins_cache: Tuple[Set[int], float] = (set(), 0.0)
 
@@ -184,24 +218,20 @@ async def incoming_message_handler(client: Client, message: Message) -> None:
     if not message.from_user or message.from_user.is_self or message.from_user.is_bot:
         return
 
-    # 👈 بررسی وضعیت صندوق پیام در دیتابیس (اگر خاموش بود، کلاً پیام شکار نمی‌شود)
-    try:
-        from database.models import GlobalSettings
-        async with async_session() as db_session:
-            settings = await db_session.scalar(select(GlobalSettings).limit(1))
-            if settings and not getattr(settings, "enable_crm_reply", True):
-                return
-    except Exception as e:
-        logger.error(f"CRM Catcher settings check failed: {e}")
-
     # ==========================================
-    # 🛡 فاز ۹ (BUG-27): فیلتر ارتباط — فقط تارگت‌های ارسالِ اخیرِ کمپین
+    # 🛡 فاز ۹ (BUG-27) + C3-fix: فیلتر ارتباط «ارزان» اول اجرا می‌شود —
+    # پیام غریبه‌ها/اسپم بدون هیچ کوئری DB رد می‌شوند؛ سپس وضعیت صندوق
+    # (کش ۳۰ ثانیه‌ای) بررسی می‌شود.
     # ==========================================
     if not await _is_recent_campaign_target(message.from_user.id):
         logger.debug(
             f"CRM: message from {message.from_user.id} is not a recent campaign "
             f"target; skipped (BUG-27 filter)."
         )
+        return
+
+    # 👈 C3-fix: وضعیت صندوق پیام با کش TTL (اگر خاموش بود، کلاً پیام شکار نمی‌شود)
+    if not await _crm_reply_enabled():
         return
 
     # ==========================================
