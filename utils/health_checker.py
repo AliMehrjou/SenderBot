@@ -618,9 +618,12 @@ async def check_all_proxies(bot: Bot = None) -> None:
             return
 
         try:
-            from sqlalchemy import or_
+            from sqlalchemy import or_, and_
             proxies = (await session.execute(select(Proxy.proxy_string).where(
-                or_(Proxy.is_active == True, Proxy.health_state == 'DEAD')
+                or_(
+                    Proxy.is_active == True,
+                    and_(Proxy.health_state == 'DEAD', Proxy.consecutive_failures > 0)
+                )
             ))).scalars().all()
         except Exception as e:
             logger.error(f"Failed to fetch proxies for check: {e}")

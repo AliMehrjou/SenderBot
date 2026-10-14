@@ -390,7 +390,6 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
                 stmt_api = (
                     select(APIKey)
                     .where(APIKey.id == api_key_id)
-                    .with_for_update(skip_locked=True)
                 )
                 api_obj = await session.scalar(stmt_api)
                 if api_obj:
@@ -1173,7 +1172,7 @@ async def _allocate_api_slot_dynamic(admin_id: int, session: AsyncSession):
 
         for api_key_id, committed_count in candidates:
             if committed_count + _reserved_count_for_api(api_key_id) < max_acc_per_api:
-                stmt_api = select(APIKey).where(APIKey.id == api_key_id).with_for_update(skip_locked=True)
+                stmt_api = select(APIKey).where(APIKey.id == api_key_id)
                 api_obj = await session.scalar(stmt_api)
                 if api_obj:
                     _reserve_api_slot(admin_id, api_obj.id)
@@ -1216,10 +1215,11 @@ async def _extract_session_offline(file_path: str, api_id: int, api_hash: str) -
     """استخراج آفلاین سشن‌ها (Telethon و Pyrogram) بر اساس منطق اصلی"""
     import sqlite3
     import os
+    import shutil
     from pyrogram import Client
     is_telethon = False
     try:
-        with sqlite3.connect(file_path) as conn:
+        with sqlite3.connect(file_path, timeout=5) as conn:
             c = conn.cursor()
             c.execute("PRAGMA table_info(version)")
             if "version" in [r[1] for r in c.fetchall()]:
@@ -1228,7 +1228,7 @@ async def _extract_session_offline(file_path: str, api_id: int, api_hash: str) -
         pass
 
     if is_telethon:
-        with sqlite3.connect(file_path) as conn:
+        with sqlite3.connect(file_path, timeout=5) as conn:
             c = conn.cursor()
             c.execute("SELECT dc_id, auth_key, test_mode, user_id, is_bot FROM sessions LIMIT 1")
             row = c.fetchone()
@@ -1250,12 +1250,22 @@ async def _extract_session_offline(file_path: str, api_id: int, api_hash: str) -
         return session_str
     else:
         temp_dir = os.path.dirname(file_path)
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
-        dummy_client = Client(name=base_name, workdir=temp_dir, api_id=api_id, api_hash=api_hash)
-        await dummy_client.storage.open()
-        session_str = await dummy_client.export_session_string()
-        await dummy_client.storage.close()
-        del dummy_client
+        safe_base_name = f"safe_extract_{uuid.uuid4().hex}"
+        safe_file_path = os.path.join(temp_dir, f"{safe_base_name}.session")
+        shutil.copy2(file_path, safe_file_path)
+        dummy_client = Client(name=safe_base_name, workdir=temp_dir, api_id=api_id, api_hash=api_hash)
+        try:
+            await dummy_client.storage.open()
+            if await dummy_client.storage.user_id() is None:
+                await dummy_client.storage.user_id(0)
+            session_str = await dummy_client.export_session_string()
+        finally:
+            with suppress(Exception):
+                await dummy_client.storage.close()
+            del dummy_client
+            with suppress(Exception):
+                if os.path.exists(safe_file_path): os.remove(safe_file_path)
+                if os.path.exists(safe_file_path + "-journal"): os.remove(safe_file_path + "-journal")
         return session_str
 
 
@@ -1329,7 +1339,12 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(temp_dir)
                 
-            session_files = [f for f in os.listdir(temp_dir) if f.endswith('.session')]
+            session_files = [
+                os.path.join(root, f)
+                for root, _, files in os.walk(temp_dir)
+                for f in files
+                if f.endswith('.session') and not f.startswith('._')
+            ]
             total_files = len(session_files) # 👈 تغییر ۱: متغیر تعداد کل فایل‌ها اضافه شد
             
             if not session_files:
@@ -1339,8 +1354,8 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
             await safe_edit_or_answer(progress_msg, f"🔄 تعداد {total_files} اکانت در زیپ یافت شد.\nآغاز پردازش...")
 
             # 👈 تغییر ۳: استفاده از enumerate برای داشتن شماره ایندکس (idx)
-            for idx, session_file in enumerate(session_files, 1):
-                session_path = os.path.join(temp_dir, session_file)
+            for idx, session_path in enumerate(session_files, 1):
+                session_file = os.path.basename(session_path)
                 
                 # 👈 تغییر ۴: اضافه شدن این بلوک برای آپدیت زنده (Live) نوار پیشرفت روی صفحه تلگرام
                 if idx % 3 == 0 or idx == 1:

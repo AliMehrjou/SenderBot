@@ -849,10 +849,10 @@ async def apply_photo_package_now(account_id: int) -> bool:
 # ==========================================
 # بازنویسی کامل: initialize_workers — workers/session_manager.py
 async def get_use_proxy_for_sending(session: AsyncSession) -> bool:
-    """خواندن سوییچ ارسال با پروکسی/مستقیم با یک پیش‌فرض واحد (True)"""
+    """خواندن سوییچ ارسال با پروکسی/مستقیم با یک پیش‌فرض واحد (False)"""
     stmt_settings = select(GlobalSettings).limit(1)
     global_settings = await session.scalar(stmt_settings)
-    return getattr(global_settings, "use_proxy_for_sending", True) if global_settings else True
+    return bool(getattr(global_settings, "use_proxy_for_sending", False)) if global_settings else False
 
 async def validate_fernet_key(session: AsyncSession, bot: Optional[Bot]) -> bool:
     """اعتبارسنجی زودهنگام کلید Fernet برای جلوگیری از خواب خاموش استخر ورکرها."""
@@ -1556,12 +1556,17 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
             else:
                 raise
 
-        await warm_worker_cache(client, extra_peer_ids=config.FORCE_JOIN_CHANNEL_LIST or None)
-        if getattr(client, "in_memory", False):
-            await _persist_memory_session(client, account.id)
-
         worker_pool[account.id] = client
         logger.info(f"Dynamically started new Worker {account.id} with API {client.api_id}.")
+
+        async def _bg_warmup_and_persist(c: Client, acc_id: int):
+            await warm_worker_cache(c, extra_peer_ids=config.FORCE_JOIN_CHANNEL_LIST or None)
+            if getattr(c, "in_memory", False):
+                await _persist_memory_session(c, acc_id)
+
+        task_warm = asyncio.create_task(_bg_warmup_and_persist(client, account.id))
+        _background_tasks.add(task_warm)
+        task_warm.add_done_callback(_background_tasks.discard)
 
         # 🔥 فاز ۶ (R7): ثبت شروع دوره‌ی گرم‌شدن برای اکانت تازه-لاگین‌شده — تا
         # MIN_WARMUP_HOURS ساعت بعد از اولین اتصال، دیسپچر به این اکانت chunk

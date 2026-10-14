@@ -49,9 +49,18 @@ async def init_db() -> None:
             settings = result_settings.scalar_one_or_none()
             
             if not settings:
-                new_settings = GlobalSettings()
+                new_settings = GlobalSettings(max_accounts_per_api=1)
                 session.add(new_settings)
                 logger.info("✅ تنظیمات پیش‌فرض (GlobalSettings) در دیتابیس ایجاد شد.")
+            elif settings.max_accounts_per_api == 5:
+                # اصلاح خودکار مقدار ۵ که به اشتباه از default قبلی مدل در دیتابیس ثبت شده بود
+                from workers.sender import _get_redis
+                try:
+                    has_user_changed = await _get_redis().exists("settings:previous_max_accounts_api")
+                except Exception:
+                    has_user_changed = False
+                if not has_user_changed:
+                    settings.max_accounts_per_api = 1
             
             # --- بخش ب: بررسی و ساخت دسته‌بندی پیش‌فرض ---
             stmt_cat = select(Category).where(Category.name == "default")
