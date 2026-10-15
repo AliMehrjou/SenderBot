@@ -471,6 +471,8 @@ async def check_proxy_health(proxy_string: str, timeout: float = 3.0) -> tuple[b
         return False, None
 
     # ساخت یک URL کاملاً استاندارد برای ماژول python_socks
+    # 🩹 FIX: scheme واقعیِ پارس‌شده استفاده می‌شود (socks5/http/...) — قبلاً
+    # socks5 هاردکد بود و تستِ سلامت پروکسی‌های http با پروتکل اشتباه fail می‌شد.
     from urllib.parse import quote
     auth = ""
     if parsed.get("username") and parsed.get("password"):
@@ -478,7 +480,8 @@ async def check_proxy_health(proxy_string: str, timeout: float = 3.0) -> tuple[b
     elif parsed.get("username"):
         auth = f"{quote(parsed['username'])}@"
         
-    standard_url = f"socks5://{auth}{parsed['hostname']}:{parsed['port']}"
+    scheme = parsed.get("scheme") or "socks5"
+    standard_url = f"{scheme}://{auth}{parsed['hostname']}:{parsed['port']}"
 
     start_time = time.perf_counter()
     try:
@@ -671,4 +674,4 @@ async def proxy_health_monitor_task(bot: Bot) -> None:
         except Exception as e:
             logger.error(f"Error in proxy_health_monitor_task: {e}")
             
-        await asyncio.sleep(config.PROXY_HEALTH_CHECK_INTERVAL)
+        await asyncio.sleep(config.PROXY_HEALTH_CHECK_INTERVAL)

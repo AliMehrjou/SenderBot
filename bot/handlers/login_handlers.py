@@ -20,7 +20,7 @@ from pyrogram.errors import (
     PhoneCodeExpired,
     PasswordHashInvalid
 )
-from utils.health_checker import report_proxy_result
+from utils.health_checker import report_proxy_result, check_proxy_health
 from sqlalchemy import or_
 from pyrogram.errors import AuthKeyUnregistered, SessionRevoked, UserDeactivated, UserDeactivatedBan, Unauthorized, AuthKeyDuplicated
 from sqlalchemy import select, func
@@ -426,10 +426,32 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
     if total_login_proxies == 0:
         from workers.session_manager import login_proxy_dict
         env_proxy_dict = login_proxy_dict()
-        
+
+        # 🩹 FIX (hard-delete): قبل از استفاده از LOGIN_PROXY_URL سلامتش زنده تست می‌شود.
+        # این متغیر فقط یک‌بار موقع ساخت اینستنس نوشته می‌شود — وقتی ادمینِ ربات‌ساز همه
+        # پروکسی‌های اینستنس را حذف می‌کند، این fallback نباید به یک پروکسیِ مرده/حذف‌شده
+        # تبدیل شود؛ در نتیجه لاگین به‌جای ۴۵ ثانیه خطای مبهم، پیام روشن می‌دهد.
+        env_ok = False
         if env_proxy_dict:
+            env_url = getattr(config, "LOGIN_PROXY_URL", "")
+            env_ok, _env_ping = await check_proxy_health(env_url, timeout=3.0)
+
+        if env_ok:
             proxy_string = getattr(config, "LOGIN_PROXY_URL", "")
             proxy_dict = env_proxy_dict
+        elif env_proxy_dict:
+            await state.clear()
+            await release_login_reservations(admin_id, session)
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⚙️ رفتن به تنظیمات", callback_data="menu_settings/")
+            builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
+            builder.adjust(2)
+            return await safe_edit_or_answer(
+                ack_msg,
+                "پروکسی لاگینی در سیستم ثبت نشده و پروکسی LOGIN_PROXY_URL نیز پاسخ‌گو نیست. "
+                "لطفاً از ربات‌ساز (پنل پروکسی اینستنس‌ها) یا تنظیمات، پروکسی لاگین سالم اضافه کنید.",
+                reply_markup=builder.as_markup()
+            )
         else:
             await state.clear()
             await release_login_reservations(admin_id, session)
@@ -547,9 +569,12 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
 
             if attempt == 0:
                 # تلاش با یک پروکسی لاگین جایگزین در صورت بروز خطا
+                # 🩹 FIX: شرط health_state != 'DEAD' (همان کوئری انتخاب اولیه) —
+                # قبلاً is_healthy==True بود و پروکسی‌های WEAK که فکتوری سینک می‌کند
+                # (is_healthy=0 ولی سالم) از چرخش جایگزین حذف می‌شدند.
                 stmt_retry = (
                     select(Proxy)
-                    .where(Proxy.usage_type.in_(("login", "both")), Proxy.is_active == True, Proxy.is_healthy == True, Proxy.proxy_string != proxy_string)
+                    .where(Proxy.usage_type.in_(("login", "both")), Proxy.is_active == True, Proxy.health_state != "DEAD", Proxy.proxy_string != proxy_string)
                     .order_by(func.random())
                     .limit(1)
                 )
@@ -1191,9 +1216,13 @@ async def _get_login_proxy_dynamic(admin_id: int, session: AsyncSession, state: 
     if total_login_proxies == 0:
         env_proxy_dict = login_proxy_dict()
         if env_proxy_dict:
-            return getattr(config, "LOGIN_PROXY_URL", ""), env_proxy_dict
-        else:
-            raise Exception("هیچ پروکسی لاگینی ثبت نشده و LOGIN_PROXY_URL خالی است.")
+            # 🩹 FIX (hard-delete): سلامت LOGIN_PROXY_URL زنده چک می‌شود — پروکسیِ
+            # حذف‌شده توسط ادمین ربات‌ساز دیگر به‌عنوان fallback لاگین استفاده نمی‌شود.
+            env_url = getattr(config, "LOGIN_PROXY_URL", "")
+            env_ok, _ = await check_proxy_health(env_url, timeout=3.0)
+            if env_ok:
+                return env_url, env_proxy_dict
+        raise Exception("هیچ پروکسی لاگینی ثبت نشده و LOGIN_PROXY_URL هم خالی/غیرفعال است.")
     else:
         stmt_login_proxy = (
             select(Proxy)
@@ -1210,6 +1239,32 @@ async def _get_login_proxy_dynamic(admin_id: int, session: AsyncSession, state: 
             raise Exception("پراکسی لاگین رزرو شده نامعتبر است.")
             
         return login_proxy_obj.proxy_string, proxy_dict
+
+
+async def _rotate_login_proxy(session: AsyncSession, exclude: set) -> tuple[Optional[str], Optional[dict]]:
+    """
+    🩹 FIX (چرخش واقعی): یک پروکسی لاگینِ سالمِ «متفاوت با قبلی‌ها» برمی‌گرداند.
+    قبلاً فلوی سشن/فایل، سه بار با «همان» پروکسیِ شکست‌خورده تلاش می‌کرد و پیام
+    «در حال چرخش IP...» نمایش می‌داد بدون اینکه IP واقعاً عوض شود.
+    """
+    from database.models import Proxy
+    from workers.session_manager import parse_proxy_string
+
+    stmt = (
+        select(Proxy)
+        .where(Proxy.usage_type.in_(("login", "both")), Proxy.is_active == True, Proxy.health_state != "DEAD")
+        .order_by(func.random())
+        .limit(1)
+    )
+    if exclude:
+        stmt = stmt.where(Proxy.proxy_string.notin_(list(exclude)))
+    obj = await session.scalar(stmt)
+    if not obj or not obj.proxy_string:
+        return None, None
+    pd = parse_proxy_string(obj.proxy_string)
+    if not pd:
+        return None, None
+    return obj.proxy_string, pd
 
 async def _extract_session_offline(file_path: str, api_id: int, api_hash: str) -> str:
     """استخراج آفلاین سشن‌ها (Telethon و Pyrogram) بر اساس منطق اصلی"""
@@ -1387,6 +1442,8 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
                     device_model, system_version, app_version = random.choice(DEVICE_MODELS), random.choice(SYSTEM_VERSIONS), random.choice(APP_VERSIONS)
                     me = None
                     MAX_RETRIES = 3
+                    # 🩹 FIX (چرخش واقعی): پروکسی‌های امتحان‌شده؛ تلاش بعدی با پروکسی متفاوت
+                    tried_proxies = {proxy_string} if proxy_string else set()
                     
                     for attempt in range(MAX_RETRIES):
                         client = Client(
@@ -1404,6 +1461,12 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
                         except Exception as e: # شامل TimeoutError
                             if proxy_string:
                                 asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
+                            # 🩹 FIX (چرخش واقعی): تلاش بعدی با یک پروکسی سالمِ متفاوت
+                            if attempt < MAX_RETRIES - 1:
+                                next_ps, next_pd = await _rotate_login_proxy(session, tried_proxies)
+                                if next_ps and next_pd:
+                                    proxy_string, proxy_dict = next_ps, next_pd
+                                    tried_proxies.add(next_ps)
                             if attempt == MAX_RETRIES - 1:
                                 raise e # پاس دادن خطا به بلاک بیرونی
                         finally:
@@ -1497,6 +1560,8 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
         device_model, system_version, app_version = random.choice(DEVICE_MODELS), random.choice(SYSTEM_VERSIONS), random.choice(APP_VERSIONS)
         me = None
         MAX_RETRIES = 3
+        # 🩹 FIX (چرخش واقعی): پروکسی‌های امتحان‌شده؛ تلاش بعدی با پروکسی متفاوت
+        tried_proxies = {proxy_string} if proxy_string else set()
         
         for attempt in range(MAX_RETRIES):
             client = Client(
@@ -1516,6 +1581,12 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
                     asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
                 if client.is_connected:
                     with suppress(Exception): await asyncio.wait_for(client.disconnect(), timeout=5)
+                # 🩹 FIX (چرخش واقعی): پیام «در حال چرخش IP» حالا واقعاً IP را عوض می‌کند
+                if attempt < MAX_RETRIES - 1:
+                    next_ps, next_pd = await _rotate_login_proxy(session, tried_proxies)
+                    if next_ps and next_pd:
+                        proxy_string, proxy_dict = next_ps, next_pd
+                        tried_proxies.add(next_ps)
                 if attempt == MAX_RETRIES - 1:
                     await safe_edit_or_answer(progress_msg, "⏱ مهلت اتصال به تلگرام به پایان رسید.")
                 else:
@@ -1526,6 +1597,12 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
                     asyncio.create_task(report_proxy_result(proxy_string, is_success=False))
                 if client.is_connected:
                     with suppress(Exception): await asyncio.wait_for(client.disconnect(), timeout=5)
+                # 🩹 FIX (چرخش واقعی): تلاش بعدی با یک پروکسی سالمِ متفاوت
+                if attempt < MAX_RETRIES - 1:
+                    next_ps, next_pd = await _rotate_login_proxy(session, tried_proxies)
+                    if next_ps and next_pd:
+                        proxy_string, proxy_dict = next_ps, next_pd
+                        tried_proxies.add(next_ps)
                 if attempt == MAX_RETRIES - 1:
                     await safe_edit_or_answer(progress_msg, f"❌ <b>خطای ناشناخته:</b>\n<code>{html.escape(str(e))}</code>")
                 else:
@@ -1604,4 +1681,4 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
         await safe_edit_or_answer(progress_msg, f"❌ خطای غیرمنتظره:\n<code>{html.escape(str(e))}</code>")
     finally:
         await release_login_reservations(admin_id, session)
-        await state.clear()
+        await state.clear()
