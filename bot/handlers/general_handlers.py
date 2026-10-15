@@ -1,0 +1,636 @@
+import logging
+import html
+import os
+import time
+import tempfile
+
+from aiogram import Router, types, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import Command
+
+from bot.keyboards.main_menu import get_main_menu_keyboard
+from workers.session_manager import worker_pool
+from bot.keyboards.cancel import with_cancel_hint
+from utils.fsm_cleanup import cleanup_fsm_temp_files
+from utils.safe_edit import safe_edit_or_answer
+from config import config
+
+logger = logging.getLogger(__name__)
+
+router = Router(name="general_handlers_router")
+
+# ==========================================
+# VERIFY JOIN HANDLER
+# ==========================================
+@router.callback_query(F.data == "menu_verify_join/")
+async def verify_join_callback(callback: types.CallbackQuery) -> None:
+    bot = callback.bot
+    not_joined_channels = []
+
+    for channel in config.FORCE_JOIN_CHANNEL_LIST:
+        try:
+            chat_member = await bot.get_chat_member(chat_id=channel, user_id=callback.from_user.id)
+            if chat_member.status in ["left", "kicked", "banned"]:
+                not_joined_channels.append(channel)
+        except Exception as e:
+            logger.warning(f"Verify-join: membership check failed for {channel}: {e}")
+            not_joined_channels.append(channel)
+
+    if not_joined_channels:
+        channels_list = "\n".join(f"• {ch}" for ch in not_joined_channels)
+        return await callback.answer(
+            "❌ عضویت شما هنوز تایید نشده است!\n\n"
+            f"لطفاً ابتدا در کانال(های) زیر عضو شوید:\n{channels_list}",
+            show_alert=True
+        )
+
+    await callback.answer("✅ عضویت شما تایید شد!", show_alert=True)
+    
+    await callback.message.edit_text(
+        "🎛 <b>پنل کنترل اصلی</b>\n\nلطفاً یک گزینه را انتخاب کنید:",
+        reply_markup=get_main_menu_keyboard()
+    )
+
+# ==========================================
+# 🌟 HELP MENU ENGINE (Dynamic & Beautiful)
+# ==========================================
+
+HELP_DATA = {
+  "main_menu_help": {
+    "title": "📖 راهنمای جامع و دوستانه کار با ربات",
+    "text": "به راهنمای جامع ربات ما خوش آمدید! 🌸\nما تمام تلاشمان را کرده‌ایم تا فرآیندهای ارسال انبوه، استخراج ممبر و مدیریت اکانت‌ها را به هوشمندانه‌ترین و ساده‌ترین شکل ممکن طراحی کنیم. هدف ما این است که بدون درگیر شدن با تنظیمات پیچیده، بالاترین بازدهی را با خیالی آسوده تجربه کنید.\n\nبرای آشنایی بیشتر با هر بخش، لطفاً روی دکمه دلخواهتان کلیک بفرمایید: 👇",
+    "buttons": [
+      [
+        {"text": "🎥 تماشای فیلم آموزش کار با ربات", "url": config.VIDEO_LINK, "style": "danger"}
+      ],
+      [
+        {"text": "📋 دستورات و میانبرها", "callback_data": "help:shortcuts"},
+        {"text": "🚀 ثبت سفارش و ارسال", "callback_data": "help:orders"}
+      ],
+      [
+        {"text": "👥 استخراج ممبر", "callback_data": "help:extractor"},
+        {"text": "📱 مدیریت اکانت‌ها و پروفایل", "callback_data": "help:accounts"}
+      ],
+      [
+        {"text": "🛠 ابزارها و بنرها", "callback_data": "help:tools"},
+        {"text": "❓ سوالات و رفع اشکال", "callback_data": "help:faq"}
+      ]
+    ]
+  },
+  "sections": {
+    "shortcuts": {
+      "title": "📋 دستورات میانبر و کلیدهای اصلی",
+      "content": "در هر کجای مسیر که باشید، این دستورات کوتاه مثل یک میانبر سریع به کمک شما می‌آیند. کافیست روی آن‌ها لمس کنید:\n\n"
+                 "🔹 <code>/start</code> : شروعی دوباره! ربات را از نو راه‌اندازی می‌کند و منوی اصلی را برایتان می‌آورد.\n\n"
+                 "🔹 <code>/restart</code> یا دکمه <b>🔄 ریستارت ربات</b> : اگر در مرحله‌ای گیر کردید یا نظرتان عوض شد، ربات فوراً همه‌چیز را لغو کرده و به حالت اولیه برمی‌گردد.\n\n"
+                 "🔹 <code>/cancel</code> یا دکمه <b>❌ انصراف</b> : اگر از انجام مرحله فعلی منصرف شدید، این دستور شما را یک قدم به عقب می‌برد.\n\n"
+                 "🔹 <code>/help</code> : نمایش همین صفحه راهنمای دوستانه.\n\n"
+                 "🔹 <code>/status</code> : یک نگاه سریع به وضعیت سرور، اکانت‌های متصل و کارهای در حال انجام.\n\n"
+                 "🔹 <code>/accounts</code> : رفتن به بخش مدیریت اکانت‌ها با یک کلیک.\n\n"
+                 "🔹 <code>/extract</code> : ورود مستقیم و سریع به بخش استخراج ممبر.\n\n"
+                 "🔹 <code>/import</code> : ورود سریع به بخش افزودن اکانت با فایل (گروهی یا تکی).\n\n"
+                 "🔹 <code>/dl_session_[آیدی]</code> : <i>(مخصوص ادمین اصلی)</i> دانلود امن فایل سشن یک اکانت خاص. (پیام حاوی فایل برای امنیت پس از ۶۰ ثانیه خودکار حذف می‌شود).\n\n"
+                 "🔹 <code>/dl_all_sessions</code> : <i>(مخصوص ادمین اصلی)</i> استخراج و دانلود گروهی تمامی سشن‌های سیستم در قالب یک فایل ZIP محرمانه. (پیام پس از ۶۰ ثانیه حذف می‌شود).\n\n"
+                 "🔹 <code>/wipe_all_photos</code> : <i>(مخصوص ادمین اصلی)</i> حذف قطعی تمامی عکس‌های پروفایل از روی همه‌ی اکانت‌های متصل به سرور.",
+      "back_button": {"text": "🔙 بازگشت به منوی راهنما", "callback_data": "help:main"}
+    },
+    "orders": {
+      "title": "🚀 راهنمای ثبت سفارش ارسال انبوه",
+      "content": "برای اینکه ارسال انبوه شما به بهترین شکل انجام شود، این مسیر ساده را با هم طی می‌کنیم:\n\n"
+                 "۱️⃣ <b>ورود به بخش ارسال:</b> از منوی اصلی، با خیالی راحت دکمه <b>«ثبت سفارش ارسال»</b> را انتخاب کنید.\n\n"
+                 "۲️⃣ <b>آماده‌سازی پیام:</b> می‌توانید متن زیبای خود را همینجا بنویسید یا از بین بنرهایی که قبلاً ذخیره کرده‌اید یکی را انتخاب کنید (امکان ارسال عکس هم وجود دارد!).\n\n"
+                 "۳️⃣ <b>جادوی متن تصادفی (اسپین‌تکس):</b> برای جلوگیری از حساسیت تلگرام، متن را با این فرمت بنویسید: <code>{سلام|درود|وقت بخیر}</code>. ربات برای هر شخص یکی از این کلمات را تصادفی استفاده می‌کند.\n\n"
+                 "۴️⃣ <b>لیست مخاطبان شما:</b> فایل متنی (<code>.txt</code>) شامل آیدی‌ها یا نام‌های کاربری را بفرستید (هر خط یک آیدی).\n\n"
+                 "۵️⃣ <b>پیش‌نمایش قبل از ارسال:</b> ربات قبل از شروع، نمونه‌ای از پیام نهایی را به شما نشان می‌دهد.\n\n"
+                 "۶️⃣ <b>کنترل پنل زنده:</b> پس از تایید، پیشرفت کار را لحظه‌ای در یک پیام می‌بینید و می‌توانید آن را متوقف یا لغو کنید.",
+      "back_button": {"text": "🔙 بازگشت به منوی راهنما", "callback_data": "help:main"}
+    },
+    "extractor": {
+      "title": "👥 راهنمای استخراج ممبر از گروه‌ها",
+      "content": "این بخش به شما کمک می‌کند تا به راحتی مخاطبان هدف خود را پیدا کنید:\n\n"
+                 "۱️⃣ <b>شروع کار:</b> لطفاً دکمه <b>«آنالیز»</b> (یا استفاده از میانبر /extract) را انتخاب کنید.\n\n"
+                 "۲️⃣ <b>معرفی گروه:</b> لینک عمومی یا لینک دعوت (Join Link) گروه مدنظرتان را ارسال کنید.\n\n"
+                 "۳️⃣ <b>انتخاب استراتژی:</b> یکی از حالت‌های زیر را انتخاب کنید:\n"
+                 "   ▫️ <b>👥 همه اعضا:</b> کل اعضای گروه استخراج می‌شود.\n"
+                 "   ▫️ <b>💬 فرستندگان پیام:</b> فقط افراد فعال در چت گروه پیدا می‌شوند (عالی برای گروه‌هایی که لیست اعضا مخفی است).\n"
+                 "   ▫️ <b>🥇 طلایی:</b> ترکیبی هوشمند از لیست اعضا و فعالیت آن‌ها.\n"
+                 "   ▫️ <b>🟢 فقط آنلاین:</b> کاربرانی که اخیراً آنلاین بوده‌اند.\n\n"
+                 "۴️⃣ <b>دریافت فایل نهایی:</b> در نهایت یک فایل متنی تمیز دریافت می‌کنید که مستقیماً در «ثبت سفارش» قابل استفاده است.",
+      "back_button": {"text": "🔙 بازگشت به منوی راهنما", "callback_data": "help:main"}
+    },
+    "accounts": {
+      "title": "📱 مدیریت اکانت‌ها و قانون استراحت",
+      "content": "اکانت‌های شما سرمایه‌های اصلی شما هستند و ما به شدت مراقب سلامت آن‌ها هستیم 🛡:\n\n"
+                 "➕ <b>افزودن اکانت:</b>\n"
+                 "از بخش «مدیریت اکانت‌ها»، دکمه افزودن را بزنید. می‌توانید با <b>شماره تلفن</b>، <b>رشته سشن (تکی)</b>، یا <b>فایل ZIP (گروهی)</b> اکانت‌ها را وارد کنید.\n\n"
+                 "🖼 <b>پکیج عکس پروفایل:</b>\n"
+                 "شما می‌توانید پکیج‌های ۳ تایی از عکس‌ها بسازید (بخش 🖼 پکیج پروفایل). ربات می‌تواند این پکیج‌ها را به صورت خودکار به اکانت‌های آزاد اختصاص داده و در زمان فعال شدن ورکر، روی آن‌ها تنظیم کند.\n\n"
+                 "🚦 <b>وضعیت اکانت‌ها به چه معناست؟</b>\n"
+                 "🟢 <b>آماده به کار:</b> اکانت کاملاً سرحال است.\n"
+                 "🟡 <b>در حال استراحت (Cooldown):</b> برای جلوگیری از اسپم، ربات پس از ارسال پیام‌ها، اکانت را ۲۴ ساعت به مرخصی می‌فرستد تا به صورت خودکار دوباره آماده کار شود.\n"
+                 "🔴 <b>محدود شده:</b> متأسفانه اکانت ریپورت (محدود) شده است.\n"
+                 "⚪️ <b>آفلاین:</b> ارتباط قطع شده و نیاز به لاگین مجدد است.\n\n"
+                 "⚡️ <i>خیالتان راحت باشد: ربات زمان‌بندی و فواصل ایمن را کاملا خودکار بین اکانت‌های سالم رعایت می‌کند.</i>",
+      "back_button": {"text": "🔙 بازگشت به منوی راهنما", "callback_data": "help:main"}
+    },
+    "tools": {
+      "title": "🛠 ابزارها و مدیریت بنرها",
+      "content": "برای راحتی بیشتر شما، امکانات فوق‌العاده‌ای در منوی «ابزارها» قرار داده‌ایم:\n\n"
+                 "🖼 <b>ویترین بنرها (Banners):</b>\n"
+                 "متن‌ها و عکس‌هایی که زیاد استفاده می‌کنید را یک‌بار اینجا ذخیره کنید. دفعات بعد فقط با یک کلیک آن‌ها را برای ارسال انتخاب کنید.\n\n"
+                 "🧹 <b>پاک‌سازی لیست‌ها:</b>\n"
+                 "ابزاری عالی برای اینکه فایل‌های آیدی خود را مرتب کنید، تکراری‌ها را دور بریزید و یک لیست بی‌نقص بسازید.\n\n"
+                 "📊 <b>آمار و گزارش‌ها:</b>\n"
+                 "می‌توانید کارهای گذشته، تعداد پیام‌های موفق و تاریخچه سفارش‌هایتان را در این بخش مرور کنید.",
+      "back_button": {"text": "🔙 بازگشت به منوی راهنما", "callback_data": "help:main"}
+    },
+    "faq": {
+      "title": "❓ سوالات متداول و حل مشکلات",
+      "content": "💡 <b>چرا ربات از من می‌خواهد در کانال‌ها عضو شوم؟</b>\n"
+                 "برای اینکه بتوانیم خدمات بهتری ارائه دهیم و ربات فعال بماند، در کانال‌های اسپانسر (مثل @linkdoonifun و @robotsfunlink) عضو شده و «بررسی مجدد» را بزنید.\n\n"
+                 "💡 <b>اگر در میان منوها گم شدم چه کار کنم؟</b>\n"
+                 "دستور <code>/restart</code> را در چت بنویسید یا دکمه «🔄 ریستارت ربات» را بزنید.\n\n"
+                 "💡 <b>آیا لازم است سرعت ارسال را تنظیم کنم؟</b>\n"
+                 "خیر! سیستم ضداسپم ما به طور هوشمندانه فواصل زمانی را مدیریت می‌کند تا اکانت‌ها در امن‌ترین حالت ممکن بمانند.\n\n"
+                 "💡 <b>آیا زمان‌بندی‌ها بر اساس ساعت ایران هستند؟</b>\n"
+                 "بله، تمام ساعت‌ها و گزارش‌ها دقیقاً با ساعت رسمی ایران (Asia/Tehran) تنظیم شده‌اند.",
+      "back_button": {"text": "🔙 بازگشت به منوی راهنما", "callback_data": "help:main"}
+    }
+  }
+}
+
+# 1. تابع سازنده منوی اصلی راهنما
+def get_help_main_keyboard():
+    builder = InlineKeyboardBuilder()
+    buttons_layout = HELP_DATA["main_menu_help"]["buttons"]
+    
+    # چیدمان کاملاً داینامیک بر اساس ردیف‌های تعیین شده در دیکشنری
+    for row in buttons_layout:
+        for btn in row:
+            # ایجاد یک دیکشنری از آرگومان‌ها برای ساخت دکمه
+            kwargs = {"text": btn["text"]}
+            
+            # بررسی نوع عملکرد دکمه (لینک یا کال‌بک)
+            if "url" in btn:
+                kwargs["url"] = btn["url"]
+            elif "callback_data" in btn:
+                kwargs["callback_data"] = btn["callback_data"]
+                
+            # اعمال استایل در صورت وجود (مثل style="danger" برای قرمز شدن دکمه)
+            if "style" in btn:
+                kwargs["style"] = btn["style"]
+                
+            # ساخت دکمه با آرگومان‌های استخراج‌شده
+            builder.button(**kwargs)
+            
+    # محاسبه تعداد دکمه در هر ردیف برای adjust شدن دقیق
+    builder.adjust(*[len(row) for row in buttons_layout])
+    
+    # اضافه کردن دکمه بازگشت به منوی اصلی ربات در انتهای منو
+    builder.row(types.InlineKeyboardButton(text="🏛 بازگشت به پنل اصلی", callback_data="menu_home/"))
+    return builder.as_markup()
+
+# 2. هندلرهای ورود به منوی راهنما (/help و دکمه شیشه‌ای)
+@router.callback_query(F.data == "menu_help/")
+async def show_help_menu(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+    
+    main_text = f"<b>{HELP_DATA['main_menu_help']['title']}</b>\n\n{HELP_DATA['main_menu_help']['text']}"
+    await safe_edit_or_answer(callback.message, main_text, reply_markup=get_help_main_keyboard())
+
+@router.message(Command("help"))
+async def show_help_command(message: types.Message, state: FSMContext) -> None:
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+    
+    main_text = f"<b>{HELP_DATA['main_menu_help']['title']}</b>\n\n{HELP_DATA['main_menu_help']['text']}"
+    await message.answer(main_text, reply_markup=get_help_main_keyboard())
+
+
+# 3. 🧠 هندلر هوشمند و داینامیک زیرمنوها (جادوی اصلی اینجاست!)
+@router.callback_query(F.data.startswith("help:"))
+async def handle_dynamic_help_sections(callback: types.CallbackQuery, state: FSMContext) -> None:
+    section_key = callback.data.split(":")[1]
+    
+    # اگر کاربر دکمه بازگشت به منوی اصلی راهنما را زد
+    if section_key == "main":
+        return await show_help_menu(callback, state)
+        
+    # واکشی اطلاعات بخش مربوطه از دیکشنری
+    section_data = HELP_DATA["sections"].get(section_key)
+    
+    if not section_data:
+        return await callback.answer("⚠️ این بخش در حال بروزرسانی است.", show_alert=True)
+        
+    # ساخت متن نهایی با استایل بسیار زیبا
+    text = f"🌟 <b>{section_data['title']}</b>\n\n{section_data['content']}"
+    
+    # ساخت دکمه‌های بازگشت (یکی برای راهنما، یکی برای پنل کل ربات)
+    builder = InlineKeyboardBuilder()
+    builder.button(text=section_data["back_button"]["text"], callback_data=section_data["back_button"]["callback_data"])
+    builder.button(text="🏛 منوی اصلی ربات", callback_data="menu_home/")
+    builder.adjust(1, 1)
+    
+    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+# ==========================================
+# COMING SOON / IGNORE HANDLERS
+# ==========================================
+@router.callback_query(F.data.in_(["menu_coming_soon_example/"]))
+async def handle_coming_soon_menus(callback: types.CallbackQuery) -> None:
+    await callback.answer("⏳ این بخش در حال توسعه است و به زودی اضافه خواهد شد!", show_alert=True)
+
+@router.callback_query(F.data == "pagination_info_ignore/")
+async def ignore_pagination_info(callback: types.CallbackQuery) -> None:
+    await callback.answer()
+
+# ==========================================
+# --- استیت‌های مربوط به CRM ---
+# (C2-fix: نسخه یکپارچه — admin_crm_handlers.py حذف شد؛ این تنها مسیر پاسخ CRM است)
+# ==========================================
+class CRMStates(StatesGroup):
+    waiting_for_reply = State()
+
+# C4-fix: نشست پاسخ‌دهی حداکثر ۱۰ دقیقه اعتبار دارد (بدون TTL، state تا ابد در Redis می‌ماند)
+CRM_REPLY_TTL_SECONDS = 600
+# C5-fix: سقف حجم مدیای پاسخ (هم‌مرز سقف دانلود Bot API)
+CRM_MEDIA_MAX_BYTES = 20 * 1024 * 1024
+
+
+def get_crm_cancel_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ انصراف", callback_data="cancel_crm_reply/")
+    return builder.as_markup()
+
+
+# ==========================================
+# هندلر کلیک روی دکمه پاسخ CRM
+# ==========================================
+@router.callback_query(F.data.startswith("crm_reply_"))
+async def crm_reply_callback(callback: types.CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split("_")
+
+    if len(parts) != 4:
+        return await callback.answer("⚠️ دیتای نامعتبر.", show_alert=True)
+
+    worker_id = parts[2]
+    target_id = parts[3]
+
+    # C4-fix: ثبت زمان شروع نشست (برای TTL)
+    await state.update_data(crm_worker_id=worker_id, crm_target_id=target_id, crm_ts=time.time())
+    await state.set_state(CRMStates.waiting_for_reply)
+
+    await callback.message.reply(
+        with_cancel_hint(
+            f"✍️ <b>ارسال پاسخ به تارگت:</b> <code>{target_id}</code>\n"
+            f"🤖 <b>از طریق اکانت ورکر:</b> <code>{worker_id}</code>\n\n"
+            "لطفاً پاسخ خود را ارسال کنید:\n"
+            "• متن (فورمت ضخیم/ایتالیک/کد حفظ می‌شود)\n"
+            "• عکس، ویدیو، فایل، ویس، گیف و استیکر (<b>بجز استیکرهای ویدیویی</b>)\n\n"
+            "⌛️ نشست پس از ۱۰ دقیقه خودکار منقضی می‌شود."
+        ),
+        reply_markup=get_crm_cancel_keyboard()
+    )
+    await callback.answer()
+
+
+# ==========================================
+# C5-fix: ارسال مدیای پاسخ CRM از طریق ورکر
+# ==========================================
+async def _send_crm_media_reply(client, message: types.Message, target_id: int) -> None:
+    bot_file = None
+    kind = None
+    if message.photo:
+        bot_file, kind = message.photo[-1], "photo"
+    elif message.video:
+        bot_file, kind = message.video, "video"
+    elif message.document:
+        bot_file, kind = message.document, "document"
+    elif message.voice:
+        bot_file, kind = message.voice, "voice"
+    elif message.audio:
+        bot_file, kind = message.audio, "audio"
+    elif message.video_note:
+        bot_file, kind = message.video_note, "video_note"
+    elif message.animation:
+        bot_file, kind = message.animation, "animation"
+    elif message.sticker:
+        # جلوگیری از ارسال استیکرهای ویدیویی برای جلوگیری از باگ یوزربات
+        if message.sticker.is_video:
+            raise ValueError("ارسال استیکر ویدیویی پشتیبانی نمی‌شود! لطفاً از استیکر معمولی یا فایل استفاده کنید.")
+        elif message.sticker.is_animated:
+            bot_file, kind = message.sticker, "animated_sticker"
+        else:
+            bot_file, kind = message.sticker, "sticker"
+    else:
+        raise ValueError("نوع مدیا پشتیبانی نمی‌شود")
+
+    size = getattr(bot_file, "file_size", 0) or 0
+    if size and size > CRM_MEDIA_MAX_BYTES:
+        raise ValueError(
+            f"حجم فایل ({size // (1024 * 1024)}MB) از سقف مجاز "
+            f"({CRM_MEDIA_MAX_BYTES // (1024 * 1024)}MB) بیشتر است"
+        )
+
+    file_name = getattr(bot_file, "file_name", None) or ""
+    suffix = os.path.splitext(file_name)[1] or ""
+    
+    # تعیین پسوند دقیق برای استیکرها
+    if not suffix and message.sticker:
+        if message.sticker.is_animated:
+            suffix = ".tgs"
+        else:
+            suffix = ".webp"
+
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="crm_reply_")
+    os.close(fd)
+    try:
+        await message.bot.download(bot_file, destination=tmp_path)
+        caption = message.html_text if message.caption else None
+        
+        if kind == "photo":
+            await client.send_photo(target_id, tmp_path, caption=caption)
+        elif kind == "video":
+            await client.send_video(target_id, tmp_path, caption=caption)
+        elif kind == "document":
+            await client.send_document(target_id, tmp_path, caption=caption)
+        elif kind == "voice":
+            await client.send_voice(target_id, tmp_path)
+        elif kind == "audio":
+            await client.send_audio(target_id, tmp_path, caption=caption)
+        elif kind == "video_note":
+            await client.send_video_note(target_id, tmp_path)
+        elif kind == "animation":
+            await client.send_animation(target_id, tmp_path, caption=caption)
+        elif kind in ("sticker", "animated_sticker"):
+            # ارسال مستقیم به عنوان استیکر (بدون تبدیل به داکیومنت)
+            await client.send_sticker(target_id, tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+async def _send_crm_media_reply(client, message: types.Message, target_id: int) -> None:
+    bot_file = None
+    kind = None
+    if message.photo:
+        bot_file, kind = message.photo[-1], "photo"
+    elif message.video:
+        bot_file, kind = message.video, "video"
+    elif message.document:
+        bot_file, kind = message.document, "document"
+    elif message.voice:
+        bot_file, kind = message.voice, "voice"
+    elif message.audio:
+        bot_file, kind = message.audio, "audio"
+    elif message.video_note:
+        bot_file, kind = message.video_note, "video_note"
+    elif message.animation:
+        bot_file, kind = message.animation, "animation"
+    elif message.sticker:
+        # تفکیک استیکر ثابت از متحرک برای جلوگیری از خطای Pyrogram
+        if message.sticker.is_animated or message.sticker.is_video:
+            bot_file, kind = message.sticker, "animated_sticker"
+        else:
+            bot_file, kind = message.sticker, "sticker"
+    else:
+        raise ValueError("نوع مدیا پشتیبانی نمی‌شود")
+
+    size = getattr(bot_file, "file_size", 0) or 0
+    if size and size > CRM_MEDIA_MAX_BYTES:
+        raise ValueError(
+            f"حجم فایل ({size // (1024 * 1024)}MB) از سقف مجاز "
+            f"({CRM_MEDIA_MAX_BYTES // (1024 * 1024)}MB) بیشتر است"
+        )
+
+    file_name = getattr(bot_file, "file_name", None) or ""
+    suffix = os.path.splitext(file_name)[1] or ""
+    
+    # تعیین پسوند دقیق برای استیکرها (چون معمولاً نام فایل ندارند)
+    if not suffix and message.sticker:
+        if message.sticker.is_animated:
+            suffix = ".tgs"
+        elif message.sticker.is_video:
+            suffix = ".webm"
+        else:
+            suffix = ".webp"
+
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="crm_reply_")
+    os.close(fd)
+    try:
+        await message.bot.download(bot_file, destination=tmp_path)
+        caption = message.html_text if message.caption else None
+        
+        if kind == "photo":
+            await client.send_photo(target_id, tmp_path, caption=caption)
+        elif kind == "video":
+            await client.send_video(target_id, tmp_path, caption=caption)
+        elif kind == "document":
+            await client.send_document(target_id, tmp_path, caption=caption)
+        elif kind == "voice":
+            await client.send_voice(target_id, tmp_path)
+        elif kind == "audio":
+            await client.send_audio(target_id, tmp_path, caption=caption)
+        elif kind == "video_note":
+            await client.send_video_note(target_id, tmp_path)
+        elif kind == "animation":
+            await client.send_animation(target_id, tmp_path, caption=caption)
+        elif kind == "sticker":
+            await client.send_sticker(target_id, tmp_path)
+        elif kind == "animated_sticker":
+            await client.send_sticker(target_id, tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+# ==========================================
+# هندلر دریافت پاسخ و ارسال با Pyrogram (CRM)
+# ==========================================
+@router.message(CRMStates.waiting_for_reply)
+async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
+    
+    # 🛑 مسدودسازی استیکرهای ویدیویی در همان لحظه اول (گیت‌وی)
+    if message.sticker and message.sticker.is_video:
+        return await message.reply(
+            "❌ <b>غیرمجاز:</b> ارسال استیکرهای ویدیویی در این بخش پشتیبانی نمی‌شود!\n"
+            "لطفاً متن، عکس، فایل یا استیکر معمولی ارسال کنید.",
+            reply_markup=get_crm_cancel_keyboard()
+        )
+        
+    # (اختیاری) اگر فایلی که در عکس فرستادید تلگرام آن را به عنوان گیف (Animation) می‌شناسد 
+    # و می‌خواهید گیف‌ها را هم کلاً ببندید، هشتگ دو خط زیر را بردارید:
+    # if message.animation:
+    #     return await message.reply("❌ ارسال گیف غیرمجاز است!", reply_markup=get_crm_cancel_keyboard())
+
+    data = await state.get_data()
+    worker_id_str = data.get("crm_worker_id")
+    target_id = data.get("crm_target_id")
+    crm_ts = data.get("crm_ts")
+
+    if not worker_id_str or not target_id:
+        await state.clear()
+        return await message.answer("⚠️ اطلاعات نشست از دست رفته است. لطفاً دوباره روی دکمه پاسخ کلیک کنید.")
+
+    # انقضای نشست پس از TTL
+    if crm_ts and (time.time() - float(crm_ts)) > CRM_REPLY_TTL_SECONDS:
+        await state.clear()
+        return await message.answer(
+            "⌛️ نشست پاسخ‌دهی به دلیل طولانی‌بودن (بیش از ۱۰ دقیقه) منقضی شد.\n"
+            "لطفاً دوباره روی دکمه «✉️ پاسخ به این کاربر» در پیام CRM بزنید."
+        )
+
+    # کامندها هرگز به مشتری ارسال نمی‌شوند
+    raw_text = message.text or message.caption or ""
+    if raw_text.startswith("/"):
+        return await message.answer(
+            "⚠️ <b>این متن به‌عنوان دستور شناخته شد و به مشتری ارسال نشد.</b>\n"
+            "برای لغو پاسخ‌دهی دکمه «❌ انصراف» را بزنید؛\n"
+            "در غیر این صورت ادامه پاسخ را بفرستید.",
+            reply_markup=get_crm_cancel_keyboard()
+        )
+
+    try:
+        worker_id_int = int(worker_id_str)
+    except ValueError:
+        await state.clear()
+        return await message.answer("⚠️ خطای سیستمی: آیدی ورکر نامعتبر است.")
+
+    client = worker_pool.get(worker_id_int)
+
+    if not client or not client.is_connected:
+        await state.clear()
+        return await message.answer(
+            f"⚠️ <b>ارسال ناموفق:</b>\n"
+            f"اکانت ورکر <code>{worker_id_str}</code> در حال حاضر آفلاین است یا اتصال آن با تلگرام قطع شده است."
+        )
+
+    wait_msg = await message.answer("⏳ در حال ارسال پاسخ توسط ورکر...")
+
+    try:
+        has_media = bool(
+            message.photo or message.video or message.document or message.voice
+            or message.audio or message.video_note or message.animation or message.sticker
+        )
+        if has_media:
+            # پاسخ مدیایی
+            await _send_crm_media_reply(client, message, int(target_id))
+            sent_kind = "مدیا"
+        elif raw_text:
+            # فرمتینگ HTML ادمین حفظ می‌شود
+            await client.send_message(chat_id=int(target_id), text=message.html_text)
+            sent_kind = "متن"
+        else:
+            return await wait_msg.edit_text(
+                "⚠️ محتوای پشتیبانی‌نشده است. لطفاً متن یا مدیا ارسال کنید."
+            )
+
+        await wait_msg.edit_text(
+            f"✅ <b>پیام شما ({sent_kind}) با موفقیت ارسال شد!</b>\n"
+            f"👤 <b>مقصد:</b> <code>{target_id}</code>\n"
+            f"🤖 <b>از طریق ورکر:</b> <code>{worker_id_str}</code>"
+        )
+    except ValueError as ve:
+        await wait_msg.edit_text(f"❌ <b>خطا در ارسال مدیا:</b>\n<code>{html.escape(str(ve))}</code>")
+    except Exception as e:
+        logger.error(f"CRM reply via worker {worker_id_int} to {target_id} failed: {e}")
+        await wait_msg.edit_text(f"❌ <b>خطا در ارسال پیام:</b>\n<code>{html.escape(str(e))}</code>")
+    finally:
+        await state.clear()
+
+
+
+async def safe_pin_message(bot, chat_id: int, message_id: int) -> bool:
+    """
+    سعی می‌کند پیام را پین کند. در صورت بروز محدودیت‌های تلگرام یا خطای دسترسی،
+    خطا لاگ می‌شود اما ربات کرش نمی‌کند.
+    """
+    try:
+        await bot.pin_chat_message(
+            chat_id=chat_id, 
+            message_id=message_id, 
+            disable_notification=True
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Pin message failed in chat {chat_id} for message {message_id}: {e}")
+        return False
+
+async def safe_unpin_message(bot, chat_id: int, message_id: int) -> bool:
+    """
+    سعی می‌کند پیام را آنپین کند. 
+    """
+    try:
+        await bot.unpin_chat_message(
+            chat_id=chat_id, 
+            message_id=message_id
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Unpin message failed in chat {chat_id} for message {message_id}: {e}")
+        return False
+    
+# ==========================================
+# 🌟 SHORTCUT COMMANDS HANDLERS (میانبرها)
+# ==========================================
+
+@router.message(Command("extract"))
+async def shortcut_extract_command(message: types.Message, state: FSMContext) -> None:
+    """هندلر میانبر /extract برای ورود سریع به بخش استخراج"""
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🌐 ورود به بخش استخراج", callback_data="menu_analysis/")
+    
+    await message.answer(
+        "👇 برای ورود به بخش استخراج ممبر (آنالیز) کلیک کنید:", 
+        reply_markup=builder.as_markup()
+    )
+
+@router.message(Command("accounts"))
+async def shortcut_accounts_command(message: types.Message, state: FSMContext) -> None:
+    """هندلر میانبر /accounts برای مدیریت اکانت‌ها"""
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📲 ورود به مدیریت اکانت‌ها", callback_data="menu_list_accounts/")
+    
+    await message.answer(
+        "👇 برای ورود به بخش لیست و مدیریت اکانت‌ها کلیک کنید:", 
+        reply_markup=builder.as_markup()
+    )
+
+@router.message(Command("status"))
+async def shortcut_status_command(message: types.Message, state: FSMContext) -> None:
+    """هندلر میانبر /status برای مشاهده وضعیت سرور"""
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 مشاهده آمار و وضعیت", callback_data="menu_stats/")
+    
+    await message.answer(
+        "👇 برای مشاهده آمار سیستم و وضعیت اکانت‌ها کلیک کنید:", 
+        reply_markup=builder.as_markup()
+    )
+
+@router.message(Command("restart"))
+async def shortcut_restart_command(message: types.Message, state: FSMContext) -> None:
+    """هندلر میانبر /restart برای بازگشت به حالت اولیه"""
+    await cleanup_fsm_temp_files(state)
+    await state.clear()
+    
+    # استفاده از کیبورد منوی اصلی که در بالای فایل ایمپورت شده است
+    await message.answer(
+        "🔄 ربات با موفقیت ریستارت شد و به حالت اولیه بازگشت.", 
+        reply_markup=get_main_menu_keyboard()
+    )
