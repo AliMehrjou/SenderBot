@@ -342,7 +342,7 @@ class GlobalSettings(Base):
     smart_anti_ban: Mapped[bool] = mapped_column(default=True, server_default="1", nullable=False)
     
     # 🚀 فاز جدید: تنظیمات ارسال مستقیم یا با پراکسی
-    use_proxy_for_sending: Mapped[bool] = mapped_column(default=False, server_default="0", nullable=False)
+    use_proxy_for_sending: Mapped[bool] = mapped_column(default=True, server_default="0", nullable=False)
 
 class Proxy(Base):
     """
