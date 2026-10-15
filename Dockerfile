@@ -11,9 +11,10 @@ ARG APP_GID=1000
 RUN groupadd -g ${APP_GID} app && \
     useradd -u ${APP_UID} -g app -d /app -s /usr/sbin/nologin appuser
 
-# تنظیمات مربوط به apt-get برای پایداری بیشتر در شبکه‌های ناپایدار
-RUN apt-get update -o Acquire::Retries=30 -o Acquire::http::Timeout=120 -o Acquire::ForceIPv4=true && \
-    apt-get install -y --no-install-recommends -o Acquire::Retries=30 -o Acquire::http::Timeout=120 -o Acquire::ForceIPv4=true \
+# تغییر مخزن پیش‌فرض Debian به Tsinghua و نصب پکیج‌ها
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true && \
+    apt-get install -y --no-install-recommends -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true \
     gcc \
     tzdata \
     libmediainfo0v5 && \
@@ -21,10 +22,10 @@ RUN apt-get update -o Acquire::Retries=30 -o Acquire::http::Timeout=120 -o Acqui
 
 COPY requirements.txt .
 
-# استفاده از مخزن Tsinghua (چینهوا) برای آپگرید pip و نصب پکیج‌ها
-RUN pip install --no-cache-dir --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple && \
+# استفاده از مخزن Aliyun (یا حذف کامل -i برای استفاده از مخزن اصلی با timeout بالا)
+RUN pip install --no-cache-dir --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ && \
     pip install --no-cache-dir -r requirements.txt \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
     --default-timeout=120 --retries=10
 
 COPY . .
