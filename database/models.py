@@ -351,8 +351,10 @@ class Proxy(Base):
     __tablename__ = "proxies"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     proxy_string: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
-    is_active: Mapped[bool] = mapped_column(default=True)
-    fail_count: Mapped[int] = mapped_column(default=0)
+    # 🩹 v4.3: server_default واقعی — INSERT خامِ ربات‌ساز (سینک پروکسی) بدون ORM
+    # این مقادیر را نمی‌فرستاد ← (1364, "Field doesn't have a default value")
+    is_active: Mapped[bool] = mapped_column(default=True, server_default="1", nullable=False)
+    fail_count: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
 
     # 🧲 فاز ۵ (BUG-14): شمارنده‌ی اکانت‌های اشغال‌کننده‌ی این پراکسی.
     # claim اتمیک با «UPDATE ... WHERE in_use < cap» نگه داشته می‌شود و
@@ -360,7 +362,7 @@ class Proxy(Base):
     # ⚠️ برای دیتابیس‌های موجود این مهاجرت دستی لازم است (قبل از اجرا بکاپ بگیر):
     #    ALTER TABLE proxies ADD COLUMN in_use INT NOT NULL DEFAULT 0;
     #    (backfill اولیه به‌صورت خودکار توسط reconcile_proxy_usage در استارتاپ انجام می‌شود)
-    in_use: Mapped[int] = mapped_column(default=0, nullable=False)
+    in_use: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
 
     # 🩺 فاز جدید: تفکیک نوع پراکسی و بررسی سلامت
     usage_type: Mapped[str] = mapped_column(String(20), default="both", server_default="'both'", nullable=False)

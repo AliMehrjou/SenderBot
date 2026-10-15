@@ -17,7 +17,7 @@ accounts.warmed_up_at / photo_package_id / proxy_string، proxies.in_use و…)
 """
 
 import logging
-from typing import Dict, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.dialects import mysql
@@ -55,6 +55,21 @@ _POST_ADD_FIXES: Dict[Tuple[str, str], str] = {
         "UPDATE accounts SET proxy_status = IF(proxy_string IS NOT NULL, 'ASSIGNED', 'WAITING_PROXY') "
         "WHERE proxy_status IS NULL OR proxy_status = ''"
     ),
+}
+
+
+# 🩹 v4.3 — دیتابیس‌های قدیمی برای ستون‌های NOT NULL هیچ DEFAULT سطح دیتابیس
+# ندارند (مدل‌های اولیه فقط default کلاینت‌سمتِ ORM داشتند) ← هر INSERT خامِ
+# خارج از ORM — مثل سینک پروکسی ربات‌ساز — با خطای
+# (1364, "Field 'fail_count' doesn't have a default value") رد می‌شود.
+# اجرا فقط برای ستون‌های موجودِ با COLUMN_DEFAULT=NULL است ← idempotent.
+_COLUMN_DEFAULT_FIXES: Dict[Tuple[str, str], str] = {
+    ("proxies", "is_active"):
+        "ALTER TABLE `proxies` MODIFY COLUMN `is_active` TINYINT(1) NOT NULL DEFAULT 1",
+    ("proxies", "fail_count"):
+        "ALTER TABLE `proxies` MODIFY COLUMN `fail_count` INT NOT NULL DEFAULT 0",
+    ("proxies", "in_use"):
+        "ALTER TABLE `proxies` MODIFY COLUMN `in_use` INT NOT NULL DEFAULT 0",
 }
 
 
@@ -106,19 +121,36 @@ async def run_startup_migrations() -> None:
     async with async_session() as session:
         # ۱) عکسِ وضعیت فعلی schema از INFORMATION_SCHEMA
         col_rows = (await session.execute(text(
-            "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS "
+            "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_DEFAULT FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA = DATABASE()"
         ))).fetchall()
 
         existing_columns: Dict[str, Set[str]] = {}
-        for table_name, column_name in col_rows:
-            existing_columns.setdefault(table_name, set()).add(column_name)
+        existing_defaults: Dict[Tuple[str, str], Optional[str]] = {}
+        for _crow in col_rows:
+            existing_columns.setdefault(_crow[0], set()).add(_crow[1])
+            existing_defaults[(_crow[0], _crow[1])] = _crow[2]
 
         fk_rows = (await session.execute(text(
             "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
             "WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL"
         ))).fetchall()
         existing_fks: Set[Tuple[str, str]] = {(t, c) for t, c in fk_rows}
+
+        # ۱.۵) 🩹 v4.3 (_COLUMN_DEFAULT_FIXES): ستون موجودِ بدون DEFAULT دیتابیسی
+        #      فقط وقتی MODIFY می‌شود که COLUMN_DEFAULT آن NULL باشد — تا INSERT خامِ
+        #      ربات‌ساز (سینک پروکسی) خطای 1364 ندهد. شکست غیربحرانی است.
+        for (_dtbl, _dcol), _ddl in _COLUMN_DEFAULT_FIXES.items():
+            if _dcol not in existing_columns.get(_dtbl, set()):
+                continue  # جدول/ستون غایب — ADD COLUMN خودش DEFAULT مدل را می‌نویسد
+            if existing_defaults.get((_dtbl, _dcol)) is not None:
+                continue  # از قبل DEFAULT دارد
+            try:
+                await session.execute(text(_ddl))
+                await session.commit()
+                logger.warning("DEP-fix: اعمال DEFAULT غایب ← %s", _ddl)
+            except Exception as exc:
+                logger.warning("DEP-fix: اعمال DEFAULT ناموفق (%s): %s", _ddl, exc)
 
         for table in Base.metadata.sorted_tables:
             if table.name not in existing_columns:
