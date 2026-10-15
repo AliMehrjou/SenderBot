@@ -761,12 +761,9 @@ async def process_new_proxies(message: types.Message, state: FSMContext, session
 
 @router.callback_query(F.data == "settings_manage_proxies/")
 async def manage_proxies_list(callback: types.CallbackQuery, session: AsyncSession) -> None:
-    is_main_admin = (callback.from_user.id == config.ADMIN_ID)
+    is_main_admin = (callback.fromuser.id == config.ADMIN_ID)
     try:
-        # واکشی ۵۰ پروکسی آخر
         stmt = select(Proxy)
-        
-        # 🟢 ادمین‌های فرعی فقط پروکسی‌های «ارسال» را در لیست مدیریت می‌بینند
         if not is_main_admin:
             stmt = stmt.where(Proxy.usage_type == "sender")
             
@@ -789,17 +786,26 @@ async def manage_proxies_list(callback: types.CallbackQuery, session: AsyncSessi
     for p in proxies:
         status_emoji = "🟢" if p.is_active else "🔴"
         type_str = {"login": "لاگین", "sender": "ارسال", "both": "دوکاره"}.get(p.usage_type, "دوکاره")
-        # استخراج آی‌پی و پورت برای نمایش کوتاه‌تر
         short_addr = p.proxy_string.split("@")[-1] if "@" in p.proxy_string else p.proxy_string.replace("socks5://", "")
         
-        btn_text = f"{status_emoji} [{type_str}] {short_addr} ❌"
-        builder.button(text=btn_text, callback_data=f"del_proxy_{p.id}/")
+        # 🛠 اصلاح: جایگزینی ❌ با 🔒 جهت جلوگیری از حذف دستی و تداخل با سیستم مرکزی
+        btn_text = f"{status_emoji} [{type_str}] {short_addr} 🔒"
+        builder.button(text=btn_text, callback_data="locked_proxy_alert/")
 
     builder.adjust(1) # هر پروکسی در یک سطر
     builder.row(types.InlineKeyboardButton(text="🔙 بازگشت به منوی پروکسی", callback_data="menu_proxies/"))
 
-    text = "🗑 <b>لیست پروکسی‌ها</b>\n\nبرای حذف فوری، روی هر پروکسی کلیک کنید:"
+    text = "🗑 <b>لیست پروکسی‌ها</b>\n\n⚠️ <i>پروکسی‌های شما توسط سرور مرکزی اختصاص داده شده‌اند و فقط قابل مشاهده هستند:</i>"
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
+
+
+# 🛠 هندلر جدید برای وقتی که کاربر روی پروکسی قفل‌شده کلیک می‌کند
+@router.callback_query(F.data == "locked_proxy_alert/")
+async def locked_proxy_alert_handler(callback: types.CallbackQuery):
+    await callback.answer(
+        "🔒 این پروکسی توسط ادمین کل و از سرور مرکزی به ربات شما متصل شده است. برای جلوگیری از قطعی، قابلیت حذف آن غیرفعال است.", 
+        show_alert=True
+    )
 
 
 @router.callback_query(F.data.startswith("del_proxy_") & F.data.endswith("/"))
