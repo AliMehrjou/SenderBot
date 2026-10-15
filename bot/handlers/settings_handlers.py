@@ -761,7 +761,7 @@ async def process_new_proxies(message: types.Message, state: FSMContext, session
 
 @router.callback_query(F.data == "settings_manage_proxies/")
 async def manage_proxies_list(callback: types.CallbackQuery, session: AsyncSession) -> None:
-    is_main_admin = (callback.fromuser.id == config.ADMIN_ID)
+    is_main_admin = (callback.from_user.id == config.ADMIN_ID)
     try:
         stmt = select(Proxy)
         if not is_main_admin:
