@@ -1266,6 +1266,19 @@ async def _rotate_login_proxy(session: AsyncSession, exclude: set) -> tuple[Opti
         return None, None
     return obj.proxy_string, pd
 
+
+def _login_no_alt_hint(tried_proxies: set) -> str:
+    """
+    🩹 FIX (v4.2): وقتی تنها یک پروکسی لاگین موجود است و پاسخ‌گو نیست، خطای نهایی
+    باید صادقانه بگوید چرا چرخشی انجام نشد (به‌جای پیام مبهم «مهلت اتصال»).
+    """
+    if tried_proxies and len(tried_proxies) == 1:
+        return (
+            "\n\n⚠️ تنها پروکسی لاگینِ موجود همین بود و پاسخ‌گو نبود؛ چرخشی انجام نشد. "
+            "پس از رفع مشکل پروکسی یا افزودن پروکسی جدید (از پنل پروکسی اینستنس در ربات‌ساز)، دوباره تلاش کنید."
+        )
+    return ""
+
 async def _extract_session_offline(file_path: str, api_id: int, api_hash: str) -> str:
     """استخراج آفلاین سشن‌ها (Telethon و Pyrogram) بر اساس منطق اصلی"""
     import sqlite3
@@ -1582,15 +1595,20 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
                 if client.is_connected:
                     with suppress(Exception): await asyncio.wait_for(client.disconnect(), timeout=5)
                 # 🩹 FIX (چرخش واقعی): پیام «در حال چرخش IP» حالا واقعاً IP را عوض می‌کند
+                # 🩹 FIX (v4.2): اگر پروکسی جایگزینی نبود، پیامِ دروغِ «چرخش IP» داده نمی‌شود
+                rotated = False
                 if attempt < MAX_RETRIES - 1:
                     next_ps, next_pd = await _rotate_login_proxy(session, tried_proxies)
                     if next_ps and next_pd:
                         proxy_string, proxy_dict = next_ps, next_pd
                         tried_proxies.add(next_ps)
+                        rotated = True
                 if attempt == MAX_RETRIES - 1:
-                    await safe_edit_or_answer(progress_msg, "⏱ مهلت اتصال به تلگرام به پایان رسید.")
-                else:
+                    await safe_edit_or_answer(progress_msg, f"⏱ مهلت اتصال به تلگرام به پایان رسید.{_login_no_alt_hint(tried_proxies)}")
+                elif rotated:
                     await safe_edit_or_answer(progress_msg, f"⏳ تلاش ناموفق ({attempt+1}/{MAX_RETRIES}). در حال چرخش IP...")
+                else:
+                    await safe_edit_or_answer(progress_msg, f"⏳ تلاش ناموفق ({attempt+1}/{MAX_RETRIES}). پروکسی جایگزینی موجود نیست؛ تلاش مجدد...")
                     
             except Exception as e:
                 if proxy_string:
@@ -1598,15 +1616,20 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
                 if client.is_connected:
                     with suppress(Exception): await asyncio.wait_for(client.disconnect(), timeout=5)
                 # 🩹 FIX (چرخش واقعی): تلاش بعدی با یک پروکسی سالمِ متفاوت
+                # 🩹 FIX (v4.2): اگر پروکسی جایگزینی نبود، پیامِ دروغِ «چرخش IP» داده نمی‌شود
+                rotated = False
                 if attempt < MAX_RETRIES - 1:
                     next_ps, next_pd = await _rotate_login_proxy(session, tried_proxies)
                     if next_ps and next_pd:
                         proxy_string, proxy_dict = next_ps, next_pd
                         tried_proxies.add(next_ps)
+                        rotated = True
                 if attempt == MAX_RETRIES - 1:
-                    await safe_edit_or_answer(progress_msg, f"❌ <b>خطای ناشناخته:</b>\n<code>{html.escape(str(e))}</code>")
+                    await safe_edit_or_answer(progress_msg, f"❌ <b>خطای ناشناخته:</b>\n<code>{html.escape(str(e))}</code>{_login_no_alt_hint(tried_proxies)}")
+                elif rotated:
+                    await safe_edit_or_answer(progress_msg, f"⏳ خطا موقت ({attempt+1}/{MAX_RETRIES}). در حال چرخش IP...")
                 else:
-                    await safe_edit_or_answer(progress_msg, f"⏳ خطا موقت ({attempt+1}/{MAX_RETRIES}). در حال تلاش مجدد...")
+                    await safe_edit_or_answer(progress_msg, f"⏳ خطا موقت ({attempt+1}/{MAX_RETRIES}). پروکسی جایگزینی موجود نیست؛ تلاش مجدد...")
 
             finally:
                 if client.is_connected:

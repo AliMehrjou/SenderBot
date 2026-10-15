@@ -371,7 +371,8 @@ async def log_proxy_event(session: AsyncSession, account_id: int, action: str, p
 
 
 async def claim_proxy_for_account(
-    session: AsyncSession, account_id: Optional[int] = None, ignore_cooldown: bool = False
+    session: AsyncSession, account_id: Optional[int] = None, ignore_cooldown: bool = False,
+    exclude_proxy: Optional[str] = None, release_current: bool = True
 ) -> Optional[str]:
     cap = max(1, config.MAX_ACCOUNTS_PER_PROXY)
     
@@ -398,6 +399,12 @@ async def claim_proxy_for_account(
     # اعمال فیلتر Cooldown روی کوئری
     if cooldown_proxies:
         stmt = stmt.where(Proxy.proxy_string.notin_(cooldown_proxies))
+
+    # 🩹 FIX (v4.2 — Failover صادقانه): پروکسیِ «فعلیِ» اکانتی که در حال سوییچ است
+    # نباید دوباره claim شود؛ سوییچ واکنشیِ قبلاً می‌توانست همان پروکسیِ مرده را
+    # برگرداند و «سوییچ موفقیت‌آمیز» گزارش شود در حالی که IP عوض نشده بود.
+    if exclude_proxy:
+        stmt = stmt.where(Proxy.proxy_string != exclude_proxy)
         
     stmt = stmt.order_by(Proxy.in_use.asc(), Proxy.ping_ms.is_(None), Proxy.ping_ms.asc()).limit(10)
     
@@ -415,6 +422,9 @@ async def claim_proxy_for_account(
         )
         if cooldown_proxies:
             stmt_weak = stmt_weak.where(Proxy.proxy_string.notin_(cooldown_proxies))
+        # 🩹 FIX (v4.2): اعمال exclude روی مسیر WEAK نیز
+        if exclude_proxy:
+            stmt_weak = stmt_weak.where(Proxy.proxy_string != exclude_proxy)
             
         stmt_weak = stmt_weak.order_by(Proxy.ping_ms.is_(None), Proxy.ping_ms.asc(), Proxy.in_use.asc()).limit(10)
         result_weak = await session.execute(stmt_weak)
@@ -424,7 +434,8 @@ async def claim_proxy_for_account(
     
     if not candidates:
         # باگ ۴: گارد نشت اسلات — اگر Claim شکست خورد و اکانت از قبل پروکسی داشت، آن را آزاد می‌کنیم
-        if account_id is not None:
+        # 🩹 FIX (v4.2): release_current=False (چرخش فرصت‌طلبانه) → آزادسازی انجام نمی‌شود
+        if account_id is not None and release_current:
             old_proxy_stmt = select(Account.proxy_string).where(Account.id == account_id)
             old_proxy_str = await session.scalar(old_proxy_stmt)
             if old_proxy_str:
@@ -476,7 +487,8 @@ async def claim_proxy_for_account(
             return new_proxy_str
             
     # باگ ۴: گارد نشت اسلات — در صورت شکست تمام کاندیدها (از دست دادن رقابت اتمیک)
-    if account_id is not None:
+    # 🩹 FIX (v4.2): release_current=False → آزادسازی انجام نمی‌شود (Binding چسبان حفظ می‌شود)
+    if account_id is not None and release_current:
         old_proxy_stmt = select(Account.proxy_string).where(Account.id == account_id)
         old_proxy_str = await session.scalar(old_proxy_stmt)
         if old_proxy_str:
@@ -517,19 +529,43 @@ async def direct_budget_ok(session: AsyncSession) -> bool:
 # ==========================================
 # 🔄 تابع سوییچ مشترک پروکسی (DRY - فاز ۴ و ۵)
 # ==========================================
-async def switch_worker_proxy(account_id: int, session: AsyncSession, reason: str, ignore_cooldown: bool = False) -> bool:
+async def switch_worker_proxy(account_id: int, session: AsyncSession, reason: str, ignore_cooldown: bool = False, release_on_fail: bool = False) -> bool:
     """
     سوییچ پروکسی درجا برای یک ورکرِ فعال در استخر (پس از اتمام چانک یا خطا).
     در صورت نبود کاندید مناسب، False برمی‌گرداند (سوییچ لغو می‌شود).
+    🩹 FIX (v4.2): پروکسی فعلی همیشه از کاندیدها حذف می‌شود (سوییچ باید IP را
+    واقعاً عوض کند) و در مسیر اضطراری release_on_fail=True اسلاتِ پروکسیِ شکست‌خورده
+    آزاد و اکانت وارد صف WAITING_PROXY می‌شود تا با افزودن پروکسی سالم فوراً متصل شود.
     """
     from workers.sender import _get_redis
     old_proxy = await session.scalar(select(Account.proxy_string).where(Account.id == account_id))
     
     # گرفتن پروکسی جدید با گارد ظرفیت و سلامت (و اعمال یا نادیده‌گرفتن Cooldown)
-    new_proxy_str = await claim_proxy_for_account(session, account_id, ignore_cooldown=ignore_cooldown)
+    # 🩹 FIX (v4.2): پروکسی فعلی از کاندیدها حذف می‌شود — سوییچ به همان پروکسیِ
+    # شکست‌خورده بی‌معناست؛ قبلاً سوییچ واکنشی می‌توانست همان پروکسی مرده را
+    # برگرداند و «سوییچ موفقیت‌آمیز» گزارش شود در حالی که IP عوض نشده بود.
+    new_proxy_str = await claim_proxy_for_account(
+        session, account_id, ignore_cooldown=ignore_cooldown,
+        exclude_proxy=old_proxy, release_current=release_on_fail
+    )
     
     if not new_proxy_str:
-        logger.info(f"Rotation skipped for user_{account_id}/ (no healthy candidates) - keeping current proxy.")
+        # 🩹 FIX (v4.2): در مسیر اضطراری (Reactive)، «رهایش اسلات + WAITING_PROXY» که
+        # claim انجام داده باید commit شود؛ قبلاً بدون commit برمی‌گشتیم و session
+        # بسته می‌شد → rollback → اکانت به پروکسیِ مرده چسبیده می‌ماند و وارد صف
+        # FIFO انتظار پروکسی نمی‌شد (تا چرخه‌ی ریکانکت ۵ دقیقه‌ای بعدی).
+        if release_on_fail and old_proxy:
+            try:
+                await session.commit()
+                logger.info(
+                    f"Rotation aborted for user_{account_id}/ (no healthy candidates) - "
+                    "released failing proxy; account enqueued to WAITING_PROXY."
+                )
+            except Exception as e:
+                await session.rollback()
+                logger.error(f"Failed to commit proxy release for worker {account_id}: {e}")
+        else:
+            logger.info(f"Rotation skipped for user_{account_id}/ (no healthy candidates) - keeping current proxy.")
         return False
         
     await session.commit()

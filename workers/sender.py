@@ -1421,7 +1421,7 @@ async def execute_bulk_send(
                     asyncio.create_task(report_proxy_result(account_row.proxy_string, is_success=False))
             
             await session.commit()
-            await _report(status=f"⚠️ اتصال پروکسی قطع شد. توقف ارسال و انتقال موقت تارگت‌ها به وورکر بعدی...", account=account_tag)
+            await _report(status=f"⚠️ اتصال پروکسی قطع شد. در حال سوییچ به پروکسی جایگزین (یا انتقال تارگت‌ها به وورکر بعدی)...", account=account_tag)
             
             stop_reason = "proxy_connection_error"
             if stage_1_delivered:

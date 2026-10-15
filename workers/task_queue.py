@@ -1531,7 +1531,8 @@ async def link_send_resolver_wrapper(
                         async with session_maker() as session:
                             from workers.session_manager import switch_worker_proxy, worker_pool
                             switch_ok = await switch_worker_proxy(
-                                account_db_id, session, "Reactive: Proxy DEAD (Resolve)", ignore_cooldown=True
+                                account_db_id, session, "Reactive: Proxy DEAD (Resolve)", ignore_cooldown=True,
+                                release_on_fail=True
                             )
                         
                         if switch_ok:
@@ -2058,7 +2059,9 @@ async def background_order_execution(
                         stop_reason = "direct_network_error"
                     else:
                         # سوییچ روی همان ورکر، نادیده‌گرفتن Cooldown برای خروج از وضعیت اضطراری
-                        switch_ok = await switch_worker_proxy(primary_id, session, "Reactive: Proxy DEAD (Failover)", ignore_cooldown=True)
+                        # 🩹 FIX (v4.2): release_on_fail=True → با شکست سوییچ، اسلات پروکسی مرده آزاد
+                        # و اکانت وارد صف WAITING_PROXY می‌شود (سینک ربات‌ساز/صف FIFO آن را می‌گیرد)
+                        switch_ok = await switch_worker_proxy(primary_id, session, "Reactive: Proxy DEAD (Failover)", ignore_cooldown=True, release_on_fail=True)
                 
                 if switch_ok:
                     targets = unsent_targets
