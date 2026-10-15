@@ -169,7 +169,7 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
         builder.button(text=btn_access, callback_data="toggle_public_order_access/")
         builder.button(text=btn_antiban, callback_data="toggle_smart_anti_ban/") 
         builder.button(text=btn_crm, callback_data="toggle_enable_crm_reply/") # 👈 دکمه اضافه شد
-        builder.button(text="🌐 مدیریت پروکسی‌ها", callback_data="menu_proxies/")
+        #builder.button(text="🌐 مدیریت پروکسی‌ها", callback_data="menu_proxies/")
         builder.button(text="🩺 وضعیت سلامت اکانت‌ها", callback_data="menu_account_health_page_1/")
     # ------------------------------------
 
