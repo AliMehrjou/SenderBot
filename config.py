@@ -26,6 +26,12 @@ class Config:
 
 
     VIDEO_LINK: str = os.getenv("VIDEO_LINK", "")
+
+    # 📢 (خواسته کارفرما) پیام‌های تبلیغاتی روزانه — هر روز ساعت ۹ صبح به وقت
+    # ایران، یکی از پیام‌های DAILY_ADS (utils/daily_ads.py) به ترتیب برای
+    # کاربران ربات (ادمین/ساب‌ادمین‌ها) ارسال می‌شود؛ بعد از آخری به اول برمی‌گردد.
+    DAILY_ADS_ENABLED: bool = _env_flag("DAILY_ADS_ENABLED", "true")
+    DAILY_ADS_HOUR: int = int(os.getenv("DAILY_ADS_HOUR", "9"))
     # Redis Settings
     REDIS_HOST: str = os.getenv("REDIS_HOST", "127.0.0.1")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))

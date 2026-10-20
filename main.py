@@ -21,6 +21,7 @@ from bot.handlers import cancel_handlers
 from bot.handlers.emergency import router as emergency_router
 from bot.handlers.admin_panel import router as admin_router
 from bot.middlewares.force_join import ForceJoinMiddleware
+from utils.daily_ads import daily_ads_loop  # 📢 (خواسته کارفرما) پیام‌های تبلیغاتی روزانه ۹ صبح
 from bot.handlers.general_handlers import router as general_router
 from bot.handlers.login_handlers import router as login_router
 from bot.handlers.order_handlers import router as order_router
@@ -178,6 +179,12 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
     aggregator_task = asyncio.create_task(supervise("error_aggregator", lambda: error_aggregator_loop(bot)))
     aggregator_task.add_done_callback(dispatcher_crash_handler)
     background_tasks.append(aggregator_task)
+    # ۳. 📢 (خواسته کارفرما) پیام‌های تبلیغاتی روزانه — هر روز ساعت ۹ صبح به وقت ایران،
+    # یکی از پیام‌های DAILY_ADS به ترتیب برای کاربران ربات (ادمین/ساب‌ادمین‌ها)؛
+    # بعد از آخری دوباره به اولی برمی‌گردد. (متن‌ها: utils/daily_ads.py)
+    daily_ads_task = asyncio.create_task(supervise("daily_ads", lambda: daily_ads_loop(bot)))
+    daily_ads_task.add_done_callback(dispatcher_crash_handler)
+    background_tasks.append(daily_ads_task)
     
     logger.info("All background loops (including GC & Error Aggregator) are running safely.")
 
