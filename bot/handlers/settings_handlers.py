@@ -498,7 +498,9 @@ async def show_proxies_menu(callback: types.CallbackQuery, state: FSMContext, se
         await session.rollback()
         return await answer_callback_error(callback, report_db_error("تنظیمات", e), get_main_menu_button())
 
-    use_sender_proxy = bool(getattr(settings, "use_proxy_for_sending", True)) if settings else False
+    # 🩹 FIX (proxy-safety): هم‌راستا با get_use_proxy_for_sending — نبودِ ردیف تنظیمات
+    # یعنی پیش‌فرض امنِ «پروکسی روشن»، نه ارسال مستقیم.
+    use_sender_proxy = bool(getattr(settings, "use_proxy_for_sending", True)) if settings else True
 
     builder = InlineKeyboardBuilder()
     
@@ -853,7 +855,8 @@ async def toggle_sender_proxy_handler(callback: types.CallbackQuery, state: FSMC
         if not settings:
             return await callback.answer("⚠️ تنظیمات یافت نشد.", show_alert=True)
             
-        current_val = bool(getattr(settings, "use_proxy_for_sending", False))
+        # 🩹 FIX (proxy-safety): fallback از False به True — هم‌راستا با default مدل.
+        current_val = bool(getattr(settings, "use_proxy_for_sending", True))
         settings.use_proxy_for_sending = not current_val
         await session.commit()
     except Exception as e:

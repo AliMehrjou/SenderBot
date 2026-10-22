@@ -342,7 +342,10 @@ class GlobalSettings(Base):
     smart_anti_ban: Mapped[bool] = mapped_column(default=True, server_default="1", nullable=False)
     
     # 🚀 فاز جدید: تنظیمات ارسال مستقیم یا با پراکسی
-    use_proxy_for_sending: Mapped[bool] = mapped_column(default=True, server_default="0", nullable=False)
+    # 🩹 FIX (proxy-safety): server_default از «0» به «1» تغییر کرد تا با default پایتون
+    # (True) و مهاجرت (DEFAULT 1) هماهنگ باشد. قبلاً create_all روی دیتابیس تازه
+    # DEFAULT 0 می‌ساخت؛ هر INSERT خامی بدون این ستون یعنی «ارسال بدون پروکسی» (IP Leak).
+    use_proxy_for_sending: Mapped[bool] = mapped_column(default=True, server_default="1", nullable=False)
 
 class Proxy(Base):
     """

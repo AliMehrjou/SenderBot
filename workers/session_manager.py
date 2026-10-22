@@ -885,10 +885,22 @@ async def apply_photo_package_now(account_id: int) -> bool:
 # ==========================================
 # بازنویسی کامل: initialize_workers — workers/session_manager.py
 async def get_use_proxy_for_sending(session: AsyncSession) -> bool:
-    """خواندن سوییچ ارسال با پروکسی/مستقیم با یک پیش‌فرض واحد (False)"""
+    """
+    خواندن سوییچ ارسال با پروکسی/مستقیم.
+
+    🩹 FIX (proxy-safety): پیش‌فرضِ نبودِ تنظیمات از False به True تغییر کرد.
+    قبلاً اگر ردیف global_settings هنوز ساخته نشده باشد (یا ستون در دیتابیس قدیمی
+    موجود نباشد)، False برمی‌گشت ← ورکرها «بدون پروکسی» بوت می‌شدند و IP سرور
+    لو می‌رفت (IP Leak). پیش‌فرض مدل (default=True) و مهاجرت (DEFAULT 1) هر دو
+    «پروکسی روشن» هستند؛ این تابع حالا با همان پیش‌فرض امن هم‌راستاست — در حالت
+    نبود تنظیمات، اکانتِ بدون پروکسی به‌جای ارسال مستقیم، توسط IP Leak Guard
+    skip می‌شود و وارد صف انتظار پروکسی می‌ماند.
+    """
     stmt_settings = select(GlobalSettings).limit(1)
     global_settings = await session.scalar(stmt_settings)
-    return bool(getattr(global_settings, "use_proxy_for_sending", False)) if global_settings else False
+    if global_settings is None:
+        return True
+    return bool(getattr(global_settings, "use_proxy_for_sending", True))
 
 async def validate_fernet_key(session: AsyncSession, bot: Optional[Bot]) -> bool:
     """اعتبارسنجی زودهنگام کلید Fernet برای جلوگیری از خواب خاموش استخر ورکرها."""
