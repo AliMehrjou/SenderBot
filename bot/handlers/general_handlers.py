@@ -12,6 +12,7 @@ from aiogram.filters import Command
 
 from bot.keyboards.main_menu import get_main_menu_keyboard
 from workers.session_manager import worker_pool
+from pyrogram.enums import ParseMode
 from bot.keyboards.cancel import with_cancel_hint
 from utils.fsm_cleanup import cleanup_fsm_temp_files
 from utils.safe_edit import safe_edit_or_answer
@@ -310,83 +311,46 @@ async def crm_reply_callback(callback: types.CallbackQuery, state: FSMContext) -
 
 
 # ==========================================
-# C5-fix: ارسال مدیای پاسخ CRM از طریق ورکر
+# 🩹 FIX (دکمه لغوِ بی‌اثر): callback_data دکمه‌ی انصراف «cancel_crm_reply/» بود
+# ولی هیچ هندلری برای آن ثبت نشده بود (هندلر قدیمی در admin_crm_handlers.py
+# با کال‌بکِ بدون اسلش بود و آن روتر هم از دیسپچر حذف شده بود) ← دکمه هیچ
+# واکنشی نداشت. این هندلر منطق لغو را به live-path برمی‌گرداند.
 # ==========================================
-async def _send_crm_media_reply(client, message: types.Message, target_id: int) -> None:
-    bot_file = None
-    kind = None
-    if message.photo:
-        bot_file, kind = message.photo[-1], "photo"
-    elif message.video:
-        bot_file, kind = message.video, "video"
-    elif message.document:
-        bot_file, kind = message.document, "document"
-    elif message.voice:
-        bot_file, kind = message.voice, "voice"
-    elif message.audio:
-        bot_file, kind = message.audio, "audio"
-    elif message.video_note:
-        bot_file, kind = message.video_note, "video_note"
-    elif message.animation:
-        bot_file, kind = message.animation, "animation"
-    elif message.sticker:
-        # جلوگیری از ارسال استیکرهای ویدیویی برای جلوگیری از باگ یوزربات
-        if message.sticker.is_video:
-            raise ValueError("ارسال استیکر ویدیویی پشتیبانی نمی‌شود! لطفاً از استیکر معمولی یا فایل استفاده کنید.")
-        elif message.sticker.is_animated:
-            bot_file, kind = message.sticker, "animated_sticker"
-        else:
-            bot_file, kind = message.sticker, "sticker"
-    else:
-        raise ValueError("نوع مدیا پشتیبانی نمی‌شود")
-
-    size = getattr(bot_file, "file_size", 0) or 0
-    if size and size > CRM_MEDIA_MAX_BYTES:
-        raise ValueError(
-            f"حجم فایل ({size // (1024 * 1024)}MB) از سقف مجاز "
-            f"({CRM_MEDIA_MAX_BYTES // (1024 * 1024)}MB) بیشتر است"
-        )
-
-    file_name = getattr(bot_file, "file_name", None) or ""
-    suffix = os.path.splitext(file_name)[1] or ""
-    
-    # تعیین پسوند دقیق برای استیکرها
-    if not suffix and message.sticker:
-        if message.sticker.is_animated:
-            suffix = ".tgs"
-        else:
-            suffix = ".webp"
-
-    fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="crm_reply_")
-    os.close(fd)
-    try:
-        await message.bot.download(bot_file, destination=tmp_path)
-        caption = message.html_text if message.caption else None
-        
-        if kind == "photo":
-            await client.send_photo(target_id, tmp_path, caption=caption)
-        elif kind == "video":
-            await client.send_video(target_id, tmp_path, caption=caption)
-        elif kind == "document":
-            await client.send_document(target_id, tmp_path, caption=caption)
-        elif kind == "voice":
-            await client.send_voice(target_id, tmp_path)
-        elif kind == "audio":
-            await client.send_audio(target_id, tmp_path, caption=caption)
-        elif kind == "video_note":
-            await client.send_video_note(target_id, tmp_path)
-        elif kind == "animation":
-            await client.send_animation(target_id, tmp_path, caption=caption)
-        elif kind in ("sticker", "animated_sticker"):
-            # ارسال مستقیم به عنوان استیکر (بدون تبدیل به داکیومنت)
-            await client.send_sticker(target_id, tmp_path)
-    finally:
+@router.callback_query(F.data == "cancel_crm_reply/")
+async def cancel_crm_reply_handler(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if await state.get_state() is not None:
+        await state.clear()
+        await callback.answer("عملیات پاسخ‌دهی لغو شد.")
         try:
-            os.unlink(tmp_path)
+            await callback.message.edit_text("🚫 عملیات پاسخ‌دهی به مشتری لغو شد.")
         except Exception:
             pass
+    else:
+        await callback.answer("هیچ عملیات فعالی برای لغو وجود ندارد.", show_alert=True)
+
+
+# ==========================================
+# C5-fix: ارسال مدیای پاسخ CRM از طریق ورکر
+# 🩹 FIX (PHOTO_EXT_INVALID): نامِ فایلِ آپلودی برای سرور تلگرام ارسال می‌شود
+# (InputFileBig.name) — فایلِ موقتِ بدون پسوند (مثل خروجی mkstemp بدون suffix)
+# با خطای PHOTO_EXT_INVALID رد می‌شود. عکسِ Bot API همیشه JPEG است و PhotoSize
+# اصلاً file_name ندارد؛ پس پسوندِ پیش‌فرضِ هر نوع مدیا الزامی است.
+# (نسخه‌ی تکراریِ قبلیِ این تابع که تعریفِ اول را می‌پوشاند حذف شد.)
+# ==========================================
+
+# پسوند پیش‌فرض هر نوع مدیا وقتی Bot API نام فایل نمی‌دهد
+_CRM_MEDIA_DEFAULT_SUFFIX = {
+    "photo": ".jpg",
+    "video": ".mp4",
+    "video_note": ".mp4",
+    "voice": ".ogg",
+    "audio": ".mp3",
+    "animation": ".mp4",
+}
+
 
 async def _send_crm_media_reply(client, message: types.Message, target_id: int) -> None:
+    """دانلود مدیا از Bot API و ارسال آن به تارگت از طریق کلاینت Pyrogram ورکر."""
     bot_file = None
     kind = None
     if message.photo:
@@ -404,7 +368,7 @@ async def _send_crm_media_reply(client, message: types.Message, target_id: int) 
     elif message.animation:
         bot_file, kind = message.animation, "animation"
     elif message.sticker:
-        # تفکیک استیکر ثابت از متحرک برای جلوگیری از خطای Pyrogram
+        # استیکر ویدیویی در گیت‌ویِ send_crm_reply مسدود شده؛ اینجا فقط tgs/webp می‌رسد
         if message.sticker.is_animated or message.sticker.is_video:
             bot_file, kind = message.sticker, "animated_sticker"
         else:
@@ -420,46 +384,56 @@ async def _send_crm_media_reply(client, message: types.Message, target_id: int) 
         )
 
     file_name = getattr(bot_file, "file_name", None) or ""
-    suffix = os.path.splitext(file_name)[1] or ""
-    
-    # تعیین پسوند دقیق برای استیکرها (چون معمولاً نام فایل ندارند)
-    if not suffix and message.sticker:
-        if message.sticker.is_animated:
-            suffix = ".tgs"
-        elif message.sticker.is_video:
-            suffix = ".webm"
+    suffix = os.path.splitext(file_name)[1].lower()
+
+    # 🩹 FIX (PHOTO_EXT_INVALID): پسوند پیش‌فرض بر اساس نوع مدیا
+    if not suffix:
+        if message.sticker:
+            if message.sticker.is_animated:
+                suffix = ".tgs"
+            elif message.sticker.is_video:
+                suffix = ".webm"
+            else:
+                suffix = ".webp"
         else:
-            suffix = ".webp"
+            suffix = _CRM_MEDIA_DEFAULT_SUFFIX.get(kind, ".bin")
 
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="crm_reply_")
     os.close(fd)
     try:
         await message.bot.download(bot_file, destination=tmp_path)
         caption = message.html_text if message.caption else None
-        
+        # کپشنِ html_text است → پارسِ HTML صریح (نه markdown ترکیبیِ پیش‌فرض)
+        parse_mode = ParseMode.HTML if caption else None
+
         if kind == "photo":
-            await client.send_photo(target_id, tmp_path, caption=caption)
+            await client.send_photo(target_id, tmp_path, caption=caption, parse_mode=parse_mode)
         elif kind == "video":
-            await client.send_video(target_id, tmp_path, caption=caption)
+            await client.send_video(target_id, tmp_path, caption=caption, parse_mode=parse_mode)
         elif kind == "document":
-            await client.send_document(target_id, tmp_path, caption=caption)
+            await client.send_document(
+                target_id,
+                tmp_path,
+                caption=caption,
+                file_name=file_name or None,
+                parse_mode=parse_mode,
+            )
         elif kind == "voice":
             await client.send_voice(target_id, tmp_path)
         elif kind == "audio":
-            await client.send_audio(target_id, tmp_path, caption=caption)
+            await client.send_audio(target_id, tmp_path, caption=caption, parse_mode=parse_mode)
         elif kind == "video_note":
             await client.send_video_note(target_id, tmp_path)
         elif kind == "animation":
-            await client.send_animation(target_id, tmp_path, caption=caption)
-        elif kind == "sticker":
-            await client.send_sticker(target_id, tmp_path)
-        elif kind == "animated_sticker":
+            await client.send_animation(target_id, tmp_path, caption=caption, parse_mode=parse_mode)
+        elif kind in ("sticker", "animated_sticker"):
             await client.send_sticker(target_id, tmp_path)
     finally:
         try:
             os.unlink(tmp_path)
         except Exception:
             pass
+
 
 # ==========================================
 # هندلر دریافت پاسخ و ارسال با Pyrogram (CRM)
@@ -535,7 +509,11 @@ async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
             sent_kind = "مدیا"
         elif raw_text:
             # فرمتینگ HTML ادمین حفظ می‌شود
-            await client.send_message(chat_id=int(target_id), text=message.html_text)
+            await client.send_message(
+                chat_id=int(target_id),
+                text=message.html_text,
+                parse_mode=ParseMode.HTML,
+            )
             sent_kind = "متن"
         else:
             return await wait_msg.edit_text(
@@ -547,13 +525,23 @@ async def send_crm_reply(message: types.Message, state: FSMContext) -> None:
             f"👤 <b>مقصد:</b> <code>{target_id}</code>\n"
             f"🤖 <b>از طریق ورکر:</b> <code>{worker_id_str}</code>"
         )
+        # موفقیت → بستن نشست
+        await state.clear()
     except ValueError as ve:
-        await wait_msg.edit_text(f"❌ <b>خطا در ارسال مدیا:</b>\n<code>{html.escape(str(ve))}</code>")
+        # خطای اعتبارسنجی (نوع مدیا/حجم) → نشست باز می‌ماند تا فایل جایگزین بفرستید
+        await wait_msg.edit_text(
+            f"❌ <b>خطا در ارسال مدیا:</b>\n<code>{html.escape(str(ve))}</code>\n\n"
+            "می‌توانید فایل دیگری ارسال کنید یا انصراف بدهید.",
+            reply_markup=get_crm_cancel_keyboard(),
+        )
     except Exception as e:
         logger.error(f"CRM reply via worker {worker_id_int} to {target_id} failed: {e}")
-        await wait_msg.edit_text(f"❌ <b>خطا در ارسال پیام:</b>\n<code>{html.escape(str(e))}</code>")
-    finally:
-        await state.clear()
+        # خطای ارسال → نشست باز می‌ماند تا تلاش مجدد ممکن باشد (TTL ۱۰ دقیقه‌ای محافظ است)
+        await wait_msg.edit_text(
+            f"❌ <b>خطا در ارسال پیام:</b>\n<code>{html.escape(str(e))}</code>\n\n"
+            "برای تلاش مجدد دوباره ارسال کنید یا انصراف بدهید.",
+            reply_markup=get_crm_cancel_keyboard(),
+        )
 
 
 

@@ -230,6 +230,15 @@ async def incoming_message_handler(client: Client, message: Message) -> None:
         )
         return
 
+    # 🩹 FIX (خواسته کارفرما): سین‌شدن پیامِ تارگت در چت خصوصی ورکر —
+    # اکانت ورکر باید پیام تارگت را «ببیند» (read receipt) تا رفتارش انسانی و
+    # ضدبن باشد؛ در غیر این صورت پیام‌های تارگت تا چرخه‌ی بعدی warm-up
+    # (۳ تا ۶ ساعت بعد) سین نمی‌خورند و از دید تارگت اکانت مرده به نظر می‌رسد.
+    try:
+        await client.read_chat_history(message.chat.id, max_id=message.id)
+    except Exception as read_err:
+        logger.debug(f"CRM: failed to mark chat {message.from_user.id} as read: {read_err}")
+
     # 👈 C3-fix: وضعیت صندوق پیام با کش TTL (اگر خاموش بود، کلاً پیام شکار نمی‌شود)
     if not await _crm_reply_enabled():
         return

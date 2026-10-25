@@ -14,7 +14,7 @@ from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio import Redis
 from bot.handlers.api_handlers import router as api_router
 from bot.handlers.settings_handlers import router as settings_router
-from utils.advanced_anti_ban import perform_warmup_cycle
+from utils.advanced_anti_ban import perform_warmup_cycle, presence_keeper_loop
 from utils.pagination import pagination_router
 import random
 from bot.handlers import cancel_handlers
@@ -156,6 +156,11 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
     warmup_task = asyncio.create_task(supervise("warmup", lambda: account_warmup_loop(worker_pool)))
     warmup_task.add_done_callback(dispatcher_crash_handler)
     background_tasks.append(warmup_task)
+
+    # 🩹 FIX (آخرین بازدید اکانت‌ها): حضور دوره‌ای ورکرها — تازه نگه‌داشتن last seen
+    presence_task = asyncio.create_task(supervise("presence", lambda: presence_keeper_loop(worker_pool)))
+    presence_task.add_done_callback(dispatcher_crash_handler)
+    background_tasks.append(presence_task)
 
     health_task = asyncio.create_task(supervise("health", lambda: auto_health_check_loop(worker_pool, bot)))
     health_task.add_done_callback(dispatcher_crash_handler)

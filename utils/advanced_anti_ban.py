@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from pyrogram import Client
+from pyrogram import raw
 from pyrogram.errors import PeerIdInvalid, UserRestricted
 from pyrogram.raw.functions.auth import ResetAuthorizations
 from pyrogram.errors import FreshResetAuthorisationForbidden
@@ -316,3 +317,41 @@ async def terminate_other_sessions(client: Client) -> bool:
     except Exception as e:
         logger.error(f"❌ خطای ناشناخته در بستن نشست‌ها برای {client.name}: {e}")
         return False
+
+
+# ==========================================
+# 🩹 FIX (آخرین بازدید اکانت‌ها): حضور دوره‌ای
+# اتصالِ صرفِ کلاینت (Pyrogram) «آنلاین» حساب نمی‌شود؛ بدون فراخوانیِ
+# account.updateStatus، آخرین بازدیدِ اکانتِ بیکار در همان زمانِ آخرین
+# فعالیتِ واقعی می‌ماند (مثلاً «یک هفته پیش») و ارسال پیام از طرف چنین
+# اکانتی پرچم قرمزِ ربات‌بودن برای تلگرام و تارگت‌هاست.
+# ==========================================
+async def keep_presence_alive(client: Client, account_id: int) -> None:
+    """بروزرسانی وضعیت آنلاین (last seen) یک ورکر — best-effort."""
+    try:
+        await client.invoke(raw.functions.account.UpdateStatus(offline=False))
+        logger.debug(f"Worker user_{account_id}/ presence refreshed (online).")
+    except Exception as e:
+        logger.debug(f"Worker user_{account_id}/ presence refresh failed: {e}")
+
+
+async def presence_keeper_loop(worker_pool: dict) -> None:
+    """
+    حلقه‌ی پس‌زمینه: هر ورکرِ متصل با فاصله‌های تصادفی (۲۰ تا ۴۵ دقیقه)
+    آنلاین می‌شود تا «آخرین بازدید» او همیشه تازه بماند؛ وقفه‌ی تصادفیِ
+    بین فراخوانیِ ورکرهای مختلف هم از رفتارِ هماهنگ/رباتیک جلوگیری می‌کند.
+    """
+    logger.info("Presence Keeper Loop started (keeps workers' last-seen fresh).")
+    while True:
+        try:
+            await asyncio.sleep(random.randint(20 * 60, 45 * 60))
+            for account_id, client in list(worker_pool.items()):
+                if getattr(client, "is_connected", False):
+                    await keep_presence_alive(client, account_id)
+                    # پخش‌کردن زمان فراخوانی‌ها بین ورکرها (رفتار انسانی)
+                    await asyncio.sleep(random.uniform(3, 15))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Presence keeper loop error: {e}")
+            await asyncio.sleep(60)
