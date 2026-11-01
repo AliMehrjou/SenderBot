@@ -150,7 +150,8 @@ async def render_filtered_account_list(
         "limited": "🚫 مسدود/محدود",
         "disconnected": "⚠️ قطع اتصال",
         "ready": "✅ آماده ارسال",
-        "cooldown": "💤 در حال استراحت"
+        "cooldown": "💤 در حال استراحت",
+        "disabled": "🔘 غیرفعال (دستی)"
     }
     display_title = filter_titles.get(filter_type, "لیست اکانت‌ها")
 
@@ -167,6 +168,7 @@ async def render_filtered_account_list(
         "cooldown": "COOLDOWN",
         "disconnected": "DISCONNECTED",
         "ready": "READY",
+        "disabled": "DISABLED",
         "all": "ALL"
     }
     
@@ -226,6 +228,10 @@ async def render_filtered_account_list(
         pipe.exists(f"chunk_cooldown:{acc.id}")
     redis_results = await pipe.execute()
 
+    # 📤 (خواسته کارفرما) شمارش ارسال‌های واقعی هر ورکر — یک GROUP BY سبک روی order_logs
+    from utils.send_stats import get_accounts_send_totals, format_send_count_line
+    send_totals = await get_accounts_send_totals(session, [acc.id for acc in current_accounts])
+
     for idx, acc in enumerate(current_accounts):
         is_conn = acc.id in worker_pool and getattr(worker_pool[acc.id], "is_connected", False)
         has_redis = bool(redis_results[idx])
@@ -238,7 +244,8 @@ async def render_filtered_account_list(
         text += (
             f"{display_idx}. شماره: <code>{acc.phone_number}</code> {status_badge}\n"
             f"📁 دسته‌بندی: /category_{acc.id} ({cat_name})\n"
-            f"🔸 وضعیت: /status_{acc.id}\n\n"
+            f"🔸 وضعیت: /status_{acc.id}\n"
+            f"{format_send_count_line(send_totals.get(acc.id))}\n\n"
         )
 
         phone_display = str(acc.phone_number) if acc.phone_number else f"ID-{acc.id}"
@@ -350,6 +357,10 @@ async def build_accounts_search_view(
         pipe.exists(f"chunk_cooldown:{acc.id}")
     redis_results = await pipe.execute()
 
+    # 📤 (خواسته کارفرما) شمارش ارسال‌های واقعی هر ورکر — یک GROUP BY سبک روی order_logs
+    from utils.send_stats import get_accounts_send_totals, format_send_count_line
+    send_totals = await get_accounts_send_totals(session, [acc.id for acc in accounts])
+
     for idx, acc in enumerate(accounts, start=offset + 1):
         is_conn = acc.id in worker_pool and getattr(worker_pool[acc.id], "is_connected", False)
         has_redis = bool(redis_results[idx - offset - 1])
@@ -361,7 +372,8 @@ async def build_accounts_search_view(
         text += (
             f"{idx}. شماره: <code>{acc.phone_number}</code> {status_badge}\n"
             f"📁 دسته‌بندی: /category_{acc.id} ({cat_name})\n"
-            f"🔸 وضعیت: /status_{acc.id}\n\n"
+            f"🔸 وضعیت: /status_{acc.id}\n"
+            f"{format_send_count_line(send_totals.get(acc.id))}\n\n"
         )
 
         phone_display = str(acc.phone_number) if acc.phone_number else f"ID-{acc.id}"
@@ -679,6 +691,12 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
         )
         total_active = (await session.execute(stmt_active)).scalar() or 0
 
+        # 🔘 (خواسته کارفرما) محاسبه اکانت‌های غیرفعال‌شده به‌صورت دستی
+        stmt_disabled = select(func.count(Account.id)).where(
+            Account.status == AccountStatus.disabled
+        )
+        total_disabled = (await session.execute(stmt_disabled)).scalar() or 0
+
         # ۵. دریافت آیدی اکانت‌های آماده ارسال برای بررسی در Redis
         stmt_ability = select(Account.id).where(
             Account.is_banned == False,
@@ -729,11 +747,18 @@ async def show_accounts_dashboard(callback: types.CallbackQuery, session: AsyncS
     # 🟢 دکمه جدید برای اکانت‌های در حال استراحت
     builder.button(text=f"💤 استراحت ({total_cooldown})", callback_data="list_acc_filter_cooldown_page_1/")
     
+    # 🔘 (خواسته کارفرما) دکمه اکانت‌های غیرفعال‌شده به‌صورت دستی
+    builder.button(text=f"🔘 غیرفعال ({total_disabled})", callback_data="list_acc_filter_disabled_page_1/")
+    
     builder.button(text="🔍 جستجو با شماره", callback_data="search_accounts/")
+
+    # 🏆 (خواسته کارفرما) ورود به نمای «هر ورکر چند ارسال زده»
+    builder.button(text="🏆 آمار ارسال ورکرها", callback_data="worker_send_stats/")
+
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
 
-    # تنظیم چیدمان جدید دکمه‌ها
-    builder.adjust(1, 2, 2, 1, 1, 1)
+    # تنظیم چیدمان جدید دکمه‌ها (۱: همه | ۲: ثبت‌نام‌نشده+محدود | ۲: آماده+فعال | ۲: استراحت+غیرفعال | ۲: جستجو+آمار | ۱: منوی اصلی)
+    builder.adjust(1, 2, 2, 2, 2, 1)
 
     await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
 
@@ -1249,6 +1274,23 @@ async def show_account_status(message: types.Message, session: AsyncSession) -> 
 
     cat_name = acc.category.name if acc.category else "بدون دسته"
     
+    # 📤 (خواسته کارفرما) آمار ارسال این ورکر — چند پیام واقعاً ارسال کرده؟
+    # مبنا: جدول order_logs (ماندگار) — منطبق بر شمارنده‌های داخلی sender.py
+    from utils.send_stats import get_account_send_stats
+    from utils.timezone_helpers import to_tehran_time
+    send_stats = await get_account_send_stats(session, acc.id)
+    _ok = send_stats["all_time"]["success"]
+    _partial = send_stats["all_time"]["partial"]
+    _total = send_stats["all_time"]["total"]
+    _ok24 = send_stats["last_24h"]["success"]
+    _partial24 = send_stats["last_24h"]["partial"]
+    _total24 = send_stats["last_24h"]["total"]
+    _errs = send_stats["errors"]
+    _last_send = (
+        to_tehran_time(send_stats["last_send_at"], "%Y-%m-%d %H:%M")
+        if send_stats["last_send_at"] else "—"
+    )
+
     # +++ دریافت آیدی تلگرام در صورت وجود +++
     user_id_line = f"🔻 آیدی تلگرام: <code>{acc.telegram_user_id}</code>\n" if getattr(acc, 'telegram_user_id', None) else ""
 
@@ -1261,6 +1303,11 @@ async def show_account_status(message: types.Message, session: AsyncSession) -> 
         f"🔻 نام خانوادگی: {html.escape(last_name)}\n"
         f"🔻 یوزرنیم: {html.escape(username)}\n"
         f"🔻 عکس پروفایل: {has_photo}\n\n"
+        f"📤 <b>آمار ارسال این ورکر:</b>\n"
+        f"🔻 کل ارسال‌ها: <b>{_total:,}</b> (کامل {_ok:,} | ناقص {_partial:,})\n"
+        f"🔻 ۲۴ ساعت اخیر: <b>{_total24:,}</b> (کامل {_ok24:,} | ناقص {_partial24:,})\n"
+        f"🔻 خطاهای ارسال: {_errs:,}\n"
+        f"🔻 آخرین ارسال: {_last_send}\n\n"
         f"{current_session_text}"
         f"{other_sessions_text}"
         # بخش security_text از اینجا کاملا حذف شد
@@ -1275,6 +1322,38 @@ async def show_account_status(message: types.Message, session: AsyncSession) -> 
     builder.adjust(1)
 
     await message.answer(text, reply_markup=builder.as_markup())
+
+
+# ==========================================
+# 🏆 (خواسته کارفرما) آمار ارسال ورکرها — رتبه‌بندی
+# «هر ورکر چند پیام واقعاً ارسال کرده» — مبنا: لاگ واقعی order_logs
+# ==========================================
+@router.callback_query(F.data == "worker_send_stats/")
+async def show_worker_send_stats(
+    callback: types.CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext = None,
+) -> None:
+    if state is not None:
+        await cleanup_fsm_temp_files(state)
+        await state.clear()
+
+    from utils.send_stats import build_worker_send_ranking_view
+
+    try:
+        text = await build_worker_send_ranking_view(session)
+    except Exception as e:
+        await session.rollback()
+        return await answer_callback_error(
+            callback, report_db_error("آمار ارسال ورکرها", e), get_accounts_return_keyboard()
+        )
+
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="worker_send_stats/"))
+    builder.row(types.InlineKeyboardButton(text="🔙 بازگشت به داشبورد اکانت‌ها", callback_data="menu_list_accounts/"))
+    builder.row(types.InlineKeyboardButton(text="🏛 منوی اصلی", callback_data="menu_home/"))
+
+    await safe_edit_or_answer(callback.message, text, reply_markup=builder.as_markup())
 
 # ==========================================
 # ⬇️ دانلود فایل .session اکانت (فقط ادمین اصلی)
@@ -1842,6 +1921,11 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
         redis_client = _get_redis()
         stats, _ = await get_all_accounts_stats(session, redis_client, worker_pool)
 
+        # 📤 (خواسته کارفرما) جمع کل ارسال‌های واقعی ورکرها از لاگ order_logs
+        from utils.send_stats import get_accounts_send_totals as _get_send_totals
+        _send_totals = await _get_send_totals(session)
+        workers_grand_total = sum(t["total"] for t in _send_totals.values())
+
         try:
             total_api = await session.scalar(select(func.count(APIKey.id))) or 0
         except Exception as e:
@@ -1874,15 +1958,17 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
         f"⛔️ ثبت نشده: {stats['NOT_REG']}\n\n"
 
         f"🔘 <b>تعداد APIها:</b> {total_api}\n\n"
-        
-        f"{throughput_text}"
+
+        f"{throughput_text}\n"
+        f"📤 <b>ارسال‌های کل ورکرها (کل دوران):</b> {workers_grand_total:,}\n"
     )
 
     builder = InlineKeyboardBuilder()
     builder.button(text="📈 تحویل‌سنجی سفارشات", callback_data="menu_delivery_stats/")
+    builder.button(text="🏆 آمار ارسال ورکرها", callback_data="worker_send_stats/")
     builder.button(text="🔄 بروزرسانی", callback_data="menu_stats/")
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
-    builder.adjust(1, 2)
+    builder.adjust(1, 1, 2)
 
     await safe_edit_message(callback.message, stats_text, reply_markup=builder.as_markup())
 

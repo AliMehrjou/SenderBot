@@ -123,6 +123,11 @@ class Account(Base):
     )
     photo_package: Mapped[Optional["ProfilePhotoPackage"]] = relationship(back_populates="accounts")
 
+    # 🔒 (خواسته کارفرما) قفل حریم خصوصی: زمان اعمال تنظیمات خصوصی (None = هنوز اعمال نشده).
+    # فقط بیو و عکس پروفایل عمومی می‌مانند؛ شماره/لست‌سین/اد گروه/تماس/فوروارد/ویس → Nobody.
+    # ستون جدید است و توسط run_startup_migrations به‌صورت idempotent به دیتابیس موجود اضافه می‌شود.
+    privacy_locked_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     @property
     def custom_id(self) -> str:
         return f"user_{self.id}/"

@@ -219,6 +219,9 @@ async def perform_warmup_cycle(client: Client, account_id: int) -> None:
             
         elif read_count > 0:
             logger.info(f"Worker user_{account_id}/ warm-up complete. Read {read_count} chats.")
+
+        # [FIX-online-24h] بعد از warm-up صراحتاً آفلاین شو تا فلگ آنلاین چسبیده باقی نماند
+        await go_offline(client, account_id)
             
     except Exception as e:
         logger.debug(f"Worker user_{account_id}/ warm-up error: {e}")
@@ -326,6 +329,16 @@ async def terminate_other_sessions(client: Client) -> bool:
 # فعالیتِ واقعی می‌ماند (مثلاً «یک هفته پیش») و ارسال پیام از طرف چنین
 # اکانتی پرچم قرمزِ ربات‌بودن برای تلگرام و تارگت‌هاست.
 # ==========================================
+# [FIX-online-24h] مدیریت حضور (Presence)
+# مشکل قبلی: حلقه‌ی presence هر ۲۰ تا ۴۵ دقیقه UpdateStatus(offline=False)
+# صدا می‌زد و چون ورکرها ۲۴/۷ متصل بودند، اکانت‌ها همیشه «آنلاین» دیده
+# می‌شدند — هیچ انسانی ۲۴ ساعته آنلاین نیست؛ هم برای الگوریتم تلگرام پرچم
+# قرمز است و هم تارگت‌ها شک می‌کنند که با ربات طرف هستند.
+# راهکار جدید: پیش‌فرض خاموش (PRESENCE_KEEPER_ENABLED=false).
+# در صورت روشن‌کردن، فقط «چشمک آنلاین» با چرخه‌ی ۳ تا ۶ ساعته زده می‌شود:
+# آنلاین (چند ثانیه) → آفلاین. نتیجه: «آخرین بازدید» تازه می‌ماند، اما
+# اکانت دیگر ۲۴ ساعته آنلاین نیست.
+# ==========================================
 async def keep_presence_alive(client: Client, account_id: int) -> None:
     """بروزرسانی وضعیت آنلاین (last seen) یک ورکر — best-effort."""
     try:
@@ -335,19 +348,70 @@ async def keep_presence_alive(client: Client, account_id: int) -> None:
         logger.debug(f"Worker user_{account_id}/ presence refresh failed: {e}")
 
 
+async def go_offline(client: Client, account_id: Optional[int] = None) -> None:
+    """
+    [FIX-online-24h] وضعیت اکانت را صراحتاً «آفلاین» می‌کند.
+
+    بعد از هر فعالیت واقعی (warm-up / chunk ارسال) صدا زده می‌شود تا فلگِ
+    آنلاینِ چسبنده از بین برود و اکانت در پیوی تارگت‌ها «آخرین بازدید اخیر»
+    نشان داده شود، نه «آنلاین» دائمی. (مثل گوشی که بعد از قفل‌شدن صفحه
+    از آنلاین خارج می‌شود.)
+    """
+    try:
+        await client.invoke(raw.functions.account.UpdateStatus(offline=True))
+        who = f"user_{account_id}/" if account_id is not None else str(client.name)
+        logger.debug(f"Worker {who} explicitly set offline.")
+    except Exception as e:
+        logger.debug(f"Worker {getattr(client, 'name', '?')} go_offline failed: {e}")
+
+
 async def presence_keeper_loop(worker_pool: dict) -> None:
     """
-    حلقه‌ی پس‌زمینه: هر ورکرِ متصل با فاصله‌های تصادفی (۲۰ تا ۴۵ دقیقه)
-    آنلاین می‌شود تا «آخرین بازدید» او همیشه تازه بماند؛ وقفه‌ی تصادفیِ
-    بین فراخوانیِ ورکرهای مختلف هم از رفتارِ هماهنگ/رباتیک جلوگیری می‌کند.
+    حلقه‌ی پس‌زمینه (اختیاری — پیش‌فرض خاموش):
+
+    اگر PRESENCE_KEEPER_ENABLED روشن باشد، هر ۳ تا ۶ ساعت برای هر ورکرِ متصل
+    یک «چشمک آنلاین» می‌زند: آنلاین (۱۰ تا ۳۰ ثانیه) → آفلاین.
+    این کار «آخرین بازدید» را تازه نگه می‌دارد بدون آنلاینِ دائمی.
+    اگر فلگ خاموش باشد، حلقه بلافاصله و تمیز خارج می‌شود.
     """
-    logger.info("Presence Keeper Loop started (keeps workers' last-seen fresh).")
+    from config import config
+
+    if not getattr(config, "PRESENCE_KEEPER_ENABLED", False):
+        logger.info(
+            "Presence Keeper disabled (PRESENCE_KEEPER_ENABLED=false) — "
+            "workers will NOT be forced online 24/7."
+        )
+        return
+
+    logger.info(
+        "Presence Keeper Loop started (blip mode: online %s-%ss every %s-%sh)."
+        % (
+            int(config.PRESENCE_BLIP_MIN_SECONDS),
+            int(config.PRESENCE_BLIP_MAX_SECONDS),
+            config.PRESENCE_CYCLE_MIN_HOURS,
+            config.PRESENCE_CYCLE_MAX_HOURS,
+        )
+    )
     while True:
         try:
-            await asyncio.sleep(random.randint(20 * 60, 45 * 60))
+            await asyncio.sleep(
+                random.uniform(
+                    config.PRESENCE_CYCLE_MIN_HOURS,
+                    config.PRESENCE_CYCLE_MAX_HOURS,
+                )
+                * 3600
+            )
             for account_id, client in list(worker_pool.items()):
                 if getattr(client, "is_connected", False):
+                    # چشمک آنلاین: آنلاین → مکث کوتاه → آفلاین
                     await keep_presence_alive(client, account_id)
+                    await asyncio.sleep(
+                        random.uniform(
+                            config.PRESENCE_BLIP_MIN_SECONDS,
+                            config.PRESENCE_BLIP_MAX_SECONDS,
+                        )
+                    )
+                    await go_offline(client, account_id)
                     # پخش‌کردن زمان فراخوانی‌ها بین ورکرها (رفتار انسانی)
                     await asyncio.sleep(random.uniform(3, 15))
         except asyncio.CancelledError:

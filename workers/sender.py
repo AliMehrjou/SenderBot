@@ -1553,4 +1553,14 @@ async def execute_bulk_send(
         f"Order #{order.id}: chunk finished for worker user_{account_db_id}/ "
         f"(sent={sent_in_chunk}, unsent={len(unsent)}, stop={stop_reason})."
     )
+
+    # [FIX-online-24h] بعد از پایان chunk، اکانت صراحتاً آفلاین شود تا
+    # فلگ آنلاین چسبیده (که با ارسال پیام‌ها ست شده) از بین برود و اکانت
+    # در پیوی تارگت‌ها «آخرین بازدید اخیر» دیده شود، نه «آنلاین» دائمی.
+    try:
+        if getattr(client, "is_connected", False):
+            from utils.advanced_anti_ban import go_offline
+            await go_offline(client, account_db_id)
+    except Exception as off_err:
+        logger.debug(f"Order #{order.id}: go_offline after chunk failed: {off_err}")
     return unsent, stop_reason

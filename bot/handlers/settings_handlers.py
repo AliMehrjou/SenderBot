@@ -964,59 +964,6 @@ async def process_new_send_limit(message: types.Message, state: FSMContext, sess
         reply_markup=get_settings_return_keyboard()
     )
 
-@router.message(SettingsStates.waiting_for_send_limit, F.text)
-async def process_new_send_limit(message: types.Message, state: FSMContext, session: AsyncSession) -> None:
-    if not message.text.isdecimal():
-        return await message.answer(
-            with_cancel_hint("⚠️ لطفاً فقط یک عدد صحیح ارسال کنید."),
-            reply_markup=get_settings_cancel_keyboard()
-        )
-
-    new_limit = int(message.text)
-
-    if not (1 <= new_limit <= 50):
-        return await message.answer(
-            with_cancel_hint("⚠️ مقدار وارد شده باید بین ۱ تا ۵۰ باشد."),
-            reply_markup=get_settings_cancel_keyboard()
-        )
-
-    old_limit = 10
-
-    try:
-        settings = (await session.scalars(select(GlobalSettings).limit(1))).first()
-        if settings is None:
-            await state.clear()
-            return await message.answer("❌ ردیف تنظیمات در دیتابیس یافت نشد. لطفاً با پشتیبانی تماس بگیرید.", reply_markup=get_settings_return_keyboard())
-        
-        # ذخیره مقدار فعلی به عنوان مقدار قدیمی
-        if settings.send_limit_per_run:
-            old_limit = settings.send_limit_per_run
-            
-        settings.send_limit_per_run = new_limit
-        await session.commit()
-        
-        # ۳. ذخیره مقدار قدیمی در Redis برای دفعات بعد
-        try:
-            from workers.sender import _get_redis
-            redis_client = _get_redis()
-            await redis_client.set("settings:previous_send_limit", old_limit)
-        except Exception as e:
-            logger.warning(f"Failed to save previous limit to redis: {e}")
-
-    except Exception as e:
-        await session.rollback()
-        await state.clear()
-        return await message.answer(
-            report_db_error("تنظیمات", e),
-            reply_markup=get_settings_return_keyboard()
-        )
-
-    await state.clear()
-    await message.answer(
-        f"✅ محدودیت ارسال هر ورکر از <b>{old_limit}</b> به <b>{new_limit}</b> تغییر یافت.",
-        reply_markup=get_settings_return_keyboard()
-    )
-
 
 # ==========================================
 # پردازش فرم ظرفیت API
@@ -2167,6 +2114,8 @@ async def account_health_dashboard(callback: types.CallbackQuery, session: Async
         is_restricted = is_future(acc.restricted_until) or is_future(acc.flood_wait_until)
         is_banned = getattr(acc, "is_banned", False) or getattr(acc, "status", "") in ["blocked", "error"]
         is_invalid = not getattr(acc, "session_string", None)
+        # 🔘 (خواسته کارفرما) اکانت غیرفعال‌شده به‌صورت دستی توسط ادمین
+        is_disabled = getattr(acc, "status", None) == AccountStatus.disabled
 
         if is_banned:
             emoji_status = "🔴"
@@ -2174,6 +2123,9 @@ async def account_health_dashboard(callback: types.CallbackQuery, session: Async
         elif is_invalid:
             emoji_status = "⚪️"
             status_text = "نامعتبر/خروج زده"
+        elif is_disabled:
+            emoji_status = "🔘"
+            status_text = "غیرفعال (دستی)"
         elif is_restricted:
             emoji_status = "🔴"
             status_text = "محدود/اسپم"
@@ -2219,34 +2171,63 @@ async def account_health_detail(callback: types.CallbackQuery, session: AsyncSes
     is_restricted = is_future(acc.restricted_until) or is_future(acc.flood_wait_until)
     is_banned = getattr(acc, "is_banned", False) or getattr(acc, "status", "") in ["blocked", "error"]
     is_invalid = not getattr(acc, "session_string", None)
-    
+    # 🔘 (خواسته کارفرما) اکانت غیرفعال‌شده به‌صورت دستی توسط ادمین
+    is_disabled = getattr(acc, "status", None) == AccountStatus.disabled
+
     if is_banned:
         status_str = "🔴 مسدود/حذف شده"
     elif is_invalid:
         status_str = "⚪️ نامعتبر/خروج زده"
+    elif is_disabled:
+        status_str = "🔘 غیرفعال (دستی)"
     elif is_restricted:
         status_str = "🔴 محدود/اسپم (FloodWait/Restrict)"
     elif is_cooldown:
         status_str = "🟡 در حال استراحت"
     else:
         status_str = "🟢 سالم و فعال"
-    
-    builder = InlineKeyboardBuilder()
-    if is_cooldown:
-        builder.button(text="🔄 لغو دستی استراحت", callback_data=f"reset_cooldown_{acc.id}/")
+
+    # 🔒 (خواسته کارفرما) وضعیت قفل حریم خصوصی: فقط بیو و عکس پروفایل عمومی
+    if getattr(acc, "privacy_locked_at", None):
+        privacy_lock_str = "🔒 قفل شده (فقط بیو و پروفایل عمومی)"
     else:
-        builder.button(text="⏸ اعمال استراحت ۲۴ ساعته", callback_data=f"force_cooldown_{acc.id}/")
-        
+        privacy_lock_str = "⏳ در انتظار قفل خودکار در اولین اتصال"
+
+    # 📤 (خواسته کارفرما) تعداد ارسال‌های واقعی این ورکر — از لاگ order_logs
+    from utils.send_stats import get_account_send_stats, format_send_count_line
+    try:
+        _health_send_stats = await get_account_send_stats(session, acc.id)
+        send_line = format_send_count_line(_health_send_stats["all_time"])
+        send_line += f" | ۲۴ ساعت: {_health_send_stats['last_24h']['total']:,}"
+    except Exception as _send_err:
+        send_line = "📤 ارسال‌ها: نامشخص"
+
+    builder = InlineKeyboardBuilder()
+
+    # 🔘/✅ (خواسته کارفرما) کلید فعال/غیرفعال دستی اکانت — علاوه بر استراحت ۲۴ ساعته
+    if is_disabled:
+        builder.button(text="✅ فعال‌سازی اکانت", callback_data=f"enable_acc_{acc.id}/")
+    else:
+        builder.button(text="🔘 غیرفعال‌سازی اکانت", callback_data=f"disable_acc_{acc.id}/")
+
+        if is_cooldown:
+            builder.button(text="🔄 لغو دستی استراحت", callback_data=f"reset_cooldown_{acc.id}/")
+        else:
+            builder.button(text="⏸ اعمال استراحت ۲۴ ساعته", callback_data=f"force_cooldown_{acc.id}/")
+
     builder.button(text="🔙 بازگشت به لیست", callback_data="menu_account_health_page_1/")
     builder.adjust(1)
 
     text = (
         f"👤 <b>جزئیات سلامت اکانت</b>\n\n"
         f"📱 شماره: <code>{acc.phone_number}</code>\n"
+        f"🆔 آیدی: <code>{acc.id}</code>\n"
         f"وضعیت فعلی: {status_str}\n"
         f"استراحت فعال: {'بله' if is_cooldown else 'خیر'}\n"
+        f"حریم خصوصی: {privacy_lock_str}\n"
+        f"{send_line}\n"
     )
-    
+
     await safe_edit_message(callback.message, text, reply_markup=builder.as_markup())
 
 from datetime import timedelta
@@ -2260,6 +2241,10 @@ async def force_cooldown_handler(callback: types.CallbackQuery, session: AsyncSe
         if not acc:
             return await callback.answer("⚠️ اکانت یافت نشد.", show_alert=True)
         
+        # 🔘 (خواسته کارفرما) اکانت غیرفعال: اول باید فعال شود
+        if getattr(acc, "status", None) == AccountStatus.disabled:
+            return await callback.answer("🔘 این اکانت غیرفعال است؛ ابتدا آن را فعال کنید.", show_alert=True)
+
         # اعمال زمان استراحت به مدت ۲۴ ساعت
         now_utc = datetime.now(timezone.utc)
         acc.expected_return_time = now_utc + timedelta(hours=24)
@@ -2283,6 +2268,10 @@ async def reset_cooldown_handler(callback: types.CallbackQuery, session: AsyncSe
         if not acc:
             return await callback.answer("⚠️ اکانت یافت نشد.", show_alert=True)
         
+        # 🔘 (خواسته کارفرما) اکانت غیرفعال: فعال‌سازی فقط از مسیر مخصوص خودش
+        if getattr(acc, "status", None) == AccountStatus.disabled:
+            return await callback.answer("🔘 این اکانت غیرفعال است؛ از دکمه «فعال‌سازی اکانت» استفاده کنید.", show_alert=True)
+
         # پاک کردن زمان استراحت
         acc.expected_return_time = None
         acc.status = AccountStatus.active
@@ -2299,6 +2288,114 @@ async def reset_cooldown_handler(callback: types.CallbackQuery, session: AsyncSe
         await callback.answer("✅ استراحت اکانت لغو شد و به صف کار بازگشت.", show_alert=True)
         
         # رفرش کردن صفحه جزئیات
+        await account_health_detail(callback, session)
+    except Exception as e:
+        await session.rollback()
+        await callback.answer(f"❌ خطا: {e}", show_alert=True)
+# ==========================================
+# 🔘/✅ (خواسته کارفرما) فعال/غیرفعال کردن دستی اکانت
+# علاوه بر استراحت ۲۴ ساعتهٔ تنظیمات، ادمین می‌تواند هر اکانت را
+# کامل خاموش (قطع ورکر + خروج از صف ارسال) یا دوباره روشن کند.
+# ==========================================
+@router.callback_query(F.data.startswith("disable_acc_") & F.data.endswith("/"))
+async def disable_account_handler(callback: types.CallbackQuery, session: AsyncSession):
+    """🔘 غیرفعال‌سازی کامل اکانت: تغییر وضعیت به disabled + قطع واقعی ورکر."""
+    acc_id = int(callback.data.replace("disable_acc_", "").replace("/", ""))
+    try:
+        acc = await session.get(Account, acc_id)
+        if not acc:
+            return await callback.answer("⚠️ اکانت یافت نشد.", show_alert=True)
+
+        # ۱. تغییر وضعیت به disabled با تابع استاندارد (ثبت لاگ WorkerEvent)
+        from workers.sender import change_account_status
+        await change_account_status(
+            session=session,
+            account_id=acc_id,
+            new_status=AccountStatus.disabled,
+            reason="Manual disable by admin",
+        )
+
+        # ۲. توقف واقعی ورکر: خروج از استخر + قطع کلاینت (اکانت کاملاً خاموش می‌شود)
+        stopped_worker = False
+        try:
+            from workers.session_manager import worker_pool, _persist_memory_session
+            client = worker_pool.pop(acc_id, None)
+            if client is not None:
+                if getattr(client, "in_memory", False):
+                    # سشنِ در حافظه قبل از قطع، ماندگار شود تا اکانت خراب نشود
+                    try:
+                        await _persist_memory_session(client, acc_id)
+                    except Exception:
+                        pass
+                if getattr(client, "is_connected", False):
+                    try:
+                        await client.stop()
+                    except Exception:
+                        pass
+                stopped_worker = True
+        except Exception as stop_err:
+            logger.warning(f"Disable account {acc_id}: worker stop failed ({stop_err}) — status change is still in effect.")
+
+        await callback.answer(
+            "🔘 اکانت غیرفعال شد؛ دیگر هیچ سفارشی به آن اختصاص نمی‌یابد."
+            + (" (ورکر هم قطع شد)" if stopped_worker else ""),
+            show_alert=True,
+        )
+
+        # رفرش صفحه جزئیات
+        await account_health_detail(callback, session)
+    except Exception as e:
+        await session.rollback()
+        await callback.answer(f"❌ خطا: {e}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("enable_acc_") & F.data.endswith("/"))
+async def enable_account_handler(callback: types.CallbackQuery, session: AsyncSession):
+    """✅ فعال‌سازی مجدد اکانت: بازگشت به active + روشن کردن ورکر در صورت نیاز."""
+    acc_id = int(callback.data.replace("enable_acc_", "").replace("/", ""))
+    try:
+        acc = await session.get(Account, acc_id)
+        if not acc:
+            return await callback.answer("⚠️ اکانت یافت نشد.", show_alert=True)
+
+        # ۱. بازگشت به وضعیت active با تابع استاندارد (expected_return_time هم پاک می‌شود)
+        from workers.sender import change_account_status
+        await change_account_status(
+            session=session,
+            account_id=acc_id,
+            new_status=AccountStatus.active,
+            reason="Manual enable by admin",
+        )
+
+        # ۲. پاک کردن استراحت باقی‌مانده از Redis تا اکانت بلافاصله آماده کار شود
+        try:
+            from workers.sender import _get_redis
+            await _get_redis().delete(f"chunk_cooldown:{acc_id}")
+        except Exception:
+            pass
+
+        # ۳. اگر ورکر در استخر نیست (مثلاً بعد از ری‌استارت)، همین حالا روشن شود
+        worker_note = ""
+        try:
+            from workers.session_manager import worker_pool, start_single_worker
+            client = worker_pool.get(acc_id)
+            if client is None or not getattr(client, "is_connected", False):
+                if client is not None:
+                    worker_pool.pop(acc_id, None)
+                started = await start_single_worker(acc, session)
+                worker_note = (
+                    " و ورکر آن روشن شد." if started
+                    else " (فعلاً ورکر روشن نشد — چرخه اتصال مجدد هر ۵ دقیقه دوباره تلاش می‌کند.)"
+                )
+        except Exception as start_err:
+            logger.warning(f"Enable account {acc_id}: worker start failed ({start_err}).")
+
+        await callback.answer(
+            "✅ اکانت فعال شد و به صف کار بازگشت." + worker_note,
+            show_alert=True,
+        )
+
+        # رفرش صفحه جزئیات
         await account_health_detail(callback, session)
     except Exception as e:
         await session.rollback()

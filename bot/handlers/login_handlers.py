@@ -32,6 +32,8 @@ from workers.session_manager import (
     release_proxy_slot,
     mark_proxy_failed,
 )
+# 🔒 (خواسته کارفرما) قفل حریم خصوصی در لحظه‌ی افزودن اکانت
+from utils.privacy_lock import ensure_account_privacy_locked
 from database.models import Account, Category, APIKey, GlobalSettings, Proxy
 from database.engine import async_session
 import secrets
@@ -1032,6 +1034,15 @@ async def finalize_login_and_save(
             termination_attempted = True
             sessions_terminated = await terminate_other_sessions(client)
 
+        # ۲.۵ 🔒 (خواسته کارفرما) قفل حریم خصوصی — همین لحظه‌ی افزودن اکانت اعمال می‌شود:
+        # فقط بیو و عکس پروفایل عمومی می‌مانند؛ شماره/لست‌سین/اد گروه/تماس/فوروارد/ویس
+        # روی Nobody قفل می‌شوند. (اگر اینجا موفق نشود، استارت ورکر دوباره تلاش می‌کند.)
+        privacy_locked_now = False
+        try:
+            privacy_locked_now = await ensure_account_privacy_locked(client, new_account.id)
+        except Exception as priv_err:
+            logger.warning(f"Privacy lock at login-time failed for {phone_number}: {priv_err}")
+
         # ۳. 🟢 قطع قطعی کلاینت موقت برای جلوگیری از تداخل (Conflict) در سرور تلگرام
         if client.is_connected:
             with suppress(Exception):
@@ -1069,6 +1080,12 @@ async def finalize_login_and_save(
                     msg += "\n\n⚠️ <i>خروج از سایر نشست‌ها به دلیل محدودیت 24 ساعته تلگرام انجام نشد. سیستم با هر بار استارت مجدد تلاش خواهد کرد.</i>"
             else:
                 msg += "\n\nℹ️ <i>(گزینه خروج از سایر نشست‌ها در تنظیمات خاموش بود).</i>"
+
+            # 🔒 (خواسته کارفرما) گزارش وضعیت قفل حریم خصوصی
+            if privacy_locked_now:
+                msg += "\n\n🔒 <i>حریم خصوصی قفل شد: فقط بیو و عکس پروفایل عمومی است؛ شماره، آخرین بازدید، افزودن گروه، تماس، فوروارد و پیام صوتی همه Nobody.</i>"
+            else:
+                msg += "\n\n⏳ <i>قفل حریم خصوصی در اولین اتصال موفق ورکر به‌صورت خودکار اعمال می‌شود.</i>"
 
             # افزودن دکمه نمایش اطلاعات ورود و سپس اتصال کیبورد منوی اصلی به آن
             builder = InlineKeyboardBuilder()

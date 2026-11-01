@@ -27,6 +27,11 @@ def get_account_display_status(acc: Account, is_connected: bool, has_redis_coold
         
     if acc.status == AccountStatus.blocked:
         return {"cat": "BLOCKED", "badge": "🚫 مسدود (سیستم)", "desc": "مسدود در دیتابیس (نیاز به بررسی)"}
+
+    # 🔘 (خواسته کارفرما) غیرفعال‌سازی دستی: اولویت بالاتر از محدودیت‌های تلگرام —
+    # چون وضعیت اکانت را «ادمین» تعیین کرده است، نه تلگرام.
+    if acc.status == AccountStatus.disabled:
+        return {"cat": "DISABLED", "badge": "🔘 غیرفعال", "desc": "غیرفعال شده (دستی)"}
         
     if acc.restricted_until and _as_utc(acc.restricted_until) > now_utc:
         t = to_tehran_time(acc.restricted_until, "%H:%M")
@@ -44,9 +49,6 @@ def get_account_display_status(acc: Account, is_connected: bool, has_redis_coold
         
     if has_redis_cooldown:
         return {"cat": "COOLDOWN_REDIS", "badge": "💤 استراحت (Redis)", "desc": "استراحت موقت (محافظت اسپم)"}
-        
-    if acc.status == AccountStatus.disabled:
-        return {"cat": "DISABLED", "badge": "⚪️ غیرفعال", "desc": "غیرفعال شده"}
         
     if not is_connected:
         return {"cat": "DISCONNECTED", "badge": "⚠️ قطع اتصال", "desc": "آفلاین (قطع از سرور تلگرام)"}

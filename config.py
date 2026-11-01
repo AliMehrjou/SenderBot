@@ -144,6 +144,17 @@ class Config:
     PREFLIGHT_SPAMBOT_CHECK_ENABLED: bool = _env_flag("PREFLIGHT_SPAMBOT_CHECK_ENABLED", "true")
     # بازه‌ی کش شدن وضعیت اسپم‌بات برای هر اکانت به ساعت
     PREFLIGHT_SPAMBOT_CACHE_HOURS: int = int(os.getenv("PREFLIGHT_SPAMBOT_CACHE_HOURS", "4"))
+
+    # 🩹 FIX (آنلاین ۲۴ ساعته اکانت‌ها): حلقه‌ی Presence به صورت پیش‌فرض «خاموش» است.
+    # قبلاً هر ۲۰ تا ۴۵ دقیقه UpdateStatus(offline=False) صدا زده می‌شد و چون
+    # ورکرها ۲۴/۷ متصل بودند، اکانت‌ها در پیوی تارگت‌ها همیشه «آنلاین» دیده می‌شدند
+    # (پرچم قرمز برای الگوریتم تلگرام + غیرطبیعی برای تارگت‌ها).
+    PRESENCE_KEEPER_ENABLED: bool = _env_flag("PRESENCE_KEEPER_ENABLED", "false")
+    PRESENCE_CYCLE_MIN_HOURS: float = float(os.getenv("PRESENCE_CYCLE_MIN_HOURS", "3"))
+    PRESENCE_CYCLE_MAX_HOURS: float = float(os.getenv("PRESENCE_CYCLE_MAX_HOURS", "6"))
+    # مدت «چشمک آنلاین» بر حسب ثانیه: مثل گوشی‌ای که بیدار می‌شود، سینک می‌کند و می‌خوابد
+    PRESENCE_BLIP_MIN_SECONDS: float = float(os.getenv("PRESENCE_BLIP_MIN_SECONDS", "10"))
+    PRESENCE_BLIP_MAX_SECONDS: float = float(os.getenv("PRESENCE_BLIP_MAX_SECONDS", "30"))
     
     @property
     def MYSQL_URL(self) -> str:

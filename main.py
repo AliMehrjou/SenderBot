@@ -157,10 +157,14 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
     warmup_task.add_done_callback(dispatcher_crash_handler)
     background_tasks.append(warmup_task)
 
-    # 🩹 FIX (آخرین بازدید اکانت‌ها): حضور دوره‌ای ورکرها — تازه نگه‌داشتن last seen
-    presence_task = asyncio.create_task(supervise("presence", lambda: presence_keeper_loop(worker_pool)))
-    presence_task.add_done_callback(dispatcher_crash_handler)
-    background_tasks.append(presence_task)
+    # [FIX-online-24h] تسک presence فقط وقتی PRESENCE_KEEPER_ENABLED=true
+    # ساخته می‌شود؛ پیش‌فرض خاموش است تا اکانت‌ها ۲۴/۷ آنلاین دیده نشوند.
+    if config.PRESENCE_KEEPER_ENABLED:
+        presence_task = asyncio.create_task(supervise("presence", lambda: presence_keeper_loop(worker_pool)))
+        presence_task.add_done_callback(dispatcher_crash_handler)
+        background_tasks.append(presence_task)
+    else:
+        logger.info("Presence Keeper is OFF (default) — accounts will not be kept online 24/7.")
 
     health_task = asyncio.create_task(supervise("health", lambda: auto_health_check_loop(worker_pool, bot)))
     health_task.add_done_callback(dispatcher_crash_handler)

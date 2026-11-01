@@ -26,7 +26,7 @@ from sqlalchemy import select, update, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.models import Account, Proxy, APIKey, Admin, GlobalSettings, ProfilePhotoPackage
+from database.models import Account, AccountStatus, Proxy, APIKey, Admin, GlobalSettings, ProfilePhotoPackage
 from database.engine import async_session
 from config import config
 from utils.advanced_anti_ban import (
@@ -34,6 +34,8 @@ from utils.advanced_anti_ban import (
     rotate_profile_photos,
     terminate_other_sessions,
 )
+# 🔒 (خواسته کارفرما) قفل حریم خصوصی اکانت‌ها — فقط بیو و عکس پروفایل عمومی
+from utils.privacy_lock import ensure_account_privacy_locked
 
 from utils.crm_catcher import incoming_message_handler
 from utils.seen_watcher import attach_seen_listener  # 🧠 جریان هوشمند (Smart Flow): شنود «سین» تارگت
@@ -985,6 +987,12 @@ async def initialize_workers(session: AsyncSession, bot: Optional[Bot] = None) -
         if not account.session_string:
             continue
 
+        # ⛔️ (خواسته کارفرما) اکانت‌های غیرفعال‌شده به‌صورت دستی: ورکرشان بوت نمی‌شود.
+        # دیسپچر هم از قبل آن‌ها را نادیده می‌گیرد (فیلتر AccountStatus.active).
+        if getattr(account, "status", None) == AccountStatus.disabled:
+            logger.info(f"Worker {account.id} is manually DISABLED — skipping worker start.")
+            continue
+
         proxy_dict = None
         if use_proxy_for_sending:
             # 🛡 رفع باگ: بررسی سلامت پروکسی قبل از بوت شدن اکانت
@@ -1245,6 +1253,14 @@ async def start_worker_with_rotation(
                 await _persist_memory_session(client, account_id)
 
             worker_pool[account_id] = client
+            
+            # 🔒 (خواسته کارفرما) قفل حریم خصوصی: فقط بیو و عکس پروفایل عمومی؛
+            # شماره/لست‌سین/اد گروه/تماس/فوروارد/ویس → Nobody. idempotent است.
+            task_privacy = asyncio.create_task(
+                ensure_account_privacy_locked(client, account_id)
+            )
+            _background_tasks.add(task_privacy)
+            task_privacy.add_done_callback(_background_tasks.discard)
             
             task_profile = asyncio.create_task(
                 randomize_profile(client, account_id, settings=global_settings)
@@ -1615,6 +1631,14 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
         task_warm = asyncio.create_task(_bg_warmup_and_persist(client, account.id))
         _background_tasks.add(task_warm)
         task_warm.add_done_callback(_background_tasks.discard)
+
+        # 🔒 (خواسته کارفرما) قفل حریم خصوصی: هر اکانتی که «اد» می‌شود فقط بیو و
+        # عکس پروفایل عمومی دارد؛ شماره/لست‌سین/اد گروه/تماس/فوروارد/ویس → Nobody.
+        # (هر سه مسیر افزودن اکانت از همین تابع عبور می‌کنند؛ اکانت‌های قدیمی‌تر
+        # هم در اولین استارتِ بعدی قفل می‌شوند — پرچم DB جلوی تکرار را می‌گیرد.)
+        task_privacy = asyncio.create_task(ensure_account_privacy_locked(client, account.id))
+        _background_tasks.add(task_privacy)
+        task_privacy.add_done_callback(_background_tasks.discard)
 
         # 🔥 فاز ۶ (R7): ثبت شروع دوره‌ی گرم‌شدن برای اکانت تازه-لاگین‌شده — تا
         # MIN_WARMUP_HOURS ساعت بعد از اولین اتصال، دیسپچر به این اکانت chunk
