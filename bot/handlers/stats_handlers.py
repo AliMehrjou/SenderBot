@@ -1890,7 +1890,9 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
 
     from utils.timezone_helpers import get_current_tehran_time
     now_tehran = get_current_tehran_time()
-    start_of_today = now_tehran.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    
+    # 🛠 اصلاح ۱: تبدیل به Naive UTC جهت سازگاری با دیتابیس MySQL
+    start_of_today = now_tehran.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).replace(tzinfo=None)
     start_of_yesterday = start_of_today - timedelta(days=1)
 
     try:
@@ -1921,7 +1923,6 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
         redis_client = _get_redis()
         stats, _ = await get_all_accounts_stats(session, redis_client, worker_pool)
 
-        # 📤 (خواسته کارفرما) جمع کل ارسال‌های واقعی ورکرها از لاگ order_logs
         from utils.send_stats import get_accounts_send_totals as _get_send_totals
         _send_totals = await _get_send_totals(session)
         workers_grand_total = sum(t["total"] for t in _send_totals.values())
@@ -1940,6 +1941,9 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
             report_db_error("آمار", e),
             reply_markup=get_back_keyboard()
         )
+
+    # 🛠 اصلاح ۲: ایجاد رشته زمان جاری برای تزریق به متن (رفع MessageNotModified)
+    current_time_str = now_tehran.strftime('%H:%M:%S')
 
     stats_text = (
         "📊 <b>آمار سیستم</b>\n\n"
@@ -1960,7 +1964,8 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
         f"🔘 <b>تعداد APIها:</b> {total_api}\n\n"
 
         f"{throughput_text}\n"
-        f"📤 <b>ارسال‌های کل ورکرها (کل دوران):</b> {workers_grand_total:,}\n"
+        f"📤 <b>ارسال‌های کل ورکرها (کل دوران):</b> {workers_grand_total:,}\n\n"
+        f"⏱ <i>آخرین بروزرسانی: {current_time_str}</i>"
     )
 
     builder = InlineKeyboardBuilder()
@@ -1970,8 +1975,8 @@ async def show_global_statistics(callback: types.CallbackQuery, session: AsyncSe
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
     builder.adjust(1, 1, 2)
 
-    await safe_edit_message(callback.message, stats_text, reply_markup=builder.as_markup())
-
+    # 🛠 اصلاح ۳: تغییر به متد امن و استاندارد پروژه
+    await safe_edit_or_answer(callback.message, stats_text, reply_markup=builder.as_markup())
 # کد جدید (به انتهای فایل stats_handlers.py اضافه شود)
 @router.message(F.text.regexp(r"^/orderstats_(\d+)$"))
 async def show_detailed_order_stats(message: types.Message, session: AsyncSession) -> None:

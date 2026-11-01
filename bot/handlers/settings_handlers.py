@@ -2172,7 +2172,7 @@ async def account_health_detail(callback: types.CallbackQuery, session: AsyncSes
     is_banned = getattr(acc, "is_banned", False) or getattr(acc, "status", "") in ["blocked", "error"]
     is_invalid = not getattr(acc, "session_string", None)
     # 🔘 (خواسته کارفرما) اکانت غیرفعال‌شده به‌صورت دستی توسط ادمین
-    is_disabled = getattr(acc, "status", None) == AccountStatus.disabled
+    is_disabled = str(getattr(acc, "status", "")).endswith("disabled")
 
     if is_banned:
         status_str = "🔴 مسدود/حذف شده"
@@ -2272,8 +2272,11 @@ async def reset_cooldown_handler(callback: types.CallbackQuery, session: AsyncSe
         if getattr(acc, "status", None) == AccountStatus.disabled:
             return await callback.answer("🔘 این اکانت غیرفعال است؛ از دکمه «فعال‌سازی اکانت» استفاده کنید.", show_alert=True)
 
-        # پاک کردن زمان استراحت
+        # پاک کردن زمان استراحت و محدودیت‌های تلگرام
         acc.expected_return_time = None
+        acc.restricted_until = None
+        acc.flood_wait_until = None
+        acc.is_banned = False
         acc.status = AccountStatus.active
         
         # پاک کردن استراحت از کش ردیس (تا ورکر بلافاصله آماده شود)
@@ -2373,6 +2376,13 @@ async def enable_account_handler(callback: types.CallbackQuery, session: AsyncSe
             await _get_redis().delete(f"chunk_cooldown:{acc_id}")
         except Exception:
             pass
+
+        # پاکسازی تمام فلگ‌های مسدودی و استراحت از دیتابیس
+        acc.is_banned = False
+        acc.restricted_until = None
+        acc.flood_wait_until = None
+        acc.expected_return_time = None
+        await session.commit()
 
         # ۳. اگر ورکر در استخر نیست (مثلاً بعد از ری‌استارت)، همین حالا روشن شود
         worker_note = ""
