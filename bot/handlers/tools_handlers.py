@@ -262,10 +262,22 @@ async def show_cleanup_tools(callback: types.CallbackQuery, state: FSMContext) -
     builder.button(text="🗑 پاکسازی تاریخچه چت‌ها", callback_data="cleanup_delete_chats")
     builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
     builder.adjust(1)
-    
+
+    # 🛡 (خواسته کارفرما) اطلاع‌رسانی شفاف درباره‌ی کانال‌های حفاظت‌شده
+    try:
+        from utils.protected_channels import protected_channel_handles
+        protected_note = (
+            "\n\n🛡 <i>کانال‌های حفاظت‌شده "
+            f"({'، '.join(sorted(protected_channel_handles())) or '-'}) "
+            "در هیچ‌کدام از عملیات پاکسازی دست نمی‌خورند و اکانت‌ها همیشه عضو آن‌ها می‌مانند.</i>"
+        )
+    except Exception:
+        protected_note = ""
+
     await safe_edit_or_answer(
         callback.message,
-        "🧹 <b>ابزارهای پاکسازی اکانت‌ها</b>\n\nلطفاً یکی از ابزارهای زیر را برای پاکسازی دیتای اکانت‌های متصل انتخاب کنید:",
+        "🧹 <b>ابزارهای پاکسازی اکانت‌ها</b>\n\nلطفاً یکی از ابزارهای زیر را برای پاکسازی دیتای اکانت‌های متصل انتخاب کنید:"
+        + protected_note,
         reply_markup=builder.as_markup()
     )
 

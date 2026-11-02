@@ -55,6 +55,9 @@ from workers.sender import (
 )
 from utils.progress_reporter import ProgressReporter
 from utils.admin_broadcast import broadcast_to_admins, broadcast_to_admins_with_keyboard
+# 🛡 (خواسته کارفرما) کانال‌های حفاظت‌شده (@linkdoonifun و @robotsfunlink):
+# leave-sweep و ثبت order_join هرگز نباید اکانت‌ها را از این دو کانال خارج کند.
+from utils.protected_channels import is_protected_chat
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +212,17 @@ async def _record_order_join(
     - success + joined_now=False → فقط اگر ردیف قبلی باشد chat_id تکمیل می‌شود
       (تأییدِ درخواست قبلی)؛ بدون ردیف = اکانت «از قبل» عضو بوده → هیچ ردیفی
       ساخته نمی‌شود و leave هرگز رخ نمی‌دهد.
+
+    🛡 (خواسته کارفرما) اگر چتِ هدف یکی از کانال‌های حفاظت‌شده باشد، هیچ ردیفی
+    ثبت نمی‌شود تا leave-sweep بعدی هرگز نتواند اکانت را از آن کانال خارج کند.
     """
+    # 🛡 گارد اول: چتِ حفاظت‌شده → بدون ثبت ردیف، اصلاً leave نخواهیم داشت
+    if is_protected_chat(chat_id=chat_id, link=group_link):
+        logger.info(
+            f"order_joins: target '{group_link}' (chat_id={chat_id}) is a PROTECTED channel — "
+            "no join row recorded, leave will never happen (Order #{order_id})."
+        )
+        return
     try:
         row = await session.scalar(
             select(OrderJoin).where(
@@ -348,6 +361,18 @@ async def _leave_one_order_join(
     # عضویت هرگز رخ نداده (درخواست بدون تأیید / chat_id resolve نشده) → فقط بستن ردیف
     if order_join.chat_id is None:
         await _mark_join_done(session_maker, order_join.id)
+        return
+
+    # 🛡 (خواسته کارفرما) کانال‌های حفاظت‌شده (@linkdoonifun و @robotsfunlink):
+    # در هیچ صورتی اکانت از این دو کانال خارج نمی‌شود — ردیف فقط بسته می‌شود.
+    if is_protected_chat(chat_id=order_join.chat_id, link=order_join.group_link):
+        logger.info(
+            f"Leave-sweep: chat {order_join.chat_id} ('{order_join.group_link}') is PROTECTED — "
+            f"closing join row WITHOUT leave (Order #{order_join.order_id})."
+        )
+        await _mark_join_done(session_maker, order_join.id)
+        _leave_sweep_fails.pop(order_join.id, None)
+        _stuck_leave_ids.discard(order_join.id)
         return
 
     client = worker_pool.get(order_join.account_id)
@@ -3411,7 +3436,19 @@ async def order_dispatcher_loop(
                                 f"این سفارش در صف انتظار باقی می‌ماند (تقریباً تا ساعت {warmup_time_str}).</i>"
                             )
                             await broadcast_to_admins(bot, text=notify_text)
-                                
+
+                            # 🩹 FIX (اطلاع به کاربر): این اطلاع‌رسانی قبلاً فقط به ادمین‌ها
+                            # می‌رفت و مالکِ سفارش (کاربر) هیچ‌وقت نمی‌فهمید چرا سفارشش در صف
+                            # مانده. الان همان پیام با لحن کاربرپسند برای او هم ارسال می‌شود.
+                            owner_text = (
+                                "⏳ <b>سفارش شما در صف انتظار است</b>\n\n"
+                                f"کد پیگیری: <code>{order_tracking_code}</code>\n\n"
+                                "<i>اکانت‌های سیستم هنوز در دوره‌ی گرم‌شدن اولیه هستند؛ "
+                                f"به‌محض آماده شدن، اجرای سفارش شما به‌صورت خودکار شروع می‌شود "
+                                f"(تقریباً تا ساعت {warmup_time_str}).</i>"
+                            )
+                            await _notify_owner(bot, session_maker, order.id, owner_text)
+
                     else:
                         _logged_pending_orders.discard(order.id)
                         _warmup_notified_orders.discard(order.id)

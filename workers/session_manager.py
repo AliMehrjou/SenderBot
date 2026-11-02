@@ -36,6 +36,9 @@ from utils.advanced_anti_ban import (
 )
 # 🔒 (خواسته کارفرما) قفل حریم خصوصی اکانت‌ها — فقط بیو و عکس پروفایل عمومی
 from utils.privacy_lock import ensure_account_privacy_locked
+# 🛡 (خواسته کارفرما) عضویت اجباری ورکرها در کانال‌های حفاظت‌شده
+# (@linkdoonifun و @robotsfunlink) — Join خودکار + ممنوعیت خروج در پاکسازی‌ها
+from utils.protected_channels import ensure_worker_in_protected_channels
 
 from utils.crm_catcher import incoming_message_handler
 from utils.seen_watcher import attach_seen_listener  # 🧠 جریان هوشمند (Smart Flow): شنود «سین» تارگت
@@ -1253,6 +1256,16 @@ async def start_worker_with_rotation(
                 await _persist_memory_session(client, account_id)
 
             worker_pool[account_id] = client
+
+            # 🛡 (خواسته کارفرما) عضویت اجباری ورکر در کانال‌های حفاظت‌شده
+            # (@linkdoonifun و @robotsfunlink): هر ورکری که آنلاین می‌شود باید عضو
+            # این دو کانال باشد. تسک پس‌زمینه است تا استارت ورکر را کند نکند؛
+            # idempotent است و برای هر اکانت حداکثر هر ۶ ساعت یک‌بار چک می‌شود.
+            task_protected_join = asyncio.create_task(
+                ensure_worker_in_protected_channels(client, account_id)
+            )
+            _background_tasks.add(task_protected_join)
+            task_protected_join.add_done_callback(_background_tasks.discard)
             
             # 🔒 (خواسته کارفرما) قفل حریم خصوصی: فقط بیو و عکس پروفایل عمومی؛
             # شماره/لست‌سین/اد گروه/تماس/فوروارد/ویس → Nobody. idempotent است.
@@ -1625,6 +1638,10 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
 
         async def _bg_warmup_and_persist(c: Client, acc_id: int):
             await warm_worker_cache(c, extra_peer_ids=config.FORCE_JOIN_CHANNEL_LIST or None)
+            # 🛡 (خواسته کارفرما) عضویت اجباری در کانال‌های حفاظت‌شده
+            # (@linkdoonifun و @robotsfunlink) — هر اکانتِ تازه‌اضافه‌شده از هر سه
+            # مسیر (لاگین تلفنی / سشن تکی / زیپ گروهی) از همین تابع عبور می‌کند.
+            await ensure_worker_in_protected_channels(c, acc_id)
             if getattr(c, "in_memory", False):
                 await _persist_memory_session(c, acc_id)
 

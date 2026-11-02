@@ -128,13 +128,59 @@ async def register_account_limit(
     if error_msg:
         await report_admin_error(error_msg)
 
+def _soft_limit_rest_minutes() -> int:
+    """مدت استراحت کوتاه برای محدودیت نرم اسپم‌بات (دقیقه) — قابل تنظیم با کانفیگ."""
+    try:
+        from config import config
+        return max(0, int(getattr(config, "SPAMBOT_SOFT_LIMIT_REST_MINUTES", 60)))
+    except Exception:
+        return 60
+
+
+async def _apply_spambot_soft_limit(session, account_id: int, soft_minutes: int, report_text: str):
+    """
+    🩹 FIX (باگ «مسدود» اشتباه): محدودیت «بدون تاریخ» اسپم‌بات (پیام
+    «I'm very sorry…») مسدودی چندروزه نیست — اکانت به‌جای blocked باقی ماندن،
+    به یک استراحت کوتاهِ قابل تنظیم تبدیل می‌شود و بعدش خودکار برمی‌گردد.
+    flood_wait_until هم هم‌زمان کوتاه می‌شود تا بعد از پایان استراحت، اکانت
+    واقعاً قابل استفاده باشد (نه اینکه جریمه چندروزه‌ی PeerFlood سرِ راه بماند).
+    """
+    from datetime import timedelta
+    from database.models import AccountStatus, WorkerEvent
+
+    now = datetime.now(timezone.utc)
+    return_time = now + timedelta(minutes=max(1, soft_minutes))
+
+    old_status_val = await session.scalar(select(Account.status).where(Account.id == account_id))
+    old_status = old_status_val.value if hasattr(old_status_val, "value") else str(old_status_val) if old_status_val else "blocked"
+
+    await session.execute(
+        update(Account).where(Account.id == account_id).values(
+            status=AccountStatus.cooldown.value,
+            status_reason="SpamBot soft limit (بدون تاریخ پایان)",
+            expected_return_time=return_time,
+            flood_wait_until=return_time,
+            restricted_until=None,
+            is_banned=False,
+        )
+    )
+    session.add(WorkerEvent(
+        account_id=account_id, old_status=old_status,
+        new_status=AccountStatus.cooldown.value, reason="spambot-soft-limit",
+        error_details=(report_text or "")[:500],
+    ))
+    await session.commit()
+
+
 async def _run_spambot_check(client: Client, account_id: int):
     """اجرای چک اسپم‌بات و ذخیره نتیجه در دیتابیس با مدیریت مجزای تراکنش."""
     from database.engine import async_session
     from utils.advanced_anti_ban import check_spambot_status
-    
+    from database.models import AccountStatus, WorkerEvent
+
     status = await check_spambot_status(client, account_id)
     if status:
+        action_taken = "بدون تغییر"
         # آپدیت متادیتای اسپم بات با try/except محافظت‌شده
         try:
             async with async_session() as session:
@@ -142,26 +188,48 @@ async def _run_spambot_check(client: Client, account_id: int):
                     "spambot_report": status["text"],
                     "spambot_checked_at": datetime.now(timezone.utc)
                 }
-                
+
                 if status["until"]:
+                    # محدودیت با تاریخ پایان مشخص — دیسپچر تا آن زمان متوقف می‌ماند
                     update_vals["restricted_until"] = status["until"]
                     # 🛡 همگام‌سازی: اعمال محدودیت زمانی اسپم‌بات روی flood_wait_until تا دیسپچر متوقف بماند
                     update_vals["flood_wait_until"] = status["until"]
+                    action_taken = f"محدود تا {status['until'].strftime('%H:%M UTC')}"
                 elif not status.get("restricted", False):
+                    # 🩹 FIX: اسپم‌بات اعلام آزادی کرد («Good news…») — علاوه بر پاک کردن
+                    # محدودیت‌ها، is_banned هم پاک می‌شود (چون اسپم‌بات جواب داد یعنی
+                    # اکانت زنده است؛ بنای واقعی اصلاً نمی‌توانست با اسپم‌بات صحبت کند).
                     update_vals["restricted_until"] = None
                     update_vals["flood_wait_until"] = None
                     update_vals["last_limit_type"] = None
-                    update_vals["status"] = "active"
+                    update_vals["is_banned"] = False
+                    update_vals["status"] = AccountStatus.active.value
                     update_vals["status_reason"] = "SpamBot clear"
-                    
+                    update_vals["expected_return_time"] = None
+                    update_vals["consecutive_errors"] = 0
+                    action_taken = "آزاد شد و به چرخه بازگشت ✅"
+
                     old_status_val = await session.scalar(select(Account.status).where(Account.id == account_id))
                     old_status = old_status_val.value if hasattr(old_status_val, 'value') else str(old_status_val) if old_status_val else "blocked"
-                    
-                    from database.models import WorkerEvent
+
                     session.add(WorkerEvent(
-                        account_id=account_id, old_status=old_status, new_status="active", reason="spambot-clear"
+                        account_id=account_id, old_status=old_status, new_status=AccountStatus.active.value, reason="spambot-clear"
                     ))
-                    
+                else:
+                    # 🩹 FIX: محدودیتِ «بدون تاریخ» (پیام «I'm very sorry…») — قبلاً هیچ
+                    # آپدیتی انجام نمی‌شد و اکانت با همان جریمه چندروزه‌ی PeerFlood
+                    # «مسدود» می‌ماند. الان به استراحت کوتاهِ قابل تنظیم تبدیل می‌شود.
+                    soft_minutes = _soft_limit_rest_minutes()
+                    await session.execute(
+                        update(Account).where(Account.id == account_id).values(**update_vals)
+                    )
+                    await session.commit()
+                    if soft_minutes > 0:
+                        await _apply_spambot_soft_limit(session, account_id, soft_minutes, status["text"])
+                        action_taken = f"محدودیت نرم → استراحت {soft_minutes} دقیقه‌ای"
+                    else:
+                        action_taken = "محدودیت نرم (بدون توقف)"
+
                 await session.execute(
                     update(Account).where(Account.id == account_id).values(**update_vals)
                 )
@@ -173,6 +241,7 @@ async def _run_spambot_check(client: Client, account_id: int):
             report_txt = (
                 f"🤖 <b>نتیجه SpamBot برای <code>user_{account_id}/</code>:</b>\n"
                 f"وضعیت محدودیت: {'فعال 🔴' if status['restricted'] else 'آزاد 🟢'}\n"
+                f"اقدام سیستم: {action_taken}\n"
                 f"متن پیام:\n<pre>{status['text'][:150]}...</pre>"
             )
             await report_admin_error(report_txt)

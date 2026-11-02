@@ -769,11 +769,27 @@ async def unblock_account_handler(callback: types.CallbackQuery, session: AsyncS
     try:
         from workers.sender import change_account_status
         await change_account_status(
-            session=session, 
-            account_id=acc_id, 
-            new_status=AccountStatus.active, 
+            session=session,
+            account_id=acc_id,
+            new_status=AccountStatus.active,
             reason="Manual Unblock by Admin"
         )
+
+        # 🩹 FIX: رفع مسدودی دستی قبلاً فقط status را عوض می‌کرد؛ اگر is_banned یا
+        # تاریخ‌های محدودیت (flood_wait_until / restricted_until) ست مانده بودند،
+        # اکانت همچنان «مسدود/محدود» نمایش داده می‌شد و دیسپچر هم استفاده‌اش نمی‌کرد.
+        # الان تمام فلگ‌های محدودیت هم پاک می‌شوند تا بازگردانی واقعی باشد.
+        from database.models import Account as _Account
+        acc_obj = await session.get(_Account, acc_id)
+        if acc_obj is not None:
+            acc_obj.is_banned = False
+            acc_obj.flood_wait_until = None
+            acc_obj.restricted_until = None
+            acc_obj.last_limit_type = None
+            acc_obj.expected_return_time = None
+            acc_obj.consecutive_errors = 0
+            await session.commit()
+
         await safe_callback_answer(callback, f"✅ اکانت {acc_id} با موفقیت به چرخه Active بازگشت.", show_alert=True)
     except Exception as e:
         logger.error(f"Failed to unblock account {acc_id}: {e}")

@@ -274,6 +274,121 @@ async def build_category_keyboard(session: AsyncSession, selected_ids: list[int]
 # 🟣 ورود به فلوی سفارش — مشترک بین دکمه‌ی دکمه‌ای (متن) و شیشه‌ای (callback)
 # ⚠️ ترتیب ثبت مهم: هندلرهای «متنیِ بدون state» باید قبل از هندلرهای state ثبت شوند
 # ==========================================
+# ==========================================
+# 🩹 FIX (باگ گرم‌شدن — اطلاع از همان اول): فانکشن‌های مشترک گارد ورودی
+# فلوی «ثبت سفارش» و «آنالیز». قبلاً دوره‌ی گرم‌شدن اکانت‌ها در این گارد
+# بررسی نمی‌شد؛ کاربر کل فلوی طولانی را طی می‌کرد و بعد (فقط در پیام ادمین‌ها)
+# معلوم می‌شد سفارشش به‌خاطر گرم‌شدن در صف مانده است.
+# ==========================================
+async def gather_worker_availability(session: AsyncSession) -> dict:
+    """
+    بررسی مشترک وضعیت ورکرها پیش از شروع فلوی سفارش/آنالیز.
+
+    خروجی:
+      {
+        "ready_count": int,          # متصل + سالم + بدون استراحت + گرم‌شده
+        "warming_accounts": list,    # اکانت‌های سالم ولی در دوره‌ی گرم‌شدن
+        "max_warmup_end": dt | None, # دیرترین زمان پایان دوره‌ی گرم‌شدن (UTC)
+      }
+    """
+    from workers.session_manager import worker_pool
+    from database.models import Account, AccountStatus
+    from sqlalchemy import or_, select
+    from datetime import datetime, timezone
+
+    result = {"ready_count": 0, "warming_accounts": [], "max_warmup_end": None}
+    connected_ids = [acc_id for acc_id, c in worker_pool.items() if getattr(c, "is_connected", False)]
+    if not connected_ids:
+        return result
+
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    stmt = select(Account).where(
+        Account.id.in_(connected_ids),
+        Account.is_banned == False,
+        Account.status == AccountStatus.active,
+        or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
+        or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
+    )
+    valid_accounts = (await session.scalars(stmt)).all()
+    if not valid_accounts:
+        return result
+
+    # کسر اکانت‌هایی که در استراحت (Cooldown) ردیسی هستند
+    ready_accounts = list(valid_accounts)
+    try:
+        from workers.sender import _get_redis
+        redis_client = _get_redis()
+        pipe = redis_client.pipeline()
+        for acc in ready_accounts:
+            pipe.exists(f"chunk_cooldown:{acc.id}")
+        cooldown_results = await pipe.execute()
+        ready_accounts = [acc for acc, res in zip(ready_accounts, cooldown_results) if not res]
+    except Exception as e:
+        logger.error(f"Redis check failed in availability preflight: {e}")
+        # Fallback: بدون کسر استراحت‌های ردیسی
+
+    # جداسازی اکانت‌های در دوره‌ی گرم‌شدن (هم‌ارز با منطق دیسپچر: workers/task_queue.py)
+    try:
+        from workers.task_queue import _is_warmed_up
+        now_utc_pf = datetime.now(timezone.utc)
+        still_ready = []
+        for acc in ready_accounts:
+            if await _is_warmed_up(session, acc, now_utc_pf):
+                still_ready.append(acc)
+            else:
+                result["warming_accounts"].append(acc)
+                w = acc.warmed_up_at
+                if w:
+                    if w.tzinfo is None:
+                        w = w.replace(tzinfo=timezone.utc)
+                    if result["max_warmup_end"] is None or w > result["max_warmup_end"]:
+                        result["max_warmup_end"] = w
+        ready_accounts = still_ready
+    except Exception as e:
+        logger.error(f"Warmup check failed in availability preflight: {e}")
+        ready_accounts = valid_accounts  # Fallback محافظه‌کارانه نباشد — مثل رفتار قبلی ادامه بده
+
+    result["ready_count"] = len(ready_accounts)
+    return result
+
+
+def build_warmup_block_notice(max_warmup_end, warming_count: int, action_label: str) -> str:
+    """ساخت پیام «اکانت‌ها در حال گرم‌شدن هستند» برای گارد ورودی فلوها."""
+    from datetime import timezone, datetime as _dt
+    if max_warmup_end is not None:
+        if max_warmup_end.tzinfo is None:
+            max_warmup_end = max_warmup_end.replace(tzinfo=timezone.utc)
+        remain_secs = max(0, (max_warmup_end - _dt.now(timezone.utc)).total_seconds())
+        remain_hours = int(remain_secs // 3600)
+        remain_mins = int((remain_secs % 3600) // 60)
+        if remain_hours > 0:
+            remain_str = f"حدود {remain_hours} ساعت و {remain_mins} دقیقه دیگر"
+        else:
+            remain_str = f"حدود {remain_mins} دقیقه دیگر"
+        try:
+            from utils.timezone_helpers import to_tehran_time
+            warmup_time_str = to_tehran_time(max_warmup_end, "%H:%M")
+        except Exception:
+            warmup_time_str = max_warmup_end.strftime("%H:%M UTC")
+        time_detail = (
+            f"⏱ پایان دوره‌ی گرم‌شدن: حدود ساعت <b>{warmup_time_str}</b> به وقت تهران "
+            f"({remain_str})"
+        )
+    else:
+        time_detail = "⏱ پایان دوره‌ی گرم‌شدن: نامشخص"
+
+    return (
+        f"⏳ <b>فعلاً امکان {action_label} وجود ندارد</b>\n\n"
+        f"اکانت(های) موجود در سیستم تازه اضافه شده‌اند و در دوره‌ی گرم‌شدن اولیه هستند"
+        + (f" (<b>{warming_count}</b> اکانت)" if warming_count > 1 else "") + ".\n"
+        f"{time_detail}\n\n"
+        "<i>برای جلوگیری از محدود/مسدود شدن اکانت‌ها توسط تلگرام، تا پایان این دوره "
+        "هیچ سفارشی روی آن‌ها اجرا نمی‌شود.\n"
+        "لطفاً بعد از پایان دوره‌ی گرم‌شدن مراجعه کنید یا از ادمین بخواهید اکانتِ "
+        "از قبل گرم‌شده اضافه کند.</i>"
+    )
+
+
 async def _start_create_order_flow(
     message: types.Message,
     state: FSMContext,
@@ -287,43 +402,32 @@ async def _start_create_order_flow(
     from workers.session_manager import worker_pool
     from database.models import Account, AccountStatus
     from sqlalchemy import or_, select
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
     from contextlib import suppress
     from aiogram.exceptions import TelegramBadRequest
     
+    # 🩹 FIX (باگ گرم‌شدن): شمارش ورکرهای واقعاً آماده (متصل + سالم + بدون استراحت
+    # + خارج از دوره‌ی گرم‌شدن) با فانکشن مشترک. اکانت‌های در حال گرم‌شدن گزارش
+    # می‌شوند تا همان اول به کاربر پیام مناسب نمایش داده شود.
+    availability = await gather_worker_availability(session)
     connected_ids = [acc_id for acc_id, c in worker_pool.items() if getattr(c, "is_connected", False)]
-    available_workers = 0
-    
-    if connected_ids:
-        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-        # 🟢 تغییر: دریافت آی‌دی اکانت‌های معتبر به جای شمارش کلی
-        stmt = select(Account.id).where(
-            Account.id.in_(connected_ids),
-            Account.is_banned == False,
-            Account.status == AccountStatus.active,
-            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
-            or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
-        )
-        valid_account_ids = (await session.scalars(stmt)).all()
-        
-        if valid_account_ids:
-            try:
-                # 🟢 بررسی ردیس برای کسر اکانت‌هایی که در استراحت (Cooldown) هستند
-                from workers.sender import _get_redis
-                redis_client = _get_redis()
-                pipe = redis_client.pipeline()
-                for aid in valid_account_ids:
-                    pipe.exists(f"chunk_cooldown:{aid}")
-                cooldown_results = await pipe.execute()
-                
-                # تعداد نهایی: کل اکانت‌های سالم منهای آن‌هایی که در استراحتند
-                available_workers = len(valid_account_ids) - sum(1 for res in cooldown_results if res)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).error(f"Redis check failed in order preflight: {e}")
-                available_workers = len(valid_account_ids) # Fallback
+    available_workers = availability["ready_count"]
+    warming_accounts = availability["warming_accounts"]
+    max_warmup_end = availability["max_warmup_end"]
         
     if available_workers <= 0:
+        # 🩹 FIX (باگ گرم‌شدن — اطلاع از همان اول): اگر اکانت سالم متصل هست ولی هنوز
+        # در دوره‌ی گرم‌شدن است، کاربر بلافاصله و در همان ابتدای فلوی سفارش مطلع
+        # می‌شود — نه اینکه چند مرحله جلو برود و بعد از ثبت سفارش، فقط در پیام
+        # ادمین‌ها معلوم شود که سفارش به‌خاطر گرم‌شدن در صف مانده است.
+        if warming_accounts:
+            warmup_err_text = build_warmup_block_notice(max_warmup_end, len(warming_accounts), "ثبت سفارش")
+            if callback is not None:
+                with suppress(TelegramBadRequest):
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                return await safe_edit_or_answer(message, warmup_err_text, reply_markup=get_main_menu_keyboard())
+            return await message.answer(warmup_err_text, reply_markup=get_main_menu_reply_keyboard())
+
         nearest_recovery = None
         reasons_msg = ""
         if connected_ids:

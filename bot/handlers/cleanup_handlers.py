@@ -17,6 +17,13 @@ from pyrogram.errors import FloodWait
 from utils.limit_handler import register_account_limit
 from workers.session_manager import worker_pool
 from utils.safe_edit import safe_edit_or_answer
+# 🛡 (خواسته کارفرما) کانال‌های حفاظت‌شده (@linkdoonifun و @robotsfunlink):
+# در هیچ عملیات پاکسازی، اکانت‌ها اجازه خروج از این دو کانال را ندارند.
+from utils.protected_channels import (
+    is_protected_chat,
+    resolve_protected_channel_ids,
+    protected_channel_handles,
+)
 
 logger = logging.getLogger(__name__)
 router = Router(name="cleanup_handlers_router")
@@ -78,6 +85,8 @@ async def execute_leave_groups(callback: types.CallbackQuery, state: FSMContext)
     report = []
     pool_items = list(worker_pool.items())
     total_accounts = len(pool_items)
+    # 🛡 شمارنده‌ی چت‌های حفاظت‌شده که عمداً leave نشدند
+    protected_skipped = 0
     
     for i, (acc_id, client) in enumerate(pool_items, 1):
         now = time.time()
@@ -88,6 +97,9 @@ async def execute_leave_groups(callback: types.CallbackQuery, state: FSMContext)
         if not client.is_connected:
             report.append(f"• اکانت <code>{acc_id}</code>: آفلاین ❌")
             continue
+
+        # 🛡 resolve کانال‌های حفاظت‌شده به chat_id (برای مقایسه‌ی مطمئن در همین چرخه)
+        await resolve_protected_channel_ids(client)
             
         success, errors = 0, 0
         error_reasons = {}
@@ -98,6 +110,13 @@ async def execute_leave_groups(callback: types.CallbackQuery, state: FSMContext)
                 is_channel = dialog.chat.type == ChatType.CHANNEL
                 
                 if is_group or (domain == "all" and is_channel):
+                    # 🛡 (خواسته کارفرما) کانال‌های حفاظت‌شده هرگز leave نمی‌شوند
+                    if is_protected_chat(
+                        chat_id=dialog.chat.id,
+                        username=getattr(dialog.chat, "username", None),
+                    ):
+                        protected_skipped += 1
+                        continue
                     try:
                         await client.leave_chat(dialog.chat.id)
                         success += 1
@@ -132,6 +151,12 @@ async def execute_leave_groups(callback: types.CallbackQuery, state: FSMContext)
         report.append(report_line)
         
     final_text = "📊 <b>گزارش نهایی خروج از چت‌ها:</b>\n\n" + "\n".join(report)
+    # 🛡 گزارش شفاف درباره‌ی کانال‌های حفاظت‌شده (که عمداً خارج نشدند)
+    if protected_skipped:
+        final_text += (
+            f"\n\n🛡 <b>کانال‌های حفاظت‌شده:</b>"
+            f"\n<i>{'، '.join(sorted(protected_channel_handles())) or '-'} — «{protected_skipped}» مورد عضویت عمداً حذف نشد و اکانت‌ها در آن‌ها باقی ماندند.</i>"
+        )
     await safe_edit_or_answer(callback.message, final_text)
 
 
@@ -187,6 +212,8 @@ async def execute_delete_chats(callback: types.CallbackQuery, state: FSMContext)
     total_accounts = len(pool_items)
     
     total_flood_temp = 0  # شمارنده کل برای گزارش نهایی
+    # 🛡 شمارنده‌ی چت‌های حفاظت‌شده که عمداً دست نخوردند
+    protected_skipped = 0
     
     for i, (acc_id, client) in enumerate(pool_items, 1):
         now = time.time()
@@ -197,6 +224,9 @@ async def execute_delete_chats(callback: types.CallbackQuery, state: FSMContext)
         if not client.is_connected:
             report.append(f"• اکانت <code>{acc_id}</code>: آفلاین ❌")
             continue
+
+        # 🛡 resolve کانال‌های حفاظت‌شده به chat_id (برای مقایسه‌ی مطمئن در همین چرخه)
+        await resolve_protected_channel_ids(client)
             
         success, flood_temp, permanent = 0, 0, 0
         error_reasons = {}
@@ -205,6 +235,15 @@ async def execute_delete_chats(callback: types.CallbackQuery, state: FSMContext)
         try:
             async for dialog in client.get_dialogs():
                 if domain == "dm" and dialog.chat.type != ChatType.PRIVATE:
+                    continue
+
+                # 🛡 (خواسته کارفرما) کانال‌های حفاظت‌شده (@linkdoonifun و
+                # @robotsfunlink) در پاکسازی تاریخچه هم دست نمی‌خورند
+                if is_protected_chat(
+                    chat_id=dialog.chat.id,
+                    username=getattr(dialog.chat, "username", None),
+                ):
+                    protected_skipped += 1
                     continue
                     
                 try:
@@ -283,6 +322,13 @@ async def execute_delete_chats(callback: types.CallbackQuery, state: FSMContext)
     
     if total_flood_temp > 0:
         final_text += f"\n\n⚠️ {total_flood_temp} چت به‌خاطر محدودیت موقت باقی مانده؛ فرایند قابل تکرار است."
+
+    # 🛡 گزارش شفاف درباره‌ی کانال‌های حفاظت‌شده (که عمداً دست نخوردند)
+    if protected_skipped:
+        final_text += (
+            f"\n\n🛡 <b>کانال‌های حفاظت‌شده:</b>"
+            f"\n<i>{'، '.join(sorted(protected_channel_handles())) or '-'} — تاریخچه‌ی «{protected_skipped}» مورد عمداً پاک نشد.</i>"
+        )
         
     await safe_edit_or_answer(callback.message, final_text)
 

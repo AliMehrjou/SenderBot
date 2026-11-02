@@ -151,38 +151,28 @@ async def enter_classic_extraction(callback: types.CallbackQuery, state: FSMCont
     from contextlib import suppress
     from aiogram.exceptions import TelegramBadRequest
     
-    connected_ids = [acc_id for acc_id, c in worker_pool.items() if getattr(c, "is_connected", False)]
-    available_workers = 0
-    
-    if connected_ids:
-        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-        # 🟢 تغییر: دریافت آی‌دی اکانت‌های معتبر
-        stmt = select(Account.id).where(
-            Account.id.in_(connected_ids),
-            Account.is_banned == False,
-            Account.status == AccountStatus.active,
-            or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= now_naive),
-            or_(Account.restricted_until.is_(None), Account.restricted_until <= now_naive)
-        )
-        valid_account_ids = (await session.scalars(stmt)).all()
-        
-        if valid_account_ids:
-            try:
-                # 🟢 کسر اکانت‌های در حال استراحت
-                from workers.sender import _get_redis
-                redis_client = _get_redis()
-                pipe = redis_client.pipeline()
-                for aid in valid_account_ids:
-                    pipe.exists(f"chunk_cooldown:{aid}")
-                cooldown_results = await pipe.execute()
-                
-                available_workers = len(valid_account_ids) - sum(1 for res in cooldown_results if res)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).error(f"Redis check failed in extractor preflight: {e}")
-                available_workers = len(valid_account_ids)
-        
+    # 🩹 FIX (باگ گرم‌شدن — اطلاع از همان اول): شمارش ورکرهای واقعاً آماده
+    # (متصل + سالم + بدون استراحت + خارج از دوره‌ی گرم‌شدن) با فانکشن مشترکِ
+    # order_handlers — تا اگر تمام اکانت‌ها در دوره‌ی گرم‌شدن هستند، کاربر در همان
+    # ابتدای فلوی آنالیز مطلع شود، نه در میانه/انتهای کار.
+    from bot.handlers.order_handlers import gather_worker_availability, build_warmup_block_notice
+    availability = await gather_worker_availability(session)
+    available_workers = availability["ready_count"]
+    warming_accounts = availability["warming_accounts"]
+    max_warmup_end = availability["max_warmup_end"]
+
     if available_workers <= 0:
+        # 🩹 FIX (باگ گرم‌شدن — اطلاع از همان اول): اگر اکانت سالم متصل هست ولی هنوز
+        # در دوره‌ی گرم‌شدن است، کاربر در همان ابتدای فلوی آنالیز مطلع می‌شود.
+        if warming_accounts:
+            with suppress(TelegramBadRequest):
+                await callback.message.edit_reply_markup(reply_markup=None)
+            return await safe_edit_or_answer(
+                callback.message,
+                build_warmup_block_notice(max_warmup_end, len(warming_accounts), "ثبت سفارش آنالیز"),
+                reply_markup=get_main_menu_keyboard()
+            )
+
         with suppress(TelegramBadRequest):
             await callback.message.edit_reply_markup(reply_markup=None)
             

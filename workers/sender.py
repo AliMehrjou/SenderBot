@@ -884,12 +884,46 @@ async def execute_bulk_send(
                         await _report(status="⚠️ اکانت Shadow-ban (محدود) است — بازگشت تارگت‌ها...", account=account_tag)
                         return targets, "account_limited"
                     elif status["restricted"]:
-                        account_row.is_banned = True
-                        await session.commit()
-                        from workers.sender import change_account_status
-                        await change_account_status(session, account_db_id, AccountStatus.blocked, "SpamBot Restriction", status["text"])
-                        await _report(status="⛔️ اکانت بن دائم است — بازگشت تارگت‌ها...", account=account_tag)
-                        return targets, "account_banned"
+                        # 🩹 FIX (باگ «مسدود» اشتباه): پیام محدودیتِ «بدون تاریخ» اسپم‌بات
+                        # (همان پیام «I'm very sorry…») بن دائم نیست — این اکانت‌ها معمولاً
+                        # همچنان می‌توانند به بقیه پیام بدهند. قبلاً اینجا is_banned=True و
+                        # status=blocked می‌شد و اکانت برای همیشه «مسدود» می‌ماند (حتی بعد
+                        # از آزاد شدن توسط تلگرام). الان فقط یک استراحت کوتاهِ قابل تنظیم
+                        # اعمال می‌شود و اکانت خودکار به چرخه برمی‌گردد.
+                        from datetime import timedelta
+                        soft_minutes = max(0, int(getattr(config, "SPAMBOT_SOFT_LIMIT_REST_MINUTES", 60)))
+                        if soft_minutes <= 0:
+                            await session.commit()
+                            await _report(status="⚠️ اسپم‌بات محدودیت نرم (بدون تاریخ) گزارش کرد — ادامه ارسال...", account=account_tag)
+                        else:
+                            from workers.sender import change_account_status
+                            return_time = now_utc + timedelta(minutes=soft_minutes)
+                            await change_account_status(
+                                session, account_db_id, AccountStatus.cooldown,
+                                "SpamBot soft limit (بدون تاریخ پایان)", (status["text"] or "")[:200], return_time
+                            )
+                            await _report(
+                                status=f"⚠️ محدودیت نرم اسپم‌بات — استراحت کوتاه {soft_minutes} دقیقه‌ای و بازگشت خودکار...",
+                                account=account_tag
+                            )
+                            return targets, "account_limited"
+                    else:
+                        # 🩹 FIX (خودترمیمی): اسپم‌بات اعلام آزادی کرد («Good news… no limits»).
+                        # هر محدودیت/مسدودیِ باقی‌مانده پاک می‌شود تا اکانت بلافاصله به چرخه
+                        # برگردد (قبلاً حتی بعد از آزاد شدن تلگرام، اکانت تا سرسقف جریمه
+                        # «مسدود» نمایش داده می‌شد).
+                        account_row.restricted_until = None
+                        account_row.flood_wait_until = None
+                        account_row.last_limit_type = None
+                        account_row.is_banned = False
+                        if account_row.status not in (AccountStatus.active, AccountStatus.disabled):
+                            from workers.sender import change_account_status
+                            await change_account_status(
+                                session, account_db_id, AccountStatus.active,
+                                "SpamBot clear (preflight self-heal)"
+                            )
+                        else:
+                            await session.commit()
                         
                     await session.commit()
     except Exception as e:

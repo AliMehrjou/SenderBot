@@ -226,10 +226,93 @@ async def perform_warmup_cycle(client: Client, account_id: int) -> None:
     except Exception as e:
         logger.debug(f"Worker user_{account_id}/ warm-up error: {e}")
 
+# ==========================================
+# 🩹 FIX (وضعیت اشتباه «مسدود») — تشخیص پیام‌های @SpamBot
+# قبلاً بعد از ارسال /start فقط ۲.۵ ثانیه صبر می‌شد و history[0] خوانده می‌شد؛
+# اگر جواب اسپم‌بات دیر می‌رسید، «پیام /start خودِ اکانت» به‌عنوان پاسخ تفسیر
+# می‌شد و چون «Good news» نداشت، اکانت به‌اشتباه محدود/مسدود ثبت می‌شد
+# (در حالی که ورکر کاملاً سالم بود و می‌توانست به بقیه پیام بدهد).
+# ==========================================
+async def _latest_spambot_reply(
+    client: Client,
+    after_message_id: int,
+    timeout_seconds: float = 12.0,
+    poll_interval: float = 1.5,
+):
+    """
+    جدیدترین پیامِ «واقعیِ» @SpamBot با شناسه‌ی بزرگ‌تر از after_message_id.
+    - پیام‌های خروجی (outgoing) خودِ اکانت هرگز در نظر گرفته نمی‌شوند.
+    - تا timeout_seconds به‌صورت پله‌ای poll می‌شود تا پاسخ دیررس اسپم‌بات هم گرفته شود.
+    - اگر هیچ پاسخی نرسید None برمی‌گرداند (فراخوان‌دهنده باید آن را «بررسی ناموفق»
+      بپندارد، نه «محدود شده»).
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_seconds
+    best = None
+    while True:
+        try:
+            async for msg in client.get_chat_history("spambot", limit=8):
+                if getattr(msg, "outgoing", False):
+                    continue
+                if after_message_id and msg.id <= after_message_id:
+                    continue
+                if best is None or msg.id > best.id:
+                    best = msg
+        except Exception as e:
+            logger.debug(f"spambot history read failed: {e}")
+        if best is not None:
+            return best
+        if loop.time() >= deadline:
+            return None
+        await asyncio.sleep(poll_interval)
+
+
+# نشانه‌های پیام «آزاد بودن» اکانت در پاسخ @SpamBot (کوچک/بزرگ غیرحساس)
+_SPAMBOT_FREE_MARKERS = (
+    "good news",
+    "free as a bird",
+    "free from any limitations",
+    "no limits are currently applied",
+    "هیچ محدودیتی",
+)
+
+# الگوهای مختلف تاریخ انقضای محدودیت در پیام @SpamBot
+_SPAMBOT_UNTIL_PATTERNS = (
+    (r"until (\d{1,2} [a-zA-Z]+ \d{4}, \d{1,2}:\d{2}:\d{2}) UTC", "%d %b %Y, %H:%M:%S"),
+    (r"until (\d{1,2} [a-zA-Z]+ \d{4}, \d{1,2}:\d{2}) UTC", "%d %b %Y, %H:%M"),
+    (r"until (\d{1,2} [a-zA-Z]+ \d{4} at \d{1,2}:\d{2})", "%d %b %Y at %H:%M"),
+    (r"until (\d{1,2} [a-zA-Z]+ \d{4}, \d{1,2}:\d{2})", "%d %b %Y, %H:%M"),
+)
+
+
+def parse_spambot_until_date(text: str) -> Optional[datetime]:
+    """استخراج تاریخ پایان محدودیت از متن پیام @SpamBot (چند فرمت پشتیبانی می‌شود)."""
+    for pattern, fmt in _SPAMBOT_UNTIL_PATTERNS:
+        date_match = re.search(pattern, text)
+        if date_match:
+            try:
+                parsed = datetime.strptime(date_match.group(1), fmt)
+                return parsed.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+    return None
+
+
+def is_spambot_free_text(text: str) -> bool:
+    """آیا این متن پیامِ «بدون محدودیت» از @SpamBot است؟"""
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _SPAMBOT_FREE_MARKERS)
+
+
 async def check_spambot_status(client: Client, account_id: int) -> Optional[dict]:
     """
     بررسی وضعیت محدودیت اکانت از طریق SpamBot.
-    ارسال /start، خواندن پاسخ، فشردن دکمه inline (در صورت وجود) و استخراج تاریخ انقضا.
+    ارسال /start، خواندن پاسخِ واقعی ربات (نه اکوی /start خودمان)، فشردن دکمه inline
+    (در صورت وجود) برای دیدن جزئیات/تاریخ محدودیت و استخراج تاریخ انقضا.
+
+    خروجی:
+      {"text": str, "restricted": bool, "until": Optional[datetime]}
+      None یعنی «بررسی ناموفق» — فراخوان‌دهنده نباید وضعیت اکانت را تغییر دهد.
     """
     try:
         try:
@@ -237,49 +320,39 @@ async def check_spambot_status(client: Client, account_id: int) -> Optional[dict
         except Exception:
             pass
 
-        await client.send_message("spambot", "/start")
-        await asyncio.sleep(2.5)
-        
-        history = []
-        async for msg in client.get_chat_history("spambot", limit=2):
-            history.append(msg)
-            
-        if not history:
+        sent = await client.send_message("spambot", "/start")
+        base_id = sent.id if sent is not None else 0
+
+        reply = await _latest_spambot_reply(client, base_id)
+        if reply is None:
+            logger.warning(
+                f"Worker user_{account_id}/ spambot did not answer in time — check skipped (no state change)."
+            )
             return None
-            
-        reply = history[0]
-        
-        # اگر دکمه‌ای وجود دارد (مثلاً "This is a mistake") آن را فشار بده
+
+        # اگر دکمه‌ای وجود دارد (مثلاً "But I can't message some people!") آن را فشار بده
+        # تا جزئیات واقعی و تاریخ پایان محدودیت (در صورت وجود) نمایش داده شود.
         # 🟢 رفع باگ کرش در برخورد با کیبورد معمولی (ReplyKeyboardMarkup) اسپم‌بات
         if reply.reply_markup and getattr(reply.reply_markup, "inline_keyboard", None):
-            callback_data = reply.reply_markup.inline_keyboard[0][0].callback_data
-            if callback_data:
-                await client.request_callback_answer(
-                    chat_id="spambot",
-                    message_id=reply.id,
-                    callback_data=callback_data
-                )
-                await asyncio.sleep(2)
-                # رفرش کردن آخرین پیام بعد از تعامل
-                async for msg in client.get_chat_history("spambot", limit=1):
-                    reply = msg
-        
+            try:
+                callback_data = reply.reply_markup.inline_keyboard[0][0].callback_data
+                if callback_data:
+                    await client.request_callback_answer(
+                        chat_id="spambot",
+                        message_id=reply.id,
+                        callback_data=callback_data
+                    )
+                    # رفرش کردن آخرین پیام بعد از تعامل — فقط پیام جدیدتر از پاسخ قبلی
+                    follow_up = await _latest_spambot_reply(client, reply.id, timeout_seconds=8.0)
+                    if follow_up is not None:
+                        reply = follow_up
+            except Exception as btn_err:
+                logger.debug(f"Worker user_{account_id}/ spambot button press failed: {btn_err}")
+
         text = reply.text or ""
-        is_restricted = True
-        until_date = None
-        
-        if "Good news" in text or "free from any limitations" in text or "هیچ محدودیتی" in text:
-            is_restricted = False
-        else:
-            # پارس کردن تاریخ انقضا (فرمت معمول: until 15 Aug 2024, 15:33 UTC)
-            date_match = re.search(r"until (\d{1,2} [a-zA-Z]+ \d{4}, \d{2}:\d{2} UTC)", text)
-            if date_match:
-                try:
-                    until_date = datetime.strptime(date_match.group(1), "%d %b %Y, %H:%M %Z")
-                    until_date = until_date.replace(tzinfo=timezone.utc)
-                except Exception:
-                    pass
-                    
+        is_restricted = not is_spambot_free_text(text)
+        until_date = parse_spambot_until_date(text) if is_restricted else None
+
         # اختیاری: ارسال Appeal اتوماتیک در صورت محدودیت و روشن بودن تنظیمات
         from config import config
         if is_restricted and getattr(config, "SPAMBOT_AUTO_APPEAL", False):

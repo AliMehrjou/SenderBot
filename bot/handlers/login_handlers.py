@@ -67,6 +67,28 @@ temp_clients: Dict[int, Client] = {}
 
 
 # ==========================================
+# 🧮 (خواسته کارفرما) سقف کل اکانت‌های ربات — MAX_TOTAL_ACCOUNTS (پیش‌فرض ۵۰)
+# ==========================================
+async def _total_accounts_count(session: AsyncSession) -> int:
+    """تعداد کل اکانت‌های ثبت‌شده؛ -1 یعنی خطای موقت در شمارش (چک را نقض نمی‌کند)."""
+    try:
+        return int(await session.scalar(select(func.count()).select_from(Account)) or 0)
+    except Exception as e:
+        logger.warning(f"Account count for limit check failed: {e}")
+        return -1
+
+
+def _accounts_limit_message(total: int) -> str:
+    """پیام استاندارد «سقف تکمیل است» برای همه‌ی مسیرهای افزودن اکانت."""
+    return (
+        "⛔ <b>سقف افزودن اکانت به ربات تکمیل است!</b>\n\n"
+        f"حداکثر تعداد اکانت‌های قابل ثبت در این ربات: <code>{config.MAX_TOTAL_ACCOUNTS}</code>\n"
+        f"تعداد فعلی ثبت‌شده: <code>{total}</code>\n\n"
+        "برای افزودن اکانت جدید، ابتدا از بخش «📲 لیست اکانت‌ها» تعدادی اکانت را حذف کنید."
+    )
+
+
+# ==========================================
 # 🔴 فاز ۱۱ (BUG-28): مهلت نشست لاگین + رزرو ظرفیت API
 # ==========================================
 # حداکثر عمر یک فلوی لاگین از لحظه ارسال کد تا وارد کردن پسورد 2FA.
@@ -249,6 +271,19 @@ async def enter_add_account_flow(callback: types.CallbackQuery, state: FSMContex
             reply_markup=builder.as_markup()
         )
 
+    # 🧮 (خواسته کارفرما) سقف کل اکانت‌ها — ورود به فلوی افزودن مسدود می‌شود
+    total_accounts = await _total_accounts_count(session)
+    if 0 <= total_accounts >= config.MAX_TOTAL_ACCOUNTS:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="📲 لیست اکانت‌ها", callback_data="menu_list_accounts/")
+        builder.button(text="🏛 منوی اصلی", callback_data="menu_home/")
+        builder.adjust(2)
+        return await safe_edit_or_answer(
+            callback.message,
+            _accounts_limit_message(total_accounts),
+            reply_markup=builder.as_markup()
+        )
+
     builder = InlineKeyboardBuilder()
     for cat in categories:
         # استفاده از الگوی استاندارد همراه با اسلش انتهایی
@@ -365,6 +400,14 @@ async def process_phone_number(message: types.Message, state: FSMContext, sessio
         return await message.answer(
             with_cancel_hint("⚠️ این شماره موبایل قبلاً در سیستم ثبت شده است. لطفاً شماره دیگری ارسال کنید."),
             reply_markup=get_login_cancel_keyboard()
+        )
+
+    # 🧮 (خواسته کارفرما) سقف کل اکانت‌ها — قبل از شروع لاگین تلفنی چک می‌شود
+    total_accounts = await _total_accounts_count(session)
+    if 0 <= total_accounts >= config.MAX_TOTAL_ACCOUNTS:
+        return await message.answer(
+            _accounts_limit_message(total_accounts),
+            reply_markup=get_main_menu_keyboard()
         )
 
     # بازخورد فوری به کاربر
@@ -982,6 +1025,16 @@ async def finalize_login_and_save(
             
         cat_name = cat_obj.name
 
+        # 🧮 (خواسته کارفرما) سقف کل اکانت‌ها — چک نهایی قبل از ذخیره در دیتابیس
+        total_accounts = await _total_accounts_count(session)
+        if 0 <= total_accounts >= config.MAX_TOTAL_ACCOUNTS:
+            await state.clear()
+            await release_login_reservations(admin_id, session)
+            return await message.answer(
+                _accounts_limit_message(total_accounts),
+                reply_markup=get_main_menu_keyboard()
+            )
+
         session_string = await client.export_session_string()
         encrypted_session = encrypt_session(session_string)
         
@@ -1418,6 +1471,8 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
         
         success_count, duplicate_count, error_count = 0, 0, 0
         api_limit_hit = False
+        # 🧮 (خواسته کارفرما) سقف کل اکانت‌ها در افزودن گروهی
+        limit_hit = False
         
         try:
             await message.bot.download(message.document, destination=zip_path)
@@ -1454,6 +1509,12 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
                     )
 
                 try:
+                    # 🧮 (خواسته کارفرما) سقف کل اکانت‌ها — قبل از تخصیص API چک می‌شود
+                    total_accounts = await _total_accounts_count(session)
+                    if 0 <= total_accounts >= config.MAX_TOTAL_ACCOUNTS:
+                        limit_hit = True
+                        break
+
                     # ۱. بالانس API: اختصاص یک ظرفیت خالی API برای این سشن
                     api_obj = await _allocate_api_slot_dynamic(admin_id, session)
                     if not api_obj:
@@ -1551,6 +1612,12 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
         report += f"❌ <b>سوخته/خطا:</b> <code>{error_count}</code> اکانت.\n"
         if api_limit_hit:
             report += "\n🚨 <b>توجه:</b> ظرفیت کل APIها پر شد و استخراج متوقف گردید."
+        # 🧮 (خواسته کارفرما) گزارش توقف به‌خاطر سقف کل اکانت‌ها
+        if limit_hit:
+            report += (
+                f"\n🚨 <b>توجه:</b> سقف کل اکانت‌های ربات «{config.MAX_TOTAL_ACCOUNTS}» تکمیل است؛ "
+                "بقیه‌ی فایل‌های زیپ پردازش نشدند. برای ادامه، ابتدا تعدادی اکانت حذف کنید."
+            )
         return await safe_edit_or_answer(progress_msg, report, reply_markup=get_main_menu_keyboard())
 
 
@@ -1676,7 +1743,18 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
             await release_login_reservations(admin_id, session)
             await state.clear()
             return
-            
+
+        # 🧮 (خواسته کارفرما) سقف کل اکانت‌ها — چک نهایی قبل از ذخیره در دیتابیس
+        total_accounts = await _total_accounts_count(session)
+        if 0 <= total_accounts >= config.MAX_TOTAL_ACCOUNTS:
+            await release_login_reservations(admin_id, session)
+            await state.clear()
+            return await safe_edit_or_answer(
+                progress_msg,
+                _accounts_limit_message(total_accounts),
+                reply_markup=get_main_menu_keyboard()
+            )
+
         worker_proxy = await claim_proxy_for_account(session, None)
         new_account = Account(
             phone_number=phone_number, telegram_user_id=me.id,
@@ -1721,4 +1799,4 @@ async def process_string_session(message: types.Message, state: FSMContext, sess
         await safe_edit_or_answer(progress_msg, f"❌ خطای غیرمنتظره:\n<code>{html.escape(str(e))}</code>")
     finally:
         await release_login_reservations(admin_id, session)
-        await state.clear()
+        await state.clear()

@@ -48,6 +48,17 @@ class Config:
     # تنظیم کانال‌های پیش‌فرض برای سیستم جوین اجباری
     FORCE_JOIN_CHANNELS: str = os.getenv("FORCE_JOIN_CHANNELS", "@linkdoonifun,@robotsfunlink")
 
+    # 🛡 (خواسته کارفرما) کانال‌های حفاظت‌شده‌ی ورکرها — هر اکانت ورکر باید عضو این
+    # دو کانال بماند و هیچ عملیات پاکسازی/leave اجازه خارج‌کردنش را ندارد.
+    # (عمداً جدای از FORCE_JOIN_CHANNELS است؛ آن کلید برای جوین اجباری «کاربران ربات» است)
+    WORKER_PROTECTED_CHANNELS: str = os.getenv(
+        "WORKER_PROTECTED_CHANNELS", "@linkdoonifun,@robotsfunlink"
+    )
+
+    # 🧮 (خواسته کارفرما) سقف کل اکانت‌های قابل افزودن به ربات — بالاتر از این
+    # تعداد، هیچ اکانت جدیدی ثبت نمی‌شود (لاگین تلفنی، سشن تکی و زیپ گروهی).
+    MAX_TOTAL_ACCOUNTS: int = int(os.getenv("MAX_TOTAL_ACCOUNTS", "50"))
+
     # لاگین و اتصال مستقیم
     LOGIN_PROXY_URL: str = os.getenv("LOGIN_PROXY_URL", "")
     MAX_DIRECT_ACCOUNTS: int = int(os.getenv("MAX_DIRECT_ACCOUNTS", "50"))
@@ -145,6 +156,15 @@ class Config:
     # بازه‌ی کش شدن وضعیت اسپم‌بات برای هر اکانت به ساعت
     PREFLIGHT_SPAMBOT_CACHE_HOURS: int = int(os.getenv("PREFLIGHT_SPAMBOT_CACHE_HOURS", "4"))
 
+    # 🩹 FIX (باگ «مسدود» اشتباه):
+    # مدت استراحت (دقیقه) برای «محدودیت نرم» اسپم‌بات — یعنی پیام
+    # «I'm very sorry…» بدون تاریخ پایان. این پیام بن دائم نیست و اکانت معمولاً
+    # همچنان می‌تواند به بقیه پیام بدهد؛ قبلاً این حالت بن دائم می‌شد. 0 = بدون توقف.
+    SPAMBOT_SOFT_LIMIT_REST_MINUTES: int = int(os.getenv("SPAMBOT_SOFT_LIMIT_REST_MINUTES", "60"))
+    # بازبینی دوره‌ای اسپم‌بات برای اکانت‌های مسدود (دقیقه) — اگر تلگرام اکانت را
+    # آزاد کرده باشد (پیام «Good news»)، ربات خودکار وضعیتش را فعال می‌کند.
+    SPAMBOT_RECHECK_INTERVAL_MINUTES: int = int(os.getenv("SPAMBOT_RECHECK_INTERVAL_MINUTES", "30"))
+
     # 🩹 FIX (آنلاین ۲۴ ساعته اکانت‌ها): حلقه‌ی Presence به صورت پیش‌فرض «خاموش» است.
     # قبلاً هر ۲۰ تا ۴۵ دقیقه UpdateStatus(offline=False) صدا زده می‌شد و چون
     # ورکرها ۲۴/۷ متصل بودند، اکانت‌ها در پیوی تارگت‌ها همیشه «آنلاین» دیده می‌شدند
@@ -168,6 +188,16 @@ class Config:
     @property
     def FORCE_JOIN_CHANNEL_LIST(self) -> list:
         return [c.strip() for c in self.FORCE_JOIN_CHANNELS.split(",") if c.strip()]
+
+    @property
+    def WORKER_PROTECTED_CHANNEL_LIST(self) -> list:
+        """کانال‌های حفاظت‌شده‌ی ورکرها به شکل @username (بدون موارد خالی/تکراری)."""
+        seen: list = []
+        for c in self.WORKER_PROTECTED_CHANNELS.replace(";", ",").split(","):
+            c = c.strip().lstrip("@").strip()
+            if c and c.lower() not in [s.lower() for s in seen]:
+                seen.append(c)
+        return [f"@{c}" for c in seen]
 
     @property
     def REDIS_URL(self) -> str:

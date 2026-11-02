@@ -205,6 +205,134 @@ async def auto_reconnect_loop(worker_pool: dict, bot: Bot) -> None:
                     if blocked_accs: logger.info(f"HealthChecker: Reactivated {len(blocked_accs)} blocked accounts (expired-recovery).")
 
             # ---------------------------------------------------------
+            # 🩹 FIX (باگ «مسدود ماندن بعد از آزاد شدن»): بازبینی دوره‌ای اسپم‌بات
+            # برای اکانت‌های مسدود/بن‌شده‌ای که کلاینتِ زنده دارند. قبلاً اگر تلگرام
+            # اکانت را آزاد می‌کرد (پیام «Good news… no limits»)، هیچ‌چیز وضعیت
+            # «مسدود» را پاک نمی‌کرد و اکانت تا سرسقف جریمه — یا با is_banned=True
+            # برای همیشه — مسدود نمایش داده می‌شد. اینجا هر چرخه (هر ۵ دقیقه)
+            # حداکثر چند اکانتِ مشروط، با فاصله‌ی زمانی قابل تنظیم، با @SpamBot
+            # چک می‌شوند و در صورت آزادی بلافاصله به چرخه ارسال برمی‌گردند.
+            # ---------------------------------------------------------
+            try:
+                from sqlalchemy import or_ as _sql_or
+                from database.models import AccountStatus, WorkerEvent
+                from utils.advanced_anti_ban import check_spambot_status
+                from utils.limit_handler import _apply_spambot_soft_limit, _soft_limit_rest_minutes
+
+                recheck_interval_min = max(5, int(getattr(config, "SPAMBOT_RECHECK_INTERVAL_MINUTES", 30)))
+                max_checks_per_cycle = 3
+
+                _now_rc = datetime.now(timezone.utc)
+                async with async_session() as db_session:
+                    stmt_suspects = select(Account).where(
+                        _sql_or(
+                            Account.status == AccountStatus.blocked,
+                            Account.is_banned == True,
+                        ),
+                        Account.status != AccountStatus.disabled,
+                    )
+                    suspects = (await db_session.scalars(stmt_suspects)).all()
+
+                    candidates = []
+                    for acc in suspects:
+                        client_rc = worker_pool.get(acc.id)
+                        if client_rc is None or not getattr(client_rc, "is_connected", False):
+                            continue
+                        last_rc = acc.spambot_checked_at
+                        if last_rc and last_rc.tzinfo is None:
+                            last_rc = last_rc.replace(tzinfo=timezone.utc)
+                        if last_rc and (_now_rc - last_rc).total_seconds() < recheck_interval_min * 60:
+                            continue
+                        candidates.append(acc)
+                        if len(candidates) >= max_checks_per_cycle:
+                            break
+
+                    for acc in candidates:
+                        client_rc = worker_pool.get(acc.id)
+                        tag_rc = f"user_{acc.id}/"
+                        try:
+                            st_rc = await check_spambot_status(client_rc, acc.id)
+                        except Exception as e:
+                            logger.warning(f"Spambot recheck failed for {tag_rc}: {e}")
+                            continue
+                        if st_rc is None:
+                            continue
+
+                        try:
+                            if not st_rc.get("restricted"):
+                                # 🟢 تلگرام اکانت را آزاد کرده («Good news…») — بازگشت فوری
+                                old_val = acc.status
+                                old_status_rc = old_val.value if hasattr(old_val, "value") else str(old_val)
+                                await db_session.execute(
+                                    update(Account).where(Account.id == acc.id).values(
+                                        status=AccountStatus.active.value,
+                                        status_reason="SpamBot clear (auto re-check)",
+                                        is_banned=False,
+                                        restricted_until=None,
+                                        flood_wait_until=None,
+                                        last_limit_type=None,
+                                        expected_return_time=None,
+                                        consecutive_errors=0,
+                                        spambot_report=(st_rc.get("text") or ""),
+                                        spambot_checked_at=datetime.now(timezone.utc),
+                                    )
+                                )
+                                db_session.add(WorkerEvent(
+                                    account_id=acc.id, old_status=old_status_rc,
+                                    new_status=AccountStatus.active.value,
+                                    reason="spambot-clear-auto",
+                                ))
+                                await db_session.commit()
+                                await notify_admins(
+                                    bot,
+                                    "✅ <b>رفع خودکار مسدودی اکانت</b>\n\n"
+                                    f"اکانت <code>{tag_rc}</code> توسط تلگرام آزاد شده بود "
+                                    "(پیام «Good news» از @SpamBot دریافت شد) و همین حالا به چرخه ارسال بازگشت."
+                                )
+                                logger.info(f"HealthChecker: auto-unblocked {tag_rc} (spambot clear).")
+                            elif st_rc.get("until"):
+                                # 🟠 محدودیت با تاریخ پایان مشخص — همگام‌سازی تاریخ‌ها
+                                await db_session.execute(
+                                    update(Account).where(Account.id == acc.id).values(
+                                        restricted_until=st_rc["until"],
+                                        flood_wait_until=st_rc["until"],
+                                        is_banned=False,
+                                        spambot_report=(st_rc.get("text") or ""),
+                                        spambot_checked_at=datetime.now(timezone.utc),
+                                    )
+                                )
+                                await db_session.commit()
+                            else:
+                                # 🟡 محدودیت نرمِ بدون تاریخ (پیام «I'm very sorry…») —
+                                # استراحت کوتاه به‌جای مسدودی؛ اکانت خودکار برمی‌گردد.
+                                await db_session.execute(
+                                    update(Account).where(Account.id == acc.id).values(
+                                        spambot_report=(st_rc.get("text") or ""),
+                                        spambot_checked_at=datetime.now(timezone.utc),
+                                    )
+                                )
+                                await db_session.commit()
+                                soft_rc = _soft_limit_rest_minutes()
+                                if soft_rc > 0:
+                                    await _apply_spambot_soft_limit(db_session, acc.id, soft_rc, st_rc.get("text") or "")
+                                    await notify_admins(
+                                        bot,
+                                        "ℹ️ <b>محدودیت نرم اسپم‌بات</b>\n\n"
+                                        f"اکانت <code>{tag_rc}</code> پیام محدودیت بدون تاریخ گرفت. "
+                                        f"به‌جای مسدودی، {soft_rc} دقیقه استراحت کرد و خودکار به چرخه برمی‌گردد."
+                                    )
+                        except Exception as e:
+                            logger.warning(f"Spambot recheck DB update failed for {tag_rc}: {e}")
+                            try:
+                                await db_session.rollback()
+                            except Exception:
+                                pass
+
+                        await asyncio.sleep(1.0)
+            except Exception as _spambot_recheck_err:
+                logger.warning(f"Spambot periodic recheck section failed: {_spambot_recheck_err}")
+
+            # ---------------------------------------------------------
             # بخش ۱: restart ورکرهای قطعیِ موجود در استخر
             # ---------------------------------------------------------
             disconnected_ids = [
