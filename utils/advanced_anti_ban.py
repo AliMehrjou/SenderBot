@@ -24,6 +24,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 PHOTO_ROTATION_SEMAPHORE = asyncio.Semaphore(2)
 
+# 🩹 FIX (photo-race): قفل انحصاری به ازای هر «اکانت» — جلوی اجرای همزمانِ
+# دو چرخش عکس (rotate) یا چرخش + پاک‌سازی (clear) روی یک اکانت را می‌گیرد.
+# بدون این قفل، دو تسک همزمان روی یک پروفایل، عکس‌های همدیگر را پاک/تکرار می‌کنند
+# و نتیجه‌ی نهایی گالری (۱ یا ۵ عکس به‌جای ۳) غیرقطعی می‌شود.
+_PHOTO_ACCOUNT_LOCKS = {}
+
+
+def get_photo_account_lock(account_id):
+    """قفل سراسری عکس‌پروفایلِ یک اکانت (بین session_manager و این ماژول مشترک است)."""
+    lock = _PHOTO_ACCOUNT_LOCKS.get(account_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PHOTO_ACCOUNT_LOCKS[account_id] = lock
+    return lock
+
 import json
 
 # مسیردهی جدید: پیدا کردن پوشه json_files در کنار پوشه utils
@@ -109,77 +124,113 @@ async def randomize_profile(
         logger.debug(f"Worker user_{account_id}/ failed to randomize profile: {e}")
 
 
-async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage") -> None:
+async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage", account_id=None) -> bool:
     """
     🖼 پکیج‌های عکس پروفایل — جایگزینی قطعی عکس‌های پروفایل.
     استراتژی: حذف تهاجمی تمام عکس‌های فعلی -> آپلود عکس‌های جدید به صورت معکوس
+
+    🩹 FIX (photo-race + silent-failure):
+      • قفل per-account: چرخش‌های همزمان روی یک اکانت دیگر باعث خرابی گالری نمی‌شوند.
+        اگر account_id پاس نشود، از الگوی نامِ ورکر (worker_acc_N) استخراج می‌شود تا
+        همان قفلی که clear_profile_photos_now می‌گیرد، اینجا هم گرفته شود.
+      • خطاهای آپلود دیگر «بی‌صدا» نیستند؛ با ERROR لاگ می‌شوند و خروجی False است.
+      • راستی‌آزمایی با «کلِ» عکس‌های پکیج مقایسه می‌شود (نه فقط فایل‌های موجودِ روی دیسک)
+        تا نبودِ فایل عکس ۲/۳ دیگر حالتِ موفقِ کاذب نسازد.
     """
     if not package or not package.photos:
-        return
+        return False
 
     from pyrogram.errors import FloodWait
     import asyncio
 
+    lock_key = account_id
+    if lock_key is None:
+        _m = re.search(r"worker_acc_(\d+)", str(getattr(client, "name", "") or ""))
+        lock_key = int(_m.group(1)) if _m else str(getattr(client, "name", "?"))
+
     async with PHOTO_ROTATION_SEMAPHORE:
-        # --- مرحله ۱: حذف تهاجمی و قطعی تمام عکس‌های قدیمی ---
-        deleted_count = 0
-        try:
-            while True:
-                old_photos = [p async for p in client.get_chat_photos("me", limit=5)]
-                if not old_photos:
-                    break
-                for photo in old_photos:
-                    try:
-                        await client.delete_profile_photos([photo.file_id])
-                        deleted_count += 1
-                        await asyncio.sleep(1.5)
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value + 1)
+        async with get_photo_account_lock(lock_key):
+            # --- مرحله ۱: حذف تهاجمی و قطعی تمام عکس‌های قدیمی ---
+            deleted_count = 0
+            try:
+                while True:
+                    old_photos = [p async for p in client.get_chat_photos("me", limit=5)]
+                    if not old_photos:
+                        break
+                    for photo in old_photos:
                         try:
                             await client.delete_profile_photos([photo.file_id])
                             deleted_count += 1
+                            await asyncio.sleep(1.5)
+                        except FloodWait as e:
+                            await asyncio.sleep(e.value + 1)
+                            try:
+                                await client.delete_profile_photos([photo.file_id])
+                                deleted_count += 1
+                            except Exception:
+                                pass
                         except Exception:
                             pass
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.warning(f"Worker {client.name}: error during aggressive old photo wipe: {e}")
-            
-        if deleted_count > 0:
-            logger.info(f"Worker {client.name}: {deleted_count} old profile photo(s) wiped completely.")
+            except Exception as e:
+                logger.warning(f"Worker {client.name}: error during aggressive old photo wipe: {e}")
 
-        # --- مرحله ۲: آپلود عکس‌های جدید به صورت معکوس (عکس اول، آواتار اصلی بماند) ---
-        successful_uploads = 0
-        sorted_photos = sorted(package.photos, key=lambda p: getattr(p, "position", 0), reverse=True)
-        
-        for photo in sorted_photos:
-            if not os.path.exists(photo.file_path):
-                continue
+            if deleted_count > 0:
+                logger.info(f"Worker {client.name}: {deleted_count} old profile photo(s) wiped completely.")
 
-            for attempt in range(2):
-                try:
-                    await client.set_profile_photo(photo=photo.file_path)
-                    successful_uploads += 1
-                    break
-                except FloodWait as e:
-                    logger.warning(f"Worker {client.name}: hit FloodWait ({e.value}s) during photo upload. Retrying...")
-                    await asyncio.sleep(e.value + 1)
-                except Exception:
-                    break
-            
-            await asyncio.sleep(random.uniform(5, 9))
+            # --- مرحله ۲: آپلود عکس‌های جدید به صورت معکوس (عکس اول، آواتار اصلی بماند) ---
+            successful_uploads = 0
+            failed_uploads = []
+            missing_files = []
+            sorted_photos = sorted(package.photos, key=lambda p: getattr(p, "position", 0), reverse=True)
 
-        # --- مرحله ۳: راستی‌آزمایی ---
-        try:
-            final_photos = [p async for p in client.get_chat_photos("me")]
-            expected_count = len([p for p in package.photos if os.path.exists(p.file_path)])
-            
-            if len(final_photos) >= expected_count:
-                logger.info(f"Worker {client.name}: profile photo rotation verified successfully.")
-            else:
-                logger.warning(f"Worker {client.name}: rotation incomplete. Expected {expected_count}, found {len(final_photos)}.")
-        except Exception:
-            pass
+            for photo in sorted_photos:
+                if not os.path.exists(photo.file_path):
+                    missing_files.append(photo.file_path)
+                    logger.error(
+                        f"Worker {client.name}: package photo file MISSING on disk: {photo.file_path} "
+                        f"(package={getattr(package, 'id', '?')} position={getattr(photo, 'position', '?')}) — skipped"
+                    )
+                    continue
+
+                uploaded = False
+                # 🩹 FIX: قبلاً فقط ۲ تلاش بود و هر Exception دیگری «بی‌صدا» قورت داده می‌شد؛
+                # الان ۳ تلاش با لاگ ERROR انجام می‌شود.
+                for attempt in range(3):
+                    try:
+                        await client.set_profile_photo(photo=photo.file_path)
+                        successful_uploads += 1
+                        uploaded = True
+                        break
+                    except FloodWait as e:
+                        logger.warning(f"Worker {client.name}: hit FloodWait ({e.value}s) during photo upload. Retrying...")
+                        await asyncio.sleep(e.value + 1)
+                    except Exception as e:
+                        logger.error(
+                            f"Worker {client.name}: set_profile_photo FAILED for "
+                            f"{photo.file_path} (attempt {attempt + 1}/3): {e}"
+                        )
+                if not uploaded:
+                    failed_uploads.append(photo.file_path)
+
+                await asyncio.sleep(random.uniform(5, 9))
+
+            # --- مرحله ۳: راستی‌آزمایی (در برابر «کل» عکس‌های پکیج) ---
+            expected_count = len(package.photos)
+            try:
+                final_photos = [p async for p in client.get_chat_photos("me")]
+
+                if len(final_photos) >= expected_count and not failed_uploads and not missing_files:
+                    logger.info(f"Worker {client.name}: profile photo rotation verified successfully.")
+                    return True
+
+                logger.error(
+                    f"Worker {client.name}: profile photo rotation INCOMPLETE — "
+                    f"expected {expected_count}, found {len(final_photos)} on Telegram; "
+                    f"failed_uploads={failed_uploads}; missing_files={missing_files}"
+                )
+                return False
+            except Exception:
+                return False
 
 
 

@@ -67,6 +67,10 @@ logger = logging.getLogger(__name__)
 # (جلوگیری از اسپم پیام هشدار به ادمین در هر سیکل دیسپچ؛ فقط یک‌بار در طول عمر پروسه)
 _banner_warned_orders: set = set()
 
+# 🛑 ANTI-CHAIN-BAN: throttle لاگِ فریز موج بن (جلوگیری از لاگِ تکراری در هر
+# سیکلِ دیسپچرِ قطع‌شده؛ فقط وقتی «ثانیه‌ی باقی‌مانده» تغییر کرد دوباره لاگ می‌شود)
+_banwave_logged = type("BanWaveLogThrottle", (), {"last_rem": -1})()
+
 # ==========================================
 # 🟢 فاز ۴: کش عضویت ورکر در کانال‌های مبدا — برای اولویت‌دهی در dispatch
 # کلید: src_member:{account_id}:{source_channel_id} = "1" با TTL 24 ساعت
@@ -2156,6 +2160,55 @@ async def background_order_execution(
                                 order.status = OrderStatus.on_hold_proxy
                         break
 
+            # ==========================================
+            # 🛑 ANTI-CHAIN-BAN (مهم‌ترین فیکس این نسخه):
+            # سوییچ فوریِ ورکر بعد از بن واقعی/PeerFlood ممنوع شد.
+            # قبلاً: ورکر ۱ بن می‌شد → بلافاصله تارگت‌ها به ورکر ۲ سپرده می‌شد
+            # (که احتمالاً روی همان پروکسی/IP سوخته بود) → بن → ورکر ۳ → …
+            # این دقیقاً همان «بن زنجیره‌ای» بود که ناوگان را نابود کرد.
+            # حالا: سفارش به‌مدت BAN_FAILOVER_COOLDOWN_MINUTES خنک می‌شود؛
+            # تارگت‌های ارسال‌نشده توسط _finalize_chunk به صف برمی‌گردند و
+            # دیسپچر بعد از استراحت، با ورکر/پروکسی تازه ادامه می‌دهد.
+            # (فریز سراسری موج بن هم در صورت تشخیص موج، روی همین بازه اضافه می‌شود.)
+            # BAN_FAILOVER_COOLDOWN_MINUTES=0 → رفتار قدیمی (بازگردانی فوری به صف).
+            # ==========================================
+            # «account_banned» هم شامل می‌شود: وقتی preflight بگوید اکانت از قبل بن
+            # است، یعنی بن در فاصله‌ی دیسپچ تا اجرا رخ داده (زنجیره در جریان!) یا
+            # ورکر stale است — در هر دو حالت ادامه‌ی فوری، زنجیره را کامل می‌کند.
+            if not _is_extract_order(order) and stop_reason in ("blocked", "banned", "account_banned") and unsent_targets:
+                try:
+                    cooldown_minutes = max(0, int(getattr(config, "BAN_FAILOVER_COOLDOWN_MINUTES", 30)))
+                    resume_at = datetime.now(timezone.utc) + timedelta(minutes=cooldown_minutes)
+                    async with session_maker() as session:
+                        db_order = await session.get(Order, order_id)
+                        if db_order and db_order.status == OrderStatus.running:
+                            db_order.scheduled_for = resume_at
+                            session.add(OrderLog(
+                                order_id=order_id,
+                                target="System",
+                                status="error",
+                                error_message=(
+                                    f"ورکر user_{primary_id}/ مسدود شد ({stop_reason}). "
+                                    f"جلوگیری از بن زنجیره‌ای: ادامه‌ی سفارش {cooldown_minutes} دقیقه "
+                                    f"به تعویق افتاد؛ {len(unsent_targets)} تارگت ارسال‌نشده به صف برگشت."
+                                ),
+                            ))
+                            await session.commit()
+                    if reporter := _progress_reporters.get(f"order:{order_id}"):
+                        await reporter.update(
+                            status=(
+                                f"⛔️ ورکر user_{primary_id}/ مسدود شد. برای جلوگیری از بن زنجیره‌ای، "
+                                f"ادامه‌ی سفارش {cooldown_minutes} دقیقه دیگر با ورکر تازه از سر گرفته می‌شود…"
+                            )
+                        )
+                    logger.warning(
+                        f"Order #{order_id}: anti-chain-ban cooldown — worker user_{primary_id}/ hit "
+                        f"'{stop_reason}'; order paused {cooldown_minutes} min instead of instant failover."
+                    )
+                except Exception as acb_err:
+                    logger.error(f"Anti-chain-ban cooldown failed for Order #{order_id}: {acb_err}")
+                break
+
             # 🔴 سوییچ فوری روی لیمیت ورکر (Immediate Limit Failover)
             limit_reasons = (
                 "flood_wait", "blocked", "banned", "consecutive_errors", 
@@ -3025,7 +3078,9 @@ async def order_dispatcher_loop(
                         select(Proxy.id).where(
                             Proxy.is_active == True, 
                             Proxy.health_state.in_(health_states), 
-                            Proxy.in_use < max(1, getattr(config, 'MAX_ACCOUNTS_PER_PROXY', 100))
+                            # 🛑 ANTI-CHAIN-BAN: fallback عددی ۱۰۰ حذف شد — همیشه از
+                            # config واقعی خوانده می‌شود تا سقف جدید (۳) اینجا هم اعمال شود.
+                            Proxy.in_use < max(1, int(getattr(config, 'MAX_ACCOUNTS_PER_PROXY', 3)))
                         ).limit(1)
                     )
                     if has_capable_proxy:
@@ -3172,6 +3227,28 @@ async def order_dispatcher_loop(
             logger.debug("Dispatcher: global slowdown active - skipping dispatch cycle.")
             await asyncio.sleep(max(1.0, float(getattr(config, "DISPATCH_INTERVAL_SECONDS", 2.0))))
             continue
+
+        # 🛑 ANTI-CHAIN-BAN (فاز جدید): فریز موج بن — اگر در پنجره‌ی زمانی کوتاه
+        # آستانه‌ی بن‌های واقعی/PeerFlood عبور شده باشد (utils/ban_wave.py)، کل
+        # دیسپچِ chunkهای جدید متوقف می‌ماند تا زنجیره‌ی بن قطع شود. برخلاف
+        # global slowdown (که فقط سرعت را کم می‌کند)، اینجا dispatch کامل skip
+        # می‌شود؛ سفارش‌های در حال اجرا طبیعی ادامه می‌یابند و بعد از فریز،
+        # سیستم با سرعت safe از سر گرفته می‌شود.
+        try:
+            from utils.ban_wave import is_banwave_freeze_active, banwave_freeze_remaining_seconds
+            if await is_banwave_freeze_active():
+                remaining_s = await banwave_freeze_remaining_seconds()
+                if remaining_s > 0 and getattr(_banwave_logged, "last_rem", -1) != remaining_s:
+                    logger.warning(
+                        f"Ban-wave freeze ACTIVE ({remaining_s}s remaining) — new dispatch paused."
+                    )
+                    _banwave_logged.last_rem = remaining_s
+                await asyncio.sleep(min(60.0, max(2.0, float(remaining_s or 60))))
+                continue
+            else:
+                _banwave_logged.last_rem = -1
+        except Exception as banwave_err:
+            logger.debug(f"Ban-wave freeze check failed (fail-open): {banwave_err}")
 
         _batch_seen_order_ids: set = set()
         active_pending_orders_this_cycle = set()

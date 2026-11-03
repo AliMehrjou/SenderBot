@@ -1370,7 +1370,15 @@ async def execute_bulk_send(
             await change_account_status(session, account_db_id, AccountStatus.blocked, "Spam Limit (PeerFlood)", log_msg)
             
             await session.commit()
-            await _report(status="🚫 محدودیت اسپم (PeerFlood) — توقف ارسال و مسدود شدن اکانت…", account=account_tag)
+            # 🛑 ANTI-CHAIN-BAN: نمایش پروکسی لحظه‌ی اسپم‌شدن (فورنزیک برای ادمین)
+            _pf_proxy = (account_row.proxy_string if account_row else None) or "دایرکت"
+            await _report(
+                status=(
+                    f"🚫 محدودیت اسپم (PeerFlood) — توقف ارسال و مسدود شدن اکانت…\n"
+                    f"🔗 پروکسی لحظه‌ی رخداد: {_pf_proxy}"
+                ),
+                account=account_tag,
+            )
             
             from utils.limit_handler import register_account_limit
             await register_account_limit(session, account_db_id, client, "peer_flood")
@@ -1390,7 +1398,10 @@ async def execute_bulk_send(
         except (UserDeactivated, AuthKeyUnregistered, Unauthorized) as e:
             err_type = e.__class__.__name__
             log_status = "partial" if stage_1_delivered else "error"
-            log_msg = _log_attempt(log_status, err_type, str(e)[:100])
+            # 🛑 ANTI-CHAIN-BAN: پروکسی لحظه‌ی بن در لاگ سفارش ثبت می‌شود تا بعداً
+            # دقیقاً مشخص باشد بن روی کدام پروکسی/IP رخ داده (پاسخ سؤال «کدام پروکسی؟»)
+            _ban_proxy = (account_row.proxy_string if account_row else None) or "دایرکت (بدون پروکسی)"
+            log_msg = _log_attempt(log_status, err_type, f"{str(e)[:100]} | proxy={_ban_proxy}")
             
             session.add(OrderLog(
                 order_id=order.id, account_id=account_db_id, target=target, 
@@ -1402,12 +1413,20 @@ async def execute_bulk_send(
             await change_account_status(session, account_db_id, AccountStatus.blocked, "Account Banned or Unregistered", str(e)[:100])
             
             await session.commit()
-            await _report(status="⛔️ اکانت بن یا از دسترس خارج شد!", account=account_tag)
+            await _report(
+                status=(
+                    f"⛔️ اکانت بن یا از دسترس خارج شد!\n"
+                    f"🔗 پروکسی لحظه‌ی بن: {_ban_proxy}"
+                ),
+                account=account_tag,
+            )
             
             from utils.limit_handler import register_account_limit
             await register_account_limit(session, account_db_id, client, "banned", is_banned=True)
             
-            stop_reason = "blocked"
+            # 🛑 ANTI-CHAIN-BAN: stop_reason واقعی بن «banned» است (نه «blocked» عمومی)
+            # تا task_queue بداند این بن واقعی است و بلافاصله به ورکر بعدی سوییچ نکند.
+            stop_reason = "banned"
             if stage_1_delivered:
                 unsent.extend(targets[position+1:])
                 sent_in_chunk += 1

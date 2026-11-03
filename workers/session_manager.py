@@ -189,28 +189,41 @@ def parse_proxy_string(proxy_string: str) -> Optional[dict]:
         return None
 
 async def clear_profile_photos_now(account_id: int) -> bool:
-    """بک‌گراند تسک با حلقه تهاجمی برای پاک کردن قطعی تمام عکس‌های پروفایل"""
+    """بک‌گراند تسک با حلقه تهاجمی برای پاک کردن قطعی تمام عکس‌های پروفایل
+
+    🩹 FIX (clear-race + silent-failure):
+      • قفل per-account (مشترک با rotate_profile_photos): پاک‌سازی دیگر نمی‌تواند
+        با چرخشِ در جریانِ همان اکانت قاطی شود.
+      • اگر ورکر متصل نباشد، دیگر «بی‌صدا» نیست؛ WARNING لاگ می‌شود.
+    """
     client = worker_pool.get(account_id)
     if not client or not client.is_connected:
+        logger.warning(
+            f"clear_profile_photos_now({account_id}): SKIPPED — worker not in pool / not connected. "
+            "Telegram profile photos were NOT touched."
+        )
         return False
-        
+
     import asyncio
+    from utils.advanced_anti_ban import get_photo_account_lock
+
     try:
         deleted_count = 0
-        while True:
-            # در هر دور فقط ۵ عکس می‌گیریم و پاک می‌کنیم تا آیدی‌ها منقضی نشوند
-            photos = [p async for p in client.get_chat_photos("me", limit=5)]
-            if not photos:
-                break
-                
-            for photo in photos:
-                try:
-                    await client.delete_profile_photos([photo.file_id])
-                    deleted_count += 1
-                    await asyncio.sleep(1.5)
-                except Exception as e:
-                    logger.warning(f"Worker {client.name}: failed to delete a photo: {e}")
-                    
+        async with get_photo_account_lock(account_id):
+            while True:
+                # در هر دور فقط ۵ عکس می‌گیریم و پاک می‌کنیم تا آیدی‌ها منقضی نشوند
+                photos = [p async for p in client.get_chat_photos("me", limit=5)]
+                if not photos:
+                    break
+
+                for photo in photos:
+                    try:
+                        await client.delete_profile_photos([photo.file_id])
+                        deleted_count += 1
+                        await asyncio.sleep(1.5)
+                    except Exception as e:
+                        logger.warning(f"Worker {client.name}: failed to delete a photo: {e}")
+
         logger.info(f"Worker {client.name}: {deleted_count} profile photos aggressively cleared.")
         return True
     except Exception as e:
@@ -274,7 +287,16 @@ async def release_proxy_slot(session: AsyncSession, proxy_string: str, account_i
     # 🔄 فاز ۵: اعمال Cooldown برای پروکسیِ تازه رهاشده تا مدتی کاندید نشود
     try:
         from workers.sender import _get_redis
-        await _get_redis().set(f"proxy_cd:{proxy_string}", "1", ex=getattr(config, "ROTATE_COOLDOWN_SECONDS", 300))
+        _redis_cli = _get_redis()
+        _cd_key = f"proxy_cd:{proxy_string}"
+        _rot_cd = int(getattr(config, "ROTATE_COOLDOWN_SECONDS", 300) or 300)
+        # 🛑 ANTI-CHAIN-BAN: اگر cooldown بلندتری (قرنطینه‌ی پروکسی سوخته /
+        # فاصله‌گذاری بعد از بن) از قبل روی این پروکسی فعال است، بازنویسی با
+        # cooldown کوتاهِ چرخشِ عادی ممنوع است — وگرنه اکانتِ بن‌شده وقتی اسلاتش
+        # آزاد می‌شود، عملاً قرنطینه را خنثی می‌کند.
+        _existing_ttl = await _redis_cli.ttl(_cd_key)
+        if not (_existing_ttl is not None and _existing_ttl > _rot_cd):
+            await _redis_cli.set(_cd_key, "1", ex=_rot_cd)
     except Exception as e:
         logger.debug(f"Failed to set proxy cooldown for {proxy_string}: {e}")
 
@@ -852,37 +874,60 @@ async def _get_photo_package_for_account(
         return None
 
 
-async def _safe_rotate_profile_photos(client: Client, package: ProfilePhotoPackage) -> None:
+async def _safe_rotate_profile_photos(
+    client: Client, package: ProfilePhotoPackage, account_id: Optional[int] = None
+) -> bool:
     """
     try/except جداگانه مطابق الزام: شکست چرخش عکس پروفایل نباید روی آپدیت
     نام/بیو (تسک randomize_profile) اثر بگذارد. خطاهای درون‌گام نیز داخل خود
     rotate_profile_photos مهار می‌شوند؛ این لایه فقط گارد نهایی تسک است.
+    🩹 FIX: نتیجه‌ی چرخش (True/False) برگردانده می‌شود تا فراخواننده بتواند گزارش بدهد.
     """
     try:
-        await rotate_profile_photos(client, package)
+        return await rotate_profile_photos(client, package, account_id=account_id)
     except Exception as e:
         logger.warning(f"Worker {client.name}: profile photo rotation failed: {e}")
+        return False
 
 
 async def apply_photo_package_now(account_id: int) -> bool:
     """B13: اعمال فوری پکیج عکسِ فعلیِ اکانت روی ورکرِ متصل.
     فقط وقتی auto_set_photo روشن باشد، ورکر متصل باشد و پکیجی متصل شده باشد.
-    True یعنی همین حالا اعمال شد."""
+    True یعنی همین حالا اعمال شد.
+
+    🩹 FIX: خروجیِ واقعیِ چرخش برگردانده می‌شود و شکست‌ها لاگ می‌شوند
+    (قبلاً حتی وقتی آپلود عکس ۲/۳ شکست می‌خورد، True برمی‌گشت).
+    """
     client = worker_pool.get(account_id)
     if not client or not client.is_connected:
+        logger.warning(
+            f"apply_photo_package_now({account_id}): SKIPPED — worker not in pool / not connected."
+        )
         return False
-        
+
     async with async_session() as session:
         global_settings = await session.scalar(select(GlobalSettings).limit(1))
         if not global_settings or not getattr(global_settings, "auto_set_photo", False):
+            logger.warning(
+                f"apply_photo_package_now({account_id}): SKIPPED — auto_set_photo is OFF in GlobalSettings."
+            )
             return False
-            
+
         photo_package = await _get_photo_package_for_account(session, account_id)
         if not photo_package or not photo_package.photos:
+            logger.warning(
+                f"apply_photo_package_now({account_id}): SKIPPED — no photo package attached "
+                "or package has no photos."
+            )
             return False
-            
-        await _safe_rotate_profile_photos(client, photo_package)
-        return True
+
+        result = await _safe_rotate_profile_photos(client, photo_package, account_id=account_id)
+        if not result:
+            logger.error(
+                f"apply_photo_package_now({account_id}): photo rotation did NOT complete cleanly "
+                "(see previous log lines for the reason)."
+            )
+        return result
 
 
 # ==========================================
@@ -1285,13 +1330,13 @@ async def start_worker_with_rotation(
                 photo_package = await _get_photo_package_for_account(session, account_id)
                 if photo_package and photo_package.photos:
                     task_photo = asyncio.create_task(
-                        _safe_rotate_profile_photos(client, photo_package)
+                        _safe_rotate_profile_photos(client, photo_package, account_id=account_id)
                     )
                     _background_tasks.add(task_photo)
                     task_photo.add_done_callback(_background_tasks.discard)
-                    
+
             return True
-            
+
         except AuthKeyUnregistered as e:
             # باگ ۲: ابتدا چک می‌کنیم که آیا پروکسی در دسترس است؟
             new_proxy_str = await claim_proxy_for_account(session, account_id)
@@ -1696,7 +1741,7 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
             photo_package = await _get_photo_package_for_account(session, account.id)
             if photo_package and photo_package.photos:
                 task_photo = asyncio.create_task(
-                    _safe_rotate_profile_photos(client, photo_package)
+                    _safe_rotate_profile_photos(client, photo_package, account_id=account.id)
                 )
                 _background_tasks.add(task_photo)
                 task_photo.add_done_callback(_background_tasks.discard)

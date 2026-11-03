@@ -281,6 +281,12 @@ async def main() -> None:
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=storage)
+
+    # 🛑 ANTI-CHAIN-BAN: ثبت instance بات برای هشدارهای «گارد موج بن»
+    # (utils/ban_wave.py — فریز دیسپچر، قرنطینه‌ی پروکسی سوخته، فورنزیک بن).
+    # بدون این، هشدارها فقط در لاگ سرور می‌مانند.
+    from utils.ban_wave import set_admin_bot
+    set_admin_bot(bot)
     
 # اصلاح باگ ۳: ثبت هندلر خطای سراسری جهت جلوگیری از بی‌پاسخ ماندن و کرش ربات
     

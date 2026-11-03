@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 from pyrogram import Client
 from sqlalchemy import update, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,7 +31,34 @@ async def register_account_limit(
     from database.engine import async_session  # وارد کردن در سطح تابع برای اطمینان
     account_tag = f"user_{account_id}/"
     error_msg = ""
-    
+
+    # ==========================================
+    # 🛑 ANTI-CHAIN-BAN: ثبت رویداد در گارد موج بن (utils/ban_wave.py)
+    # این تابع نقطه‌ی ترددِ واحدِ همه‌ی بن‌ها/PeerFloodهاست — ثبت رویداد در
+    # همین‌جا انجام می‌شود تا هیچ مسیر بنی از گارد خارج نماند.
+    # گارد: فورنزیک پروکسیِ لحظه‌ی بن + شمارنده‌ی موج + قرنطینه‌ی پروکسی سوخته
+    # + فریز سراسری دیسپچر در صورت تشخیص موج بن. fail-open: خطا، جریمه اصلی را نمی‌شکند.
+    # ==========================================
+    _ban_proxy_string: Optional[str] = None
+    try:
+        async with async_session() as bw_session:
+            _ban_proxy_string = await bw_session.scalar(
+                select(Account.proxy_string).where(Account.id == account_id)
+            )
+    except Exception as e:
+        logger.warning(f"ban_wave proxy fetch failed for {account_tag} (fail-open): {e}")
+
+    if is_banned or limit_type in ("banned", "peer_flood"):
+        try:
+            from utils import ban_wave
+            await ban_wave.register_ban_event(
+                account_id=account_id,
+                proxy_string=_ban_proxy_string,
+                event_type="peer_flood" if limit_type == "peer_flood" else "ban",
+            )
+        except Exception as e:
+            logger.warning(f"ban_wave register_ban_event failed for {account_tag} (fail-open): {e}")
+
     # --- گرفتن تنظیمات جهانی با سشن مستقل ---
     try:
         async with async_session() as indep_session:

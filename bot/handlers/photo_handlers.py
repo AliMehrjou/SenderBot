@@ -644,6 +644,53 @@ async def choose_package_for_account(callback: types.CallbackQuery) -> None:
 # ==========================================
 # 🔗 ASSIGN PACKAGE TO SPECIFIC ACCOUNT (تخصیص دستی)
 # ==========================================
+
+async def _apply_and_report(acc_id: int, message: types.Message) -> bool:
+    """اعمال پکیج در پس‌زمینه + گزارش نتیجه‌ی واقعی به ادمین.
+    🩹 FIX: قبلاً همیشه «✅ در حال اعمال در پس‌زمینه» گفته می‌شد، حتی وقتی
+    ورکر قطع بود / سوییچ خاموش بود / آپلود شکست می‌خورد و فقط ۱ عکس می‌نشست."""
+    try:
+        from workers.session_manager import apply_photo_package_now
+        ok = await apply_photo_package_now(acc_id)
+    except Exception as e:
+        logger.error(f"apply_photo_package_now crashed for account {acc_id}: {e}")
+        ok = False
+    if not ok:
+        try:
+            await message.answer(
+                f"⚠️ <b>اعمال عکس‌های پکیج روی اکانت <code>{acc_id}</code> انجام نشد.</b>\n\n"
+                "علت‌های رایج:\n"
+                "  • ورکرِ این اکانت متصل نیست\n"
+                "  • سوییچ «🖼 عکس خودکار» (auto_set_photo) خاموش است\n"
+                "  • فایل‌های پکیج روی دیسک موجود نیستند\n"
+                "  • تلگرام آپلود را قبول نکرد (FloodWait/MediaInvalid)\n\n"
+                "<i>جزئیات در لاگ سرور ثبت شده است.</i>"
+            )
+        except Exception:
+            pass
+    return ok
+
+
+async def _clear_and_report(acc_id: int, message: types.Message) -> bool:
+    """پاک‌سازی عکس‌های پروفایل تلگرام در پس‌زمینه + گزارش نتیجه‌ی واقعی."""
+    try:
+        from workers.session_manager import clear_profile_photos_now
+        ok = await clear_profile_photos_now(acc_id)
+    except Exception as e:
+        logger.error(f"clear_profile_photos_now crashed for account {acc_id}: {e}")
+        ok = False
+    if not ok:
+        try:
+            await message.answer(
+                f"⚠️ <b>عکس‌های پروفایل تلگرامِ اکانت <code>{acc_id}</code> پاک نشد</b> "
+                "(ورکر متصل نیست یا خطای API). تخصیص از دیتابیس حذف شده است ولی عکس‌های فعلی"
+                " روی پروفایل باقی می‌مانند. جزئیات در لاگ سرور."
+            )
+        except Exception:
+            pass
+    return ok
+
+
 @router.callback_query(F.data.startswith("photo_pkg_set:"), IsAdmin())
 async def set_package_for_account(callback: types.CallbackQuery) -> None:
     await callback.answer()
@@ -676,18 +723,18 @@ async def set_package_for_account(callback: types.CallbackQuery) -> None:
         logger.error(f"DB Error in set_package_for_account: {e}")
         return await report_db_error(callback, e)
 
-    # ۳. اجرای فرآیند تغییر عکس‌ها در پس‌زمینه (بدون بلاک کردن ربات)
+    # ۳. اجرای فرآیند تغییر عکس‌ها در پس‌زمینه (بدون بلاک کردن ربات) + گزارش نتیجه
     try:
-        from workers.session_manager import apply_photo_package_now
-        asyncio.create_task(apply_photo_package_now(acc_id))
+        asyncio.create_task(_apply_and_report(acc_id, callback.message))
     except Exception as e:
         logger.warning(f"Failed to trigger apply_photo_package_now: {e}")
 
     # ۴. پیام موفقیت نهایی
     await safe_edit_or_answer(
         callback.message,
-        "✅ <b>تخصیص با موفقیت انجام شد!</b>\n\n"
-        "⏳ <i>ربات در پس‌زمینه در حال اعمال عکس‌ها روی سرور تلگرام است. نیازی نیست در این صفحه بمانید.</i>",
+        "✅ <b>تخصیص ثبت شد.</b>\n\n"
+        "⏳ <i>اعمال عکس‌ها روی تلگرام در پس‌زمینه انجام می‌شود؛ اگر مشکل پیش بیاید"
+        " (ورکر قطع، فایل گم‌شده، FloodWait) همین‌جا گزارش می‌شود.</i>",
         reply_markup=get_photo_panel_keyboard()
     )
 
@@ -707,15 +754,33 @@ async def unassign_package_from_account(callback: types.CallbackQuery) -> None:
         logger.error(f"DB Error in unassign_package_from_account: {e}")
         return await report_db_error(callback, e)
         
-    # --- بخش جدید: اجرای پاکسازی در پس‌زمینه ---
+    # --- پاک‌سازی عکس‌های تلگرام در پس‌زمینه — با چک اتصال ورکر و گزارش نتیجه ---
+    worker_connected = False
     try:
-        from workers.session_manager import clear_profile_photos_now
-        asyncio.create_task(clear_profile_photos_now(acc_id))
-    except Exception as e:
-        logger.warning(f"Failed to trigger clear_profile_photos_now: {e}")
-    # ----------------------------------------
-        
-    await callback.answer("✅ تخصیص در دیتابیس حذف شد و عکس‌ها در پس‌زمینه پاک می‌شوند.", show_alert=True)
+        from workers.session_manager import worker_pool
+        _client = worker_pool.get(acc_id)
+        worker_connected = bool(_client and getattr(_client, "is_connected", False))
+    except Exception:
+        pass
+
+    if not worker_connected:
+        # 🩹 FIX: قبلاً بی‌شرط گفته می‌شد «عکس‌ها پاک می‌شوند» در حالی که
+        # clear_profile_photos_now بی‌صدا هیچ کاری نمی‌کرد («پاک نمیشه»).
+        await callback.answer(
+            "✅ تخصیص از دیتابیس حذف شد؛ ⚠️ اما ورکرِ این اکانت متصل نیست، "
+            "پس عکس‌های فعلی پروفایلِ تلگرام همان‌طور باقی می‌مانند.",
+            show_alert=True,
+        )
+    else:
+        try:
+            asyncio.create_task(_clear_and_report(acc_id, callback.message))
+        except Exception as e:
+            logger.warning(f"Failed to trigger clear_profile_photos_now: {e}")
+        await callback.answer(
+            "✅ تخصیص حذف شد؛ عکس‌های پروفایل در پس‌زمینه پاک می‌شوند (نتیجه گزارش می‌شود).",
+            show_alert=True,
+        )
+
     await _send_accounts_page(callback.message, page=0)
 
 
@@ -802,15 +867,13 @@ async def auto_assign_packages(callback: types.CallbackQuery) -> None:
             reply_markup=get_photo_panel_keyboard(),
         )
 
-    # اجرای فرآیند تغییر عکس‌ها در پس‌زمینه با استفاده از asyncio.gather برای مدیریت بهتر تسک‌ها
+    # اجرای فرآیند تغییر عکس‌ها در پس‌زمینه با گزارش نتیجه‌ی واقعی هر اکانت
     if assigned_ids:
         try:
-            from workers.session_manager import apply_photo_package_now
-            
             async def trigger_tasks():
-                 tasks = [apply_photo_package_now(a_id) for a_id in assigned_ids]
+                 tasks = [_apply_and_report(a_id, callback.message) for a_id in assigned_ids]
                  await asyncio.gather(*tasks, return_exceptions=True)
-                 
+
             asyncio.create_task(trigger_tasks())
         except Exception as e:
             logger.warning(f"Failed to trigger auto-apply background tasks: {e}")

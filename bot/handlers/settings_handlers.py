@@ -127,6 +127,9 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
     daily_cap = config.DAILY_SEND_LIMIT_PER_ACCOUNT
     new_acc_days = config.NEW_ACCOUNT_DAYS
     new_acc_cap = config.NEW_ACCOUNT_DAILY_SEND_LIMIT
+    # 🩹 FIX (hourly-cap): نمایش سقف ساعتی در پنل تا دیگر «مخفی» نباشد؛ این سقف
+    # اگر از ظرفیتِ هر ورکر کمتر باشد، زودتر از ظرفیت، ارسال را متوقف می‌کند.
+    hourly_cap = config.HOURLY_SEND_LIMIT_PER_ACCOUNT
 
     builder = InlineKeyboardBuilder()
 
@@ -191,11 +194,14 @@ async def show_settings_menu(callback: types.CallbackQuery, state: FSMContext, s
         "⚙️ <b>پنل تنظیمات پیشرفته سیستم</b>\n\n"
         f"🔹 <b>حالت سرعت استخراج:</b> {speed_mode_fa}\n"
         f"🔹 <b>حداکثر اکانت روی هر API:</b> <code>{max_acc_api}</code> عدد\n"
-        f"🔹 <b>ظرفیت ارسال هر ورکر:</b> <code>{send_limit}</code> پیام\n"
+        f"🔹 <b>ظرفیت ارسال هر ورکر (هر دور):</b> <code>{send_limit}</code> پیام\n"
+        f"🔹 <b>سقف ساعتی هر اکانت:</b> <code>{hourly_cap}</code> پیام <i>(از .env — HOURLY_SEND_LIMIT_PER_ACCOUNT)</i>\n"
         f"🔹 <b>زمان استراحت هر اکانت:</b> <code>{cooldown}</code> ساعت\n"
         f"🔹 <b>سقف روزانه هر اکانت (ضد-بن):</b> <code>{daily_cap}</code> پیام <i>(از .env)</i>\n"
         f"🔹 <b>اکانت تازه (&lt;{new_acc_days} روز):</b> <code>{new_acc_cap}</code> پیام/روز <i>(از .env)</i>\n"
         f"🔹 <b>جریمه پیش‌فرض اسپم:</b> <code>{penalty}</code> روز\n\n"
+        "<i>⚠️ نکته: ورکر در هر دور، حداکثر تا کوچک‌ترینِ این سه سقف ارسال می‌کند: "
+        "ظرفیت هر دور، سقف ساعتی و سقف روزانه.</i>\n\n"
         "<i>برای تغییر وضعیت هر قابلیت، روی دکمه مربوطه کلیک کنید:</i>"
     )
 
@@ -695,6 +701,9 @@ async def process_new_proxies(message: types.Message, state: FSMContext, session
         )
 
     updated_to_both_count = 0
+    # 🛑 ANTI-CHAIN-BAN: شمارنده‌ی پروکسی‌های سوخته‌ای که با ارسال مجددِ رشته‌شان
+    # توسط ادمین، آگاهانه بازیابی می‌شوند (رفع دستی قرنطینه).
+    restored_burned_count = 0
 
     try:
         # ۱. استخراج آبجکت‌های پراکسی تکراری از دیتابیس در دسته‌های ۵۰۰تایی (برای جلوگیری از طولانی شدن کوئری)
@@ -713,6 +722,24 @@ async def process_new_proxies(message: types.Message, state: FSMContext, session
             if p.usage_type != proxy_type and p.usage_type != "both":
                 p.usage_type = "both"
                 updated_to_both_count += 1
+            # 🛑 ANTI-CHAIN-BAN: بازگردانی دستیِ پروکسی سوخته — ادمین با ارسال مجدد
+            # رشته‌ی پروکسیِ BURNED اعلام می‌کند «این پروکسی را بررسی/جایگزین کردم،
+            # بازیابی کن». وضعیت به HEALTHY برمی‌گردد و cooldown قرنطینه + شمارنده‌های
+            # بنِ آن پروکسی از Redis پاک می‌شوند تا claimها فوراً از سر گرفته شوند.
+            if p.health_state == "BURNED":
+                p.health_state = "HEALTHY"
+                p.is_active = True
+                p.consecutive_failures = 0
+                p.consecutive_successes = 0
+                restored_burned_count += 1
+                try:
+                    from workers.sender import _get_redis
+                    _rw = _get_redis()
+                    await _rw.delete(f"proxy_cd:{p.proxy_string}")
+                    await _rw.delete(f"proxy_bans:{p.proxy_string}")
+                    await _rw.delete(f"proxy_pf:{p.proxy_string}")
+                except Exception as redis_err:
+                    logger.warning(f"Failed to clear burn cooldown for {p.proxy_string}: {redis_err}")
 
         # ۳. یافتن پراکسی‌های کاملاً جدید
         new_proxies = [p for p in valid_proxies if p not in existing_set]
@@ -739,11 +766,17 @@ async def process_new_proxies(message: types.Message, state: FSMContext, session
     
     added_count = len(new_proxies)
     response_parts = [f"✅ تعداد <b>{added_count}</b> پروکسی کاملاً جدید به استخر <b>{type_fa}</b> اضافه شد."]
-    
+
     if updated_to_both_count > 0:
         response_parts.append(f"🔄 تعداد <b>{updated_to_both_count}</b> پروکسی موجود، به وضعیت «دوکاره» ارتقا یافتند.")
-    
-    unchanged_duplicates = duplicate_in_db_count - updated_to_both_count
+
+    # 🛑 ANTI-CHAIN-BAN: گزارش بازیابی دستی پروکسی‌های سوخته
+    if restored_burned_count > 0:
+        response_parts.append(
+            f"🔥 تعداد <b>{restored_burned_count}</b> پروکسیِ سوخته (BURNED) با تأیید شما بازیابی و به چرخه برگشت."
+        )
+
+    unchanged_duplicates = duplicate_in_db_count - updated_to_both_count - restored_burned_count
     if unchanged_duplicates > 0:
         response_parts.append(f"♻️ تعداد <b>{unchanged_duplicates}</b> پروکسی تکراری نادیده گرفته شد.")
         

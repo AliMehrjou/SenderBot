@@ -650,7 +650,16 @@ async def report_proxy_result(proxy_string: str, is_success: bool, latency_ms: i
 
             now_utc = datetime.now(timezone.utc)
             old_state = proxy.health_state
-            
+
+            # 🛑 ANTI-CHAIN-BAN: پروکسیِ «سوخته» (BURNED) هرگز خودکار زنده نمی‌شود —
+            # یک ping موفق یا یک اتصال موفقِ اتفاقی معنای «این IP نزد تلگرام
+            # اعتبارش را پس گرفته» نیست. رفعِ BURNED فقط با تصمیم/اقدام دستی
+            # ادمین (جایگزینی یا فعال‌سازی آگاهانه) انجام می‌شود؛ در غیر این
+            # صورت یک استخراجِ موفق روی پروکسی سوخته، قرنطینه را خنثی می‌کرد
+            # و اکانت‌های تازه دوباره روی همان IP می‌نشستند.
+            if old_state == "BURNED":
+                return
+
             # پرچم برای اسپاون تسک بعد از کامیت
             needs_queue_process = False
 

@@ -64,9 +64,17 @@ class Config:
     MAX_DIRECT_ACCOUNTS: int = int(os.getenv("MAX_DIRECT_ACCOUNTS", "50"))
     
     PROXY_REASSIGN_ENABLED: bool = _env_flag("PROXY_REASSIGN_ENABLED", "true")
-    FALLBACK_TO_DIRECT_IP: bool = _env_flag("FALLBACK_TO_DIRECT_IP", "true")
+    # 🛑 ANTI-CHAIN-BAN: فال‌بک IP مستقیم به‌صورت پیش‌فرض خاموش شد.
+    # قبلاً true بود: با مرگ پروکسی‌ها، همه‌ی ورکرها روی IP دیتاسنتریِ خودِ سرور
+    # می‌نشستند (۴۰ اکانت اسپمر از یک IP دیتاسنتر = پرچم فوری و موج بن جمعی).
+    # برای فعال‌سازی آگاهانه: FALLBACK_TO_DIRECT_IP=true در .env
+    FALLBACK_TO_DIRECT_IP: bool = _env_flag("FALLBACK_TO_DIRECT_IP", "false")
 
-    MAX_ACCOUNTS_PER_PROXY: int = int(os.getenv("MAX_ACCOUNTS_PER_PROXY", "20"))
+    # 🛑 ANTI-CHAIN-BAN: سقف اکانت روی هر پروکسی از ۲۰ به ۳ کاهش یافت.
+    # ۲۰ اکانت روی یک IP از نظر تلگرام «کارخانه‌ی اسپم» است و سوختن IP یعنی
+    # بنِ همه‌ی ۲۰ اکانت با هم (بن زنجیره‌ای). Ideal: 1:1 (اکانت↔IP اختصاصی).
+    # bindingهای موجود sticky می‌مانند؛ فقط claimهای جدید از سقف جدید تبعیت می‌کنند.
+    MAX_ACCOUNTS_PER_PROXY: int = int(os.getenv("MAX_ACCOUNTS_PER_PROXY", "3"))
     SHARED_API_ID_WARN_THRESHOLD: int = int(os.getenv("SHARED_API_ID_WARN_THRESHOLD", "5"))
 
     # افزوده شده برای یکدست‌سازی تاخیر حلقه‌ی Reconnect و Health Check (F17)
@@ -82,7 +90,7 @@ class Config:
     SMARTFLOW_SEEN_TIMEOUT_MAX: float = float(os.getenv("SMARTFLOW_SEEN_TIMEOUT_MAX", "60.0"))
     SMARTFLOW_STAGE_DELAY_MIN: float = float(os.getenv("SMARTFLOW_STAGE_DELAY_MIN", "8.0"))
     SMARTFLOW_STAGE_DELAY_MAX: float = float(os.getenv("SMARTFLOW_STAGE_DELAY_MAX", "20.0"))
-    BYPASS_WARMUP: bool = _env_flag("BYPASS_WARMUP", "true")
+    BYPASS_WARMUP: bool = _env_flag("BYPASS_WARMUP", "false")
 
     NEW_ACCOUNT_DAYS: int = int(os.getenv("NEW_ACCOUNT_DAYS", "14"))
     NEW_ACCOUNT_DAILY_SEND_LIMIT: int = int(os.getenv("NEW_ACCOUNT_DAILY_SEND_LIMIT", "20"))
@@ -137,7 +145,12 @@ class Config:
     MAX_CONSECUTIVE_ERRORS: int = int(os.getenv("MAX_CONSECUTIVE_ERRORS", "3"))
     # کاهش به ۶۰ دقیقه جهت جلوگیری از استراحت طولانی و فلج شدن سیستم بر اثر خطاهای موقت پروکسی (فاز ۱۰)
     COOLDOWN_MINUTES_ON_ERROR: int = int(os.getenv("COOLDOWN_MINUTES_ON_ERROR", "60"))
-    HOURLY_SEND_LIMIT_PER_ACCOUNT: int = int(os.getenv("HOURLY_SEND_LIMIT_PER_ACCOUNT", "15"))
+    # 🩹 FIX (hourly-cap): این مقدار «پیش‌فرض» قبلاً ۱۵ بود و مخفیانه جلوی «ظرفیت
+    # ارسال هر ورکر» (send_limit_per_run که از پنل تنظیم می‌شود) را می‌گرفت؛ یعنی
+    # ادمین ظرفیت را ۲۰ می‌گذاشت ولی ورکر با پیام «سقف ساعتی (15) پر شد» در ۱۵
+    # متوقف می‌شد. پیش‌فرض به ۳۰ (بالاتر از مقادیر معمولِ پنل) تغییر کرد.
+    # اگر در .env مقدار صریح دارید (مثلاً 15) آن را حذف یا >= ظرفیت پنل کنید.
+    HOURLY_SEND_LIMIT_PER_ACCOUNT: int = int(os.getenv("HOURLY_SEND_LIMIT_PER_ACCOUNT", "30"))
     
     # 🟢 فاز ۲: حد نصاب شکست از کانال مبدا برای لغو کامل سفارش
     SOURCE_FAIL_MAX_WORKERS: int = int(os.getenv("SOURCE_FAIL_MAX_WORKERS", "3"))
@@ -175,6 +188,35 @@ class Config:
     # مدت «چشمک آنلاین» بر حسب ثانیه: مثل گوشی‌ای که بیدار می‌شود، سینک می‌کند و می‌خوابد
     PRESENCE_BLIP_MIN_SECONDS: float = float(os.getenv("PRESENCE_BLIP_MIN_SECONDS", "10"))
     PRESENCE_BLIP_MAX_SECONDS: float = float(os.getenv("PRESENCE_BLIP_MAX_SECONDS", "30"))
+
+    # ==========================================
+    # 🛑 ANTI-CHAIN-BAN (گارد ضد بنِ زنجیره‌ای) — utils/ban_wave.py
+    # ==========================================
+    # فاجعه‌ی ۳۴/۴۰ بن از سه کانال تغذیه می‌شد: IP مشترک + سوییچ فوری ورکر بعد از
+    # بن + نبود واکنش به بن‌های متوالی. تنظیمات زیر سه لایه‌ی دفاع را کنترل می‌کنند:
+
+    # پنجره‌ی زمانیِ «موج بن» (دقیقه) — شمارنده‌های سراسری در این پنجره ریست می‌شوند
+    BAN_WAVE_WINDOW_MINUTES: int = int(os.getenv("BAN_WAVE_WINDOW_MINUTES", "60"))
+    # آستانه‌ی بن واقعی در پنجره → فریز کامل دیسپچر
+    BAN_WAVE_GLOBAL_THRESHOLD: int = int(os.getenv("BAN_WAVE_GLOBAL_THRESHOLD", "3"))
+    # آستانه‌ی PeerFlood در پنجره → فریز کامل دیسپچر ( PeerFlood هم سیگنال اسپم است)
+    BAN_WAVE_GLOBAL_PF_THRESHOLD: int = int(os.getenv("BAN_WAVE_GLOBAL_PF_THRESHOLD", "5"))
+    # مدت فریز سراسری دیسپچر بعد از تشخیص موج (دقیقه)
+    BAN_WAVE_FREEZE_MINUTES: int = int(os.getenv("BAN_WAVE_FREEZE_MINUTES", "60"))
+
+    # آستانه‌ی بن واقعی روی «یک پروکسی» در ۲۴ ساعت → قرنطینه‌ی پروکسی (BURNED)
+    BAN_WAVE_PROXY_BAN_THRESHOLD: int = int(os.getenv("BAN_WAVE_PROXY_BAN_THRESHOLD", "2"))
+    # آستانه‌ی PeerFlood روی «یک پروکسی» در ۲۴ ساعت → قرنطینه‌ی پروکسی
+    BAN_WAVE_PROXY_PF_THRESHOLD: int = int(os.getenv("BAN_WAVE_PROXY_PF_THRESHOLD", "3"))
+    # مدت قرنطینه‌ی پروکسی سوخته (ساعت) — هیچ claim جدیدی در این مدت روی آن نمی‌نشیند
+    BAN_PROXY_QUARANTINE_HOURS: int = int(os.getenv("BAN_PROXY_QUARANTINE_HOURS", "72"))
+    # بعد از «یک» بن روی پروکسی، فاصله‌گذاری claim (ساعت) — حتی زیر آستانه
+    BAN_PROXY_CLAIM_COOLDOWN_HOURS: int = int(os.getenv("BAN_PROXY_CLAIM_COOLDOWN_HOURS", "24"))
+
+    # 🛑 مهم‌ترین فیکس: بعد از بن واقعی/PeerFlood، سفارش به‌جای سوییچِ فوری به ورکر
+    # بعدی (که زنجیره‌ی بن را کامل می‌کرد)، این‌قدر دقیقه خنک می‌شود و بعد با
+    # ورکر/پروکسی تازه ادامه می‌یابد. 0 = رفتار قدیمی (سوییچ فوری).
+    BAN_FAILOVER_COOLDOWN_MINUTES: int = int(os.getenv("BAN_FAILOVER_COOLDOWN_MINUTES", "30"))
     
     @property
     def MYSQL_URL(self) -> str:
