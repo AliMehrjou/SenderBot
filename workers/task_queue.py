@@ -2161,57 +2161,97 @@ async def background_order_execution(
                         break
 
             # ==========================================
-            # 🛑 ANTI-CHAIN-BAN (مهم‌ترین فیکس این نسخه):
-            # سوییچ فوریِ ورکر بعد از بن واقعی/PeerFlood ممنوع شد.
-            # قبلاً: ورکر ۱ بن می‌شد → بلافاصله تارگت‌ها به ورکر ۲ سپرده می‌شد
-            # (که احتمالاً روی همان پروکسی/IP سوخته بود) → بن → ورکر ۳ → …
-            # این دقیقاً همان «بن زنجیره‌ای» بود که ناوگان را نابود کرد.
-            # حالا: سفارش به‌مدت BAN_FAILOVER_COOLDOWN_MINUTES خنک می‌شود؛
-            # تارگت‌های ارسال‌نشده توسط _finalize_chunk به صف برمی‌گردند و
-            # دیسپچر بعد از استراحت، با ورکر/پروکسی تازه ادامه می‌دهد.
-            # (فریز سراسری موج بن هم در صورت تشخیص موج، روی همین بازه اضافه می‌شود.)
-            # BAN_FAILOVER_COOLDOWN_MINUTES=0 → رفتار قدیمی (بازگردانی فوری به صف).
-            # ==========================================
+            # 🛑 ANTI-CHAIN-BAN v2 (خواسته‌ی صاحب پروژه — لغوی فوری):
+            # بن واقعی («banned»/«account_banned») = سفارش همان لحظه لغو می‌شود —
+            # نه ۳۰ دقیقه خنک‌سازی (که بی‌دلیل جریان ارسال را قفل می‌کرد)، نه سوییچ
+            # فوری به ورکر بعدی (که تارگت‌ها را به اکانت بعدی، احتمالاً روی همان
+            # پروکسی/IP سوخته، تزریق می‌کرد و زنجیره‌ی بن را کامل می‌کرد).
+            # PeerFlood (اسپم) دیگر اینجا نمی‌آید — sender.py برای آن stop_reason
+            # اختصاصی «peer_flood» برمی‌گرداند و مسیرش همان رفتار اصلی است: جریمه‌ی
+            # خود اکانت + چک خودکار @SpamBot + سوییچ فوری به ورکر بعدی (بلوک پایین).
             # «account_banned» هم شامل می‌شود: وقتی preflight بگوید اکانت از قبل بن
             # است، یعنی بن در فاصله‌ی دیسپچ تا اجرا رخ داده (زنجیره در جریان!) یا
             # ورکر stale است — در هر دو حالت ادامه‌ی فوری، زنجیره را کامل می‌کند.
-            if not _is_extract_order(order) and stop_reason in ("blocked", "banned", "account_banned") and unsent_targets:
+            # اطلاع‌رسانی دقیقاً مطابق الگوی «کمبود ورکر»: پیام Push به کارفرما +
+            # فایل خروجی + داشبورد لایو + اطلاع ادمین‌ها.
+            # ==========================================
+            if not _is_extract_order(order) and stop_reason in ("banned", "account_banned") and unsent_targets:
                 try:
-                    cooldown_minutes = max(0, int(getattr(config, "BAN_FAILOVER_COOLDOWN_MINUTES", 30)))
-                    resume_at = datetime.now(timezone.utc) + timedelta(minutes=cooldown_minutes)
                     async with session_maker() as session:
                         db_order = await session.get(Order, order_id)
                         if db_order and db_order.status == OrderStatus.running:
-                            db_order.scheduled_for = resume_at
+                            success_count = await session.scalar(
+                                select(func.count())
+                                .select_from(OrderLog)
+                                .where(OrderLog.order_id == order_id, OrderLog.status == "success")
+                            ) or 0
+
+                            finish_msg = (
+                                f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). "
+                                f"به دلیل مسدود شدن (بن) ورکر user_{primary_id}/، ادامه‌ی ارسال با ورکرهای دیگر "
+                                f"امن نبود و سفارش همان لحظه لغو شد."
+                            )
+
+                            final_status = OrderStatus.completed if success_count > 0 else OrderStatus.error
+                            db_order.status = final_status
+                            db_order.scheduled_for = None
+                            db_order.reject_reason = f"بن ورکر user_{primary_id}/ ({stop_reason})"
+
                             session.add(OrderLog(
                                 order_id=order_id,
                                 target="System",
                                 status="error",
                                 error_message=(
                                     f"ورکر user_{primary_id}/ مسدود شد ({stop_reason}). "
-                                    f"جلوگیری از بن زنجیره‌ای: ادامه‌ی سفارش {cooldown_minutes} دقیقه "
-                                    f"به تعویق افتاد؛ {len(unsent_targets)} تارگت ارسال‌نشده به صف برگشت."
+                                    f"جلوگیری از بن زنجیره‌ای: سفارش همان لحظه لغو شد؛ "
+                                    f"{len(unsent_targets)} تارگت ارسال‌نشده لغو گردید."
                                 ),
                             ))
                             await session.commit()
-                    if reporter := _progress_reporters.get(f"order:{order_id}"):
-                        await reporter.update(
-                            status=(
-                                f"⛔️ ورکر user_{primary_id}/ مسدود شد. برای جلوگیری از بن زنجیره‌ای، "
-                                f"ادامه‌ی سفارش {cooldown_minutes} دقیقه دیگر با ورکر تازه از سر گرفته می‌شود…"
+
+                            # 🛑 Kill Switch (سمت نوشتن): توقف فوری chunkهای موازیِ همین سفارش
+                            try:
+                                await _get_redis().set(f"kill_order:{order_id}", "1", ex=600)
+                            except Exception:
+                                pass
+
+                            # ارسال اتوماتیک فایل خروجی برای کارفرما (الگوی کمبود ورکر)
+                            _spawn_background_task(_send_export_file(session_maker, bot, order_id, finish_msg))
+
+                            # بروزرسانی داشبورد لایو کاربر (الگوی کمبود ورکر)
+                            if reporter := _progress_reporters.get(f"order:{order_id}"):
+                                if final_status == OrderStatus.completed:
+                                    await reporter.finish(f"✅ <b>پایان سفارش</b>\n\n{finish_msg}")
+                                else:
+                                    await reporter.fail(f"⛔️ <b>لغو سفارش</b>\n\n{finish_msg}")
+                                _pop_progress_reporter("order", order_id)
+
+                            # پیام Push مستقیم به کارفرما + اطلاع‌رسانی به ادمین‌ها
+                            await _notify_owner(bot, session_maker, order_id, f"⛔️ <b>لغو سفارش</b>\n\n{finish_msg}")
+                            from utils.admin_broadcast import broadcast_to_admins
+                            await broadcast_to_admins(
+                                bot,
+                                text=(
+                                    f"⛔️ <b>لغو سفارش (بن ورکر)</b>\n\n"
+                                    f"سفارش: <code>{order_id}</code>\n"
+                                    f"ورکر: <code>user_{primary_id}/</code> ({stop_reason})\n{finish_msg}"
+                                ),
                             )
-                        )
                     logger.warning(
-                        f"Order #{order_id}: anti-chain-ban cooldown — worker user_{primary_id}/ hit "
-                        f"'{stop_reason}'; order paused {cooldown_minutes} min instead of instant failover."
+                        f"Order #{order_id}: anti-chain-ban v2 — worker user_{primary_id}/ hit "
+                        f"'{stop_reason}'; order CANCELLED immediately (worker-shortage pattern)."
                     )
                 except Exception as acb_err:
-                    logger.error(f"Anti-chain-ban cooldown failed for Order #{order_id}: {acb_err}")
+                    logger.error(f"Anti-chain-ban immediate cancel failed for Order #{order_id}: {acb_err}")
                 break
 
             # 🔴 سوییچ فوری روی لیمیت ورکر (Immediate Limit Failover)
+            # 🛑 ANTI-CHAIN-BAN v2: «peer_flood» (اسپم) اضافه شد — PeerFlood حالا
+            # stop_reason اختصاصی دارد و مثل قبل (رفتار اصلی) بی‌درنگ به ورکر بعدی
+            # سوییچ می‌کند؛ «banned»/«account_banned» هرگز به اینجا نمی‌رسند چون بلوک
+            # لغوی فوریِ بالا آنها را می‌گیرد و سفارش را همان لحظه لغو می‌کند.
             limit_reasons = (
-                "flood_wait", "blocked", "banned", "consecutive_errors", 
+                "flood_wait", "blocked", "peer_flood", "banned", "consecutive_errors", 
                 "chunk_limit", "hourly_cap", "daily_cap", "error", 
                 "proxy_connection_error", "account_limited", 
                 "account_banned", "account_inactive"
@@ -2372,7 +2412,7 @@ async def background_order_execution(
 
             else:
                 # 🟢 چرخش پیشگیرانه (Proactive Rotation - فاز ۵) بین چانک‌ها
-                if stop_reason not in ("proxy_connection_error", "crash", "blocked", "banned") and not _is_extract_order(order):
+                if stop_reason not in ("proxy_connection_error", "crash", "blocked", "peer_flood", "banned", "account_banned") and not _is_extract_order(order):
                     try:
                         redis = _get_redis()
                         chunks_count = await redis.incr(f"worker_chunks:{primary_id}")

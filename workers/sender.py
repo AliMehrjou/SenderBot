@@ -1382,8 +1382,12 @@ async def execute_bulk_send(
             
             from utils.limit_handler import register_account_limit
             await register_account_limit(session, account_db_id, client, "peer_flood")
-            
-            stop_reason = "blocked"
+
+            # 🛑 ANTI-CHAIN-BAN v2: PeerFlood (اسپم) دیگر stop_reason عمومی «blocked»
+            # نمی‌دهد؛ با «peer_flood» اختصاصی برمی‌گردد تا task_queue آن را از بن واقعی
+            # تفکیک کند: اسپم = جریمه‌ی خود اکانت + چک خودکار @SpamBot + سوییچ فوری به
+            # ورکر بعدی (رفتار اصلی، بدون خنک‌سازی سفارش)؛ بن واقعی = لغوی فوری سفارش.
+            stop_reason = "peer_flood"
             if stage_1_delivered:
                 unsent.extend(targets[position+1:])
                 sent_in_chunk += 1
