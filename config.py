@@ -82,7 +82,7 @@ class Config:
     SMARTFLOW_SEEN_TIMEOUT_MAX: float = float(os.getenv("SMARTFLOW_SEEN_TIMEOUT_MAX", "60.0"))
     SMARTFLOW_STAGE_DELAY_MIN: float = float(os.getenv("SMARTFLOW_STAGE_DELAY_MIN", "8.0"))
     SMARTFLOW_STAGE_DELAY_MAX: float = float(os.getenv("SMARTFLOW_STAGE_DELAY_MAX", "20.0"))
-    BYPASS_WARMUP: bool = _env_flag("BYPASS_WARMUP", "false")
+    BYPASS_WARMUP: bool = _env_flag("BYPASS_WARMUP", "true")
 
     NEW_ACCOUNT_DAYS: int = int(os.getenv("NEW_ACCOUNT_DAYS", "14"))
     NEW_ACCOUNT_DAILY_SEND_LIMIT: int = int(os.getenv("NEW_ACCOUNT_DAILY_SEND_LIMIT", "20"))
