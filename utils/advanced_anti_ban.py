@@ -126,56 +126,127 @@ async def randomize_profile(
 
 async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage", account_id=None) -> bool:
     """
-    🖼 پکیج‌های عکس پروفایل — جایگزینی قطعی عکس‌های پروفایل.
-    استراتژی: حذف تهاجمی تمام عکس‌های فعلی -> آپلود عکس‌های جدید به صورت معکوس
+    🖼 پکیج‌های عکس پروفایل — جایگزینی عکس‌های پروفایل.
+    استراتژی: حذف عکس‌های فعلی (محدود و قطعی) -> آپلود عکس‌های جدید به صورت معکوس
 
     🩹 FIX (photo-race + silent-failure):
       • قفل per-account: چرخش‌های همزمان روی یک اکانت دیگر باعث خرابی گالری نمی‌شوند.
         اگر account_id پاس نشود، از الگوی نامِ ورکر (worker_acc_N) استخراج می‌شود تا
         همان قفلی که clear_profile_photos_now می‌گیرد، اینجا هم گرفته شود.
       • خطاهای آپلود دیگر «بی‌صدا» نیستند؛ با ERROR لاگ می‌شوند و خروجی False است.
-      • راستی‌آزمایی با «کلِ» عکس‌های پکیج مقایسه می‌شود (نه فقط فایل‌های موجودِ روی دیسک)
+        راستی‌آزمایی با «کلِ» عکس‌های پکیج مقایسه می‌شود (نه فقط فایل‌های روی دیسک)
         تا نبودِ فایل عکس ۲/۳ دیگر حالتِ موفقِ کاذب نسازد.
+
+    🧊 FIX (infinite-hammer — ریشه‌ی اصلی بن‌ها در bot_18/bot_19):
+      حلقه‌ی قبلیِ «while True» وقتی اکانت FROZEN بود و حذف عکس همیشه شکست
+      می‌خورد، هرگز خارج نمی‌شد ← photos.GetUserPhotos هر ~۱۱ ثانیه، ۲۴/۷
+      (۱۱٬۰۹۰ بار فقط در یک لاگ!). الان:
+        • چکِ فریز بودن اکانت قبل از شروع (utils/freeze_guard.py)
+        • سقف دورِ پاک‌سازی (PHOTO_WIPE_MAX_PASSES) + خروج فوری اگر در یک دور
+          «هیچ» عکسی حذف نشد (حذف ممکن نیست = فریز/محدودیت → نه چکش‌کاری)
+        • خطای FROZEN در هر مرحله → mark_account_frozen + قطع فوری
+        • بودجه‌ی زمانی کلی (PHOTO_ROTATION_TIMEOUT_SECONDS) تا اسلات سمافور
+          و قفلِ اکانت هرگز برای همیشه اشغال نشود
+        • چک اتصال قبل از آپلود + مکث بین تلاش‌ها (قبلاً ۳ خطای پشت‌سرهمِ
+          «no active connection» در همان ثانیه لاگ می‌شد)
     """
     if not package or not package.photos:
         return False
 
     from pyrogram.errors import FloodWait
     import asyncio
+    import time as _time
 
     lock_key = account_id
     if lock_key is None:
         _m = re.search(r"worker_acc_(\d+)", str(getattr(client, "name", "") or ""))
         lock_key = int(_m.group(1)) if _m else str(getattr(client, "name", "?"))
 
+    # 🧊 گارد فریز: اکانتِ فریز‌شده اصلاً وارد چرخش نمی‌شود
+    from utils.freeze_guard import is_account_frozen, is_frozen_error, mark_account_frozen
+    if account_id is not None and await is_account_frozen(account_id):
+        logger.warning(
+            f"Worker {client.name}: photo rotation SKIPPED — account is FROZEN "
+            "(cooldown active; no Telegram calls will be made)."
+        )
+        return False
+
+    def _photo_cfg_int(name: str, default: int) -> int:
+        from config import config
+        try:
+            return max(1, int(getattr(config, name, default)))
+        except (TypeError, ValueError):
+            return default
+
+    max_passes = _photo_cfg_int("PHOTO_WIPE_MAX_PASSES", 4)
+    timeout_seconds = _photo_cfg_int("PHOTO_ROTATION_TIMEOUT_SECONDS", 900)
+    deadline = _time.monotonic() + timeout_seconds
+
     async with PHOTO_ROTATION_SEMAPHORE:
         async with get_photo_account_lock(lock_key):
-            # --- مرحله ۱: حذف تهاجمی و قطعی تمام عکس‌های قدیمی ---
+            # --- مرحله ۱: حذف عکس‌های قدیمی (محدود و قطعی — بدون حلقه‌ی بی‌نهایت) ---
             deleted_count = 0
             try:
-                while True:
+                for pass_no in range(1, max_passes + 1):
+                    if _time.monotonic() > deadline:
+                        logger.warning(
+                            f"Worker {client.name}: photo wipe exceeded time budget "
+                            f"({timeout_seconds}s) — stopping to avoid API hammering."
+                        )
+                        break
+
                     old_photos = [p async for p in client.get_chat_photos("me", limit=5)]
                     if not old_photos:
                         break
+
+                    deleted_this_pass = 0
                     for photo in old_photos:
                         try:
                             await client.delete_profile_photos([photo.file_id])
                             deleted_count += 1
+                            deleted_this_pass += 1
                             await asyncio.sleep(1.5)
                         except FloodWait as e:
-                            await asyncio.sleep(e.value + 1)
+                            await asyncio.sleep(int(getattr(e, "value", 0) or 0) + 1)
                             try:
                                 await client.delete_profile_photos([photo.file_id])
                                 deleted_count += 1
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
+                                deleted_this_pass += 1
+                            except Exception as retry_err:
+                                if is_frozen_error(retry_err):
+                                    await mark_account_frozen(
+                                        account_id, reason=f"delete_profile_photos: {retry_err}"
+                                    )
+                                    return False
+                        except Exception as del_err:
+                            # 🧊 فریز = قطع فوری؛ بقیه‌ی خطاها فقط لاگ می‌شوند
+                            if is_frozen_error(del_err):
+                                await mark_account_frozen(
+                                    account_id, reason=f"delete_profile_photos: {del_err}"
+                                )
+                                return False
+                            logger.warning(
+                                f"Worker {client.name}: failed to delete a photo: {del_err}"
+                            )
+
+                    # 🛑 پیشرفتِ صفر در یک دورِ کامل یعنی حذف ممکن نیست
+                    # (اکانت فریز/محدود است یا عکس‌ها قابل حذف نیستند) —
+                    # تکرارِ بیشتر فقط چکش‌کاریِ API و پرچمِ اسپم است.
+                    if deleted_this_pass == 0:
+                        logger.warning(
+                            f"Worker {client.name}: photo wipe pass {pass_no} deleted 0 "
+                            "photos (delete not permitted — likely frozen/restricted); "
+                            "aborting wipe to prevent API hammering."
+                        )
+                        break
             except Exception as e:
-                logger.warning(f"Worker {client.name}: error during aggressive old photo wipe: {e}")
+                if is_frozen_error(e):
+                    await mark_account_frozen(account_id, reason=f"photo wipe: {e}")
+                    return False
+                logger.warning(f"Worker {client.name}: error during old photo wipe: {e}")
 
             if deleted_count > 0:
-                logger.info(f"Worker {client.name}: {deleted_count} old profile photo(s) wiped completely.")
+                logger.info(f"Worker {client.name}: {deleted_count} old profile photo(s) wiped.")
 
             # --- مرحله ۲: آپلود عکس‌های جدید به صورت معکوس (عکس اول، آواتار اصلی بماند) ---
             successful_uploads = 0
@@ -184,6 +255,12 @@ async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage", 
             sorted_photos = sorted(package.photos, key=lambda p: getattr(p, "position", 0), reverse=True)
 
             for photo in sorted_photos:
+                if _time.monotonic() > deadline:
+                    logger.warning(
+                        f"Worker {client.name}: photo upload exceeded time budget — stopping."
+                    )
+                    break
+
                 if not os.path.exists(photo.file_path):
                     missing_files.append(photo.file_path)
                     logger.error(
@@ -193,28 +270,42 @@ async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage", 
                     continue
 
                 uploaded = False
-                # 🩹 FIX: قبلاً فقط ۲ تلاش بود و هر Exception دیگری «بی‌صدا» قورت داده می‌شد؛
-                # الان ۳ تلاش با لاگ ERROR انجام می‌شود.
                 for attempt in range(3):
+                    # 🩹 چک اتصال قبل از هر تلاش — قبلاً ۳ خطای پشت‌سرهمِ
+                    # «no active connection» در همان ثانیه زده می‌شد
+                    if not getattr(client, "is_connected", False):
+                        logger.warning(
+                            f"Worker {client.name}: client disconnected before upload "
+                            f"(attempt {attempt + 1}/3) — waiting 5s..."
+                        )
+                        await asyncio.sleep(5)
+                        if not getattr(client, "is_connected", False):
+                            break
                     try:
                         await client.set_profile_photo(photo=photo.file_path)
                         successful_uploads += 1
                         uploaded = True
                         break
                     except FloodWait as e:
-                        logger.warning(f"Worker {client.name}: hit FloodWait ({e.value}s) during photo upload. Retrying...")
-                        await asyncio.sleep(e.value + 1)
+                        wait_s = int(getattr(e, "value", 0) or 0)
+                        logger.warning(f"Worker {client.name}: hit FloodWait ({wait_s}s) during photo upload. Retrying...")
+                        await asyncio.sleep(wait_s + 1)
                     except Exception as e:
+                        # 🧊 فریز → قطع فوری (آپلودِ مجدد روی اکانت فریز بی‌معناست)
+                        if is_frozen_error(e):
+                            await mark_account_frozen(account_id, reason=f"set_profile_photo: {e}")
+                            return False
                         logger.error(
                             f"Worker {client.name}: set_profile_photo FAILED for "
                             f"{photo.file_path} (attempt {attempt + 1}/3): {e}"
                         )
+                        await asyncio.sleep(2)
                 if not uploaded:
                     failed_uploads.append(photo.file_path)
 
                 await asyncio.sleep(random.uniform(5, 9))
 
-            # --- مرحله ۳: راستی‌آزمایی (در برابر «کل» عکس‌های پکیج) ---
+            # --- مرحله ۳: راستی‌آزمایی (در برابر «کلِ» عکس‌های پکیج) ---
             expected_count = len(package.photos)
             try:
                 final_photos = [p async for p in client.get_chat_photos("me")]
@@ -233,13 +324,17 @@ async def rotate_profile_photos(client: Client, package: "ProfilePhotoPackage", 
                 return False
 
 
-
 async def perform_warmup_cycle(client: Client, account_id: int) -> None:
     """
     شبیه‌سازی رفتار انسانی با اسکن کردن لیست چت‌ها و سین کردن پیام‌های خوانده نشده.
     (اضافه شدن منطق خروج از فریز برای اکانت‌های صفر)
     """
     try:
+        from utils.freeze_guard import is_account_frozen
+        if await is_account_frozen(account_id):
+            logger.info(f"Worker user_{account_id}/ warm-up SKIPPED — account is FROZEN.")
+            return
+
         dialogs_count = 0
         read_count = 0
         

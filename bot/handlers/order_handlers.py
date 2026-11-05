@@ -3902,7 +3902,8 @@ async def hold_continue_ip_handler(callback: types.CallbackQuery, session: Async
         if not order or order.status != OrderStatus.on_hold_proxy:
             return await callback.answer("⚠️ سفارش در وضعیت هولد نیست.", show_alert=True)
             
-        if not getattr(config, "FALLBACK_TO_DIRECT_IP", True):
+        # 🧊 FIX (POST-REVIEW): fallback ناسازگار True → False (هماهنگ با پیش‌فرض امن config)
+        if not getattr(config, "FALLBACK_TO_DIRECT_IP", False):
             return await callback.answer("⚠️ ارسال با IP سرور (IP Leak Guard) در تنظیمات سیستم مسدود است.", show_alert=True)
             
         if not await direct_budget_ok(session):

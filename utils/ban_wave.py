@@ -34,6 +34,15 @@
            دهد، کل دیسپچر به‌مدت قابل تنظیم فریز می‌شود (مثل global slowdown
            ولی قطعِ واقعی، نه فقط کاهش سرعت) و به ادمین‌ها هشدار می‌رود.
 
+🧊 رویداد «freeze» (FROZEN_METHOD_INVALID):
+  تحلیل لاگ‌های bot_18/bot_19 نشان داد موج‌های بنِ واقعی از «موج فریز» شروع
+  می‌شوند: چند اکانت همزمان FROZEN_METHOD_INVALID می‌گیرند و سیستمِ قبلی —
+  که این خطا را هندل نمی‌کرد — به جای توقف، همان عملیات را بی‌وقفه تکرار
+  می‌کرد (حلقه‌ی بی‌نهایت photos.GetUserPhotos). حالا freeze به‌عنوان نوع
+  رویدادِ درجه‌یک (مثل ban/peer_flood) ثبت می‌شود: شمارنده‌ی سراسری خودش را
+  دارد و از آستانه‌ی BAN_WAVE_FROZEN_GLOBAL_THRESHOLD عبور کند، فریز سراسری
+  دیسپچر فعال می‌شود — پیش از آنکه موج فریز به موج بن تبدیل شود.
+
 همه‌ی آستانه‌ها از config.py / متغیرهای محیطی قابل تنظیم‌اند و همه‌ی مسیرها
 fail-open هستند (خطای Redis/DB هرگز جریان ارسال را نمی‌شکند).
 """
@@ -52,6 +61,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # banwave:global:ban        → شمارنده‌ی بن‌های واقعی در پنجره‌ی موج (TTL = پنجره)
 # banwave:global:peer_flood → شمارنده‌ی PeerFloodها در پنجره‌ی موج
+# banwave:global:freeze     → شمارنده‌ی فریزهای FROZEN_METHOD_INVALID (TTL = پنجره)
 # banwave:freeze_until      → epoch پایان فریز سراسری دیسپچ (TTL = مدت فریز)
 # proxy_bans:{proxy}        → شمارنده‌ی بن‌های واقعی روی این پروکسی (TTL = 24h)
 # proxy_pf:{proxy}          → شمارنده‌ی PeerFloodهای این پروکسی (TTL = 24h)
@@ -59,10 +69,14 @@ logger = logging.getLogger(__name__)
 # proxy_cd:{proxy}          → (کلید موجودِ claim cooldown) — بعد از بن، بلند می‌شود
 _BANWAVE_GLOBAL_BAN_KEY = "banwave:global:ban"
 _BANWAVE_GLOBAL_PF_KEY = "banwave:global:peer_flood"
+_BANWAVE_GLOBAL_FREEZE_KEY = "banwave:global:freeze"
 _BANWAVE_FREEZE_KEY = "banwave:freeze_until"
 _PROXY_BAN_KEY = "proxy_bans:{proxy}"
 _PROXY_PF_KEY = "proxy_pf:{proxy}"
 _LAST_BAN_PROXY_KEY = "last_ban_proxy:{account_id}"
+
+# رویدادهای معتبر ورودی — freeze هم اکنون درجه‌یک است (utils/freeze_guard.py)
+_VALID_EVENT_TYPES = ("ban", "peer_flood", "freeze")
 
 # رجیستری سبکِ instance بات برای هشدار به ادمین‌ها (بدون وابستگی حلقوی)
 _admin_bot = None
@@ -271,38 +285,51 @@ async def register_ban_event(
     event_type: str = "ban",   # "ban" | "peer_flood"
 ) -> None:
     """
-    نقطه‌ی ورود واحدِ همه‌ی بن‌ها/PeerFloodها (از utils/limit_handler.py صدا زده می‌شود).
+    نقطه‌ی ورود واحدِ همه‌ی بن‌ها/PeerFloodها/فریزها
+    (از utils/limit_handler.py و utils/freeze_guard.py صدا زده می‌شود).
 
     کارها (تماماً best-effort / fail-open):
-      ۱) شمارنده‌ی سراسری پنجره‌ی موج (ban / peer_flood جدا)
+      ۱) شمارنده‌ی سراسری پنجره‌ی موج (ban / peer_flood / freeze جدا)
       ۲) شمارنده‌ی per-proxy (۲۴ ساعت)
       ۳) کلید فورنزیک last_ban_proxy:{account_id}
-      ۴) WorkerEvent ممیزی با پروکسیِ لحظه‌ی بن
+      ۴) WorkerEvent ممیزی با پروکسیِ لحظه‌ی رخداد
       ۵) cooldown claim کوتاه برای پروکسی (فاصله‌گذاری حتی زیر آستانه)
       ۶) ارزیابی آستانه‌ها → فریز سراسری / قرنطینه‌ی پروکسی
-      ۷) هشدار ادمین با جزئیات پروکسی
+      ۷) هشدار ادمین با جزئیات پروکسی (فقط بن واقعی)
     """
     if account_id is None:
         return
-    event_type = "peer_flood" if event_type == "peer_flood" else "ban"
+    if event_type not in _VALID_EVENT_TYPES:
+        event_type = "ban"
 
     window_minutes = max(5, _cfg("BAN_WAVE_WINDOW_MINUTES", 60))
     window_seconds = window_minutes * 60
 
     # --- ۱) شمارنده‌های سراسری پنجره‌ی موج (مسیر ساده و مقاوم) ---
+    global_freeze_count = 0
     try:
         redis = _redis()
-        global_key = _BANWAVE_GLOBAL_PF_KEY if event_type == "peer_flood" else _BANWAVE_GLOBAL_BAN_KEY
+        global_key = {
+            "peer_flood": _BANWAVE_GLOBAL_PF_KEY,
+            "freeze": _BANWAVE_GLOBAL_FREEZE_KEY,
+        }.get(event_type, _BANWAVE_GLOBAL_BAN_KEY)
         cur = await redis.incr(global_key)
         if cur == 1 or await redis.ttl(global_key) == -1:
             await redis.expire(global_key, window_seconds)
         g_bans = await redis.get(_BANWAVE_GLOBAL_BAN_KEY)
         g_pfs = await redis.get(_BANWAVE_GLOBAL_PF_KEY)
+        g_frz = await redis.get(_BANWAVE_GLOBAL_FREEZE_KEY)
         global_ban_count = int(g_bans) if g_bans else 0
         global_pf_count = int(g_pfs) if g_pfs else 0
+        global_freeze_count = int(g_frz) if g_frz else 0
     except Exception as e:
         logger.warning(f"ban_wave global counters failed (fail-open): {e}")
         global_ban_count, global_pf_count = 0, 0
+
+    # فریزِ تلگرام همان‌قدر خطرناک است که بن — شمارنده‌ی بن را هم می‌شمارد
+    # تا آستانه‌ی موج بن (فریز سراسری دیسپچ) زودتر فعال شود.
+    if event_type == "freeze":
+        global_ban_count += global_freeze_count
 
     proxy_ban_count = 0
     proxy_pf_count = 0
@@ -311,6 +338,7 @@ async def register_ban_event(
         try:
             redis = _redis()
             # --- ۲) شمارنده‌های per-proxy (۲۴ ساعت) ---
+            # فریز هم مثل بن، شمارنده‌ی proxy_bans را زیاد می‌کند (خوشه‌ی IP مشترک)
             p_key = _PROXY_PF_KEY.format(proxy=proxy_string) if event_type == "peer_flood" \
                 else _PROXY_BAN_KEY.format(proxy=proxy_string)
             p_count = await redis.incr(p_key)
@@ -329,8 +357,9 @@ async def register_ban_event(
                 ex=7 * 24 * 3600,
             )
 
-            # --- ۵) فاصله‌گذاری claim حتی زیر آستانه (بن: ۲۴h، PeerFlood: ۶h) ---
-            claim_cd_hours = _cfg("BAN_PROXY_CLAIM_COOLDOWN_HOURS", 24) if event_type == "ban" else 6
+            # --- ۵) فاصله‌گذاری claim حتی زیر آستانه (بن/فریز: ۲۴h، PeerFlood: ۶h) ---
+            claim_cd_hours = _cfg("BAN_PROXY_CLAIM_COOLDOWN_HOURS", 24) \
+                if event_type in ("ban", "freeze") else 6
             try:
                 await redis.set(f"proxy_cd:{proxy_string}", "1", ex=claim_cd_hours * 3600)
             except Exception:
@@ -363,10 +392,17 @@ async def register_ban_event(
 
     # --- ۶) ارزیابی آستانه‌ها ---
     # ۶-الف) فریز سراسری موج بن
+    #     آستانه‌ی فریز: موجِ FROZEN_METHOD_INVALID خودش (پیش‌درآمدِ بن) دیسپچ را
+    #     متوقف می‌کند — BAN_WAVE_FROZEN_GLOBAL_THRESHOLD (پیش‌فرض ۳ در پنجره).
     try:
         global_ban_threshold = max(1, _cfg("BAN_WAVE_GLOBAL_THRESHOLD", 3))
         global_pf_threshold = max(1, _cfg("BAN_WAVE_GLOBAL_PF_THRESHOLD", 5))
-        should_freeze = (global_ban_count >= global_ban_threshold) or (global_pf_count >= global_pf_threshold)
+        global_freeze_threshold = max(1, _cfg("BAN_WAVE_FROZEN_GLOBAL_THRESHOLD", 3))
+        should_freeze = (
+            (global_ban_count >= global_ban_threshold)
+            or (global_pf_count >= global_pf_threshold)
+            or (global_freeze_count >= global_freeze_threshold)
+        )
         if should_freeze:
             await _trigger_global_freeze(global_ban_count, global_pf_count, window_minutes)
     except Exception as e:
@@ -443,13 +479,16 @@ async def get_banwave_snapshot() -> dict:
         "freeze_remaining": await banwave_freeze_remaining_seconds(),
         "global_bans": 0,
         "global_pfs": 0,
+        "global_freezes": 0,
     }
     try:
         redis = _redis()
         b = await redis.get(_BANWAVE_GLOBAL_BAN_KEY)
         p = await redis.get(_BANWAVE_GLOBAL_PF_KEY)
+        f = await redis.get(_BANWAVE_GLOBAL_FREEZE_KEY)
         snap["global_bans"] = int(b) if b else 0
         snap["global_pfs"] = int(p) if p else 0
+        snap["global_freezes"] = int(f) if f else 0
     except Exception:
         pass
     return snap

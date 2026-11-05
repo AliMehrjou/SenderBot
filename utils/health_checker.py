@@ -508,6 +508,17 @@ async def auto_reconnect_loop(worker_pool: dict, bot: Bot) -> None:
                         for acc in connected_accs:
                             # در زمان Low-load: اگر ورکر مشغول سفارش نیست
                             if not await redis.exists(f"busy_worker:{acc.id}"):
+                                # 🧊 FIX (proxy-flapping): حداقل اقامت روی IP فعلی —
+                                # در لاگ‌ها user_11 و user_6 کل روز بین دو پروکسی هر
+                                # ~۲۰ دقیقه رفت‌وبرگشت می‌کردند (WEAK→HEALTHY)؛ تغییر
+                                # مکرر IP برای یک اکانت = پرچم قرمز. تا پایان
+                                # PROXY_MIN_DWELL_HOURS (پیش‌فرض ۲۴h) از آخرین چرخش،
+                                # هیچ چرخشِ پیشگیرانه‌ای انجام نمی‌شود.
+                                try:
+                                    if await redis.exists(f"proxy_dwell:{acc.id}"):
+                                        continue
+                                except Exception:
+                                    pass
                                 proxy = await db_session.scalar(select(Proxy).where(Proxy.proxy_string == acc.proxy_string))
                                 
                                 if proxy and proxy.health_state == "WEAK":
@@ -516,7 +527,10 @@ async def auto_reconnect_loop(worker_pool: dict, bot: Bot) -> None:
                                         select(Proxy.id).where(
                                             Proxy.is_active == True,
                                             Proxy.health_state == "HEALTHY",
-                                            Proxy.in_use < max(1, getattr(config, 'MAX_ACCOUNTS_PER_PROXY', 100))
+                                            # 🧊 FIX (POST-REVIEW): fallback قبلی ۱۰۰ بود که با
+                                            # MAX_ACCOUNTS_PER_PROXY=3 ناسازگار بود — اگر attribute
+                                            # به هر دلیلی موجود نبود، چرخش به پروکسی پرشده مجاز می‌شد.
+                                            Proxy.in_use < max(1, getattr(config, 'MAX_ACCOUNTS_PER_PROXY', 3))
                                         ).limit(1)
                                     )
                                     if healthy_candidate:

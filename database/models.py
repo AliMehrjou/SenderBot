@@ -123,6 +123,12 @@ class Account(Base):
     )
     photo_package: Mapped[Optional["ProfilePhotoPackage"]] = relationship(back_populates="accounts")
 
+    # 🧊 FIX (startup-storm): شناسه‌ی آخرین پکیج عکسی که با موفقیت روی تلگرام
+    # اعمال شده است — استارت‌ها/ری‌کانکت‌های بعدی اگر همین مقدار باشد، چرخشِ
+    # کامل عکس (wipe+upload+verify) را تکرار نمی‌کنند. توسط
+    # run_startup_migrations به‌صورت idempotent به دیتابیس موجود اضافه می‌شود.
+    photo_package_synced_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+
     # 🔒 (خواسته کارفرما) قفل حریم خصوصی: زمان اعمال تنظیمات خصوصی (None = هنوز اعمال نشده).
     # فقط بیو و عکس پروفایل عمومی می‌مانند؛ شماره/لست‌سین/اد گروه/تماس/فوروارد/ویس → Nobody.
     # ستون جدید است و توسط run_startup_migrations به‌صورت idempotent به دیتابیس موجود اضافه می‌شود.

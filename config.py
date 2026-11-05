@@ -51,9 +51,11 @@ class Config:
     # 🛡 (خواسته کارفرما) کانال‌های حفاظت‌شده‌ی ورکرها — هر اکانت ورکر باید عضو این
     # دو کانال بماند و هیچ عملیات پاکسازی/leave اجازه خارج‌کردنش را ندارد.
     # (عمداً جدای از FORCE_JOIN_CHANNELS است؛ آن کلید برای جوین اجباری «کاربران ربات» است)
-    WORKER_PROTECTED_CHANNELS: str = os.getenv(
-        "WORKER_PROTECTED_CHANNELS", "@linkdoonifun,@robotsfunlink"
-    )
+    # 🧊 FIX: پیش‌فرض خالی شد — دو کانال قبلی توسط تلگرام حذف شده بودند
+    # (USERNAME_NOT_OCCUPIED در لاگ bot_19) و عضویت همه‌ی ورکرها در دو کانال
+    # مشترک، کل اکانت‌ها را به‌عنوان «یک خوشه» پیوند می‌داد (ریسک بن زنجیره‌ای).
+    # اگر کانال زنده و مطلوب دارید، در .env مقداردهی کنید.
+    WORKER_PROTECTED_CHANNELS: str = os.getenv("WORKER_PROTECTED_CHANNELS", "")
 
     # 🧮 (خواسته کارفرما) سقف کل اکانت‌های قابل افزودن به ربات — بالاتر از این
     # تعداد، هیچ اکانت جدیدی ثبت نمی‌شود (لاگین تلفنی، سشن تکی و زیپ گروهی).
@@ -64,9 +66,16 @@ class Config:
     MAX_DIRECT_ACCOUNTS: int = int(os.getenv("MAX_DIRECT_ACCOUNTS", "50"))
     
     PROXY_REASSIGN_ENABLED: bool = _env_flag("PROXY_REASSIGN_ENABLED", "true")
-    FALLBACK_TO_DIRECT_IP: bool = _env_flag("FALLBACK_TO_DIRECT_IP", "true")
+    # 🧊 FIX (POST-REVIEW): طبق گزارش ANTICHAIN_BAN_FIXES باید پیش‌فرض false باشد.
+    # true بودن یعنی «نبودِ پروکسی → نشستن روی IP خام سرور» — همان مسیری که
+    # خوشه‌سازی IP و بن دسته‌ای را رقم می‌زند. برای فعال‌سازی آگاهانه، در .env
+    # صریح مقداردهی کنید.
+    FALLBACK_TO_DIRECT_IP: bool = _env_flag("FALLBACK_TO_DIRECT_IP", "false")
 
-    MAX_ACCOUNTS_PER_PROXY: int = int(os.getenv("MAX_ACCOUNTS_PER_PROXY", "20"))
+    # 🧊 FIX (anti-cluster): سقف اکانت روی هر پروکسی — تلگرام اکانت‌های یک IP را
+    # یک «خوشه» می‌بیند. مقدار ۲۰ (پیش‌فرض قبلی) و ۱۰۰ (مقدار .env قبلی) مستقیماً
+    # عامل فاجعه‌ی بن دسته‌ای بود. پیش‌فرض امن: ۳.
+    MAX_ACCOUNTS_PER_PROXY: int = int(os.getenv("MAX_ACCOUNTS_PER_PROXY", "3"))
     SHARED_API_ID_WARN_THRESHOLD: int = int(os.getenv("SHARED_API_ID_WARN_THRESHOLD", "5"))
 
     # افزوده شده برای یکدست‌سازی تاخیر حلقه‌ی Reconnect و Health Check (F17)
@@ -82,7 +91,11 @@ class Config:
     SMARTFLOW_SEEN_TIMEOUT_MAX: float = float(os.getenv("SMARTFLOW_SEEN_TIMEOUT_MAX", "60.0"))
     SMARTFLOW_STAGE_DELAY_MIN: float = float(os.getenv("SMARTFLOW_STAGE_DELAY_MIN", "8.0"))
     SMARTFLOW_STAGE_DELAY_MAX: float = float(os.getenv("SMARTFLOW_STAGE_DELAY_MAX", "20.0"))
-    BYPASS_WARMUP: bool = _env_flag("BYPASS_WARMUP", "true")
+    # 🧊 FIX (POST-REVIEW): پیش‌فرضِ true باعث می‌شد بدون .env، دوره‌ی گرم‌شدن
+    # ۲۴ ساعته‌ی اکانت‌های تازه بی‌صدا دور شود (خواسته‌ی گزارش BAN_FREEZE).
+    # اکنون پیش‌فرض false است؛ اکانت‌های قدیمی (warmed_up_at=NULL) بلاک نمی‌شوند
+    # (رفع legacy-warmup در task_queue.py فقط لاگین‌های تازه را مشمول ۲۴h می‌کند).
+    BYPASS_WARMUP: bool = _env_flag("BYPASS_WARMUP", "false")
 
     NEW_ACCOUNT_DAYS: int = int(os.getenv("NEW_ACCOUNT_DAYS", "14"))
     NEW_ACCOUNT_DAILY_SEND_LIMIT: int = int(os.getenv("NEW_ACCOUNT_DAILY_SEND_LIMIT", "20"))
@@ -96,6 +109,16 @@ class Config:
 
     DISPATCH_BATCH_SIZE: int = int(os.getenv("DISPATCH_BATCH_SIZE", "6"))
     DISPATCH_INTERVAL_SECONDS: float = float(os.getenv("DISPATCH_INTERVAL_SECONDS", "1.0"))
+
+    # 🚨 FIX (خواسته‌ی صریح کارفرما — «کلا نباید در انتظار دیسپچ بیوفته و pending»):
+    # اگر در یک چرخه‌ی دیسپچ، هیچ ورکرِ آماده‌ای نتواند سفارش را برباید (همه مشغول،
+    # در استراحت/لیمیت، دوره‌ی گرم‌شدن، یا عدم تطابق دسته)، سفارش «همان لحظه» و
+    # دقیقاً مطابق الگوی «کمبود ورکر» بسته می‌شود: پیام Push به کارفرما + فایل
+    # خروجی (در صورت وجود ارسال موفق) + داشبورد لایو + اطلاع ادمین‌ها.
+    # سفارش دیگر هرگز در صف «در انتظار دیسپچ» نمی‌ماند.
+    # برای بازگشت به رفتار قبلی (ماندن در صف تا آزاد شدن ورکر) این کلید را
+    # در .env برابر false قرار دهید.
+    INSTANT_CLOSE_ON_NO_WORKER: bool = _env_flag("INSTANT_CLOSE_ON_NO_WORKER", "true")
     
     EXTRACT_PAUSE_MIN: float = float(os.getenv("EXTRACT_PAUSE_MIN", "0.25"))
     EXTRACT_PAUSE_MAX: float = float(os.getenv("EXTRACT_PAUSE_MAX", "0.5"))
@@ -159,7 +182,11 @@ class Config:
     
     SPAMBOT_SOFT_LIMIT_REST_MINUTES: int = int(os.getenv("SPAMBOT_SOFT_LIMIT_REST_MINUTES", "60"))
     
-    SPAMBOT_RECsHECK_INTERVAL_MINUTES: int = int(os.getenv("SPAMBOT_RECHECK_INTERVAL_MINUTES", "30"))
+    # 🧊 FIX (typo): نام attribute قبلی «SPAMBOT_RECsHECK_INTERVAL_MINUTES» بود؛
+    # getattr(config, "SPAMBOT_RECHECK_INTERVAL_MINUTES") هرگز آن را پیدا نمی‌کرد و
+    # همیشه پیش‌فرض ۳۰ برمی‌گشت. نام attribute اصلاح شد؛ نام قدیمی alias ماند.
+    SPAMBOT_RECHECK_INTERVAL_MINUTES: int = int(os.getenv("SPAMBOT_RECHECK_INTERVAL_MINUTES", "30"))
+    SPAMBOT_RECsHECK_INTERVAL_MINUTES: int = SPAMBOT_RECHECK_INTERVAL_MINUTES  # (منسوخ — alias)
 
     
     PRESENCE_KEEPER_ENABLED: bool = _env_flag("PRESENCE_KEEPER_ENABLED", "false")
@@ -168,6 +195,70 @@ class Config:
     # مدت «چشمک آنلاین» بر حسب ثانیه: مثل گوشی‌ای که بیدار می‌شود، سینک می‌کند و می‌خوابد
     PRESENCE_BLIP_MIN_SECONDS: float = float(os.getenv("PRESENCE_BLIP_MIN_SECONDS", "10"))
     PRESENCE_BLIP_MAX_SECONDS: float = float(os.getenv("PRESENCE_BLIP_MAX_SECONDS", "30"))
+
+    # ==========================================
+    # 🧊 FREEZE GUARD — تنظیمات گارد فریز (utils/freeze_guard.py)
+    # (پس از تحلیل لاگ‌های bot_18/bot_19 اضافه شد؛ ریشه‌ی اصلی بن‌ها)
+    # ==========================================
+    # طول کول‌داون اکانتِ فریز‌شده (FROZEN_METHOD_INVALID) به ساعت — در این مدت
+    # هیچ فعالیت غیرضروری (چرخش عکس/جوین/warm-up/ارسال) انجام نمی‌شود.
+    FROZEN_COOLDOWN_HOURS: float = float(os.getenv("FROZEN_COOLDOWN_HOURS", "24"))
+
+    # آستانه‌ی «موج فریز»: اگر این تعداد فریز در پنجره‌ی موج بن رخ دهد،
+    # دیسپچ کل سیستم موقتاً فریز می‌شود (فریز دسته‌ای = پیش‌درآمد بن دسته‌ای).
+    BAN_WAVE_FROZEN_GLOBAL_THRESHOLD: int = int(os.getenv("BAN_WAVE_FROZEN_GLOBAL_THRESHOLD", "3"))
+
+    # ==========================================
+    # 🛑 ANTI-CHAIN-BAN — کلیدهای گارد موج بن (utils/ban_wave.py)
+    # 🧊 FIX (POST-REVIEW): این کلیدها قبلاً فقط به‌صورت fallback داخل _cfg()
+    # تعریف شده بودند و از config خوانده نمی‌شدند؛ یعنی مقداردهی در .env
+    # «هیچ اثری نداشت». اکنون اینجا تعریف شده‌اند و از .env قابل تنظیم‌اند.
+    # ==========================================
+    # پنجره‌ی شمارش موج بن (دقیقه) — شمارنده‌های سراسری گارد در این پنجره ریست می‌شوند
+    BAN_WAVE_WINDOW_MINUTES: int = int(os.getenv("BAN_WAVE_WINDOW_MINUTES", "60"))
+    # آستانه‌ی بن واقعی در پنجره → فریز کل دیسپچر
+    BAN_WAVE_GLOBAL_THRESHOLD: int = int(os.getenv("BAN_WAVE_GLOBAL_THRESHOLD", "3"))
+    # آستانه‌ی PeerFlood در پنجره → فریز کل دیسپچر
+    BAN_WAVE_GLOBAL_PF_THRESHOLD: int = int(os.getenv("BAN_WAVE_GLOBAL_PF_THRESHOLD", "5"))
+    # مدت فریز سراسری دیسپچر پس از فعال‌شدن موج (دقیقه)
+    BAN_WAVE_FREEZE_MINUTES: int = int(os.getenv("BAN_WAVE_FREEZE_MINUTES", "60"))
+    # آستانه‌ی بن روی «یک پروکسی» در ۲۴h → قرنطینه‌ی پروکسی سوخته
+    BAN_WAVE_PROXY_BAN_THRESHOLD: int = int(os.getenv("BAN_WAVE_PROXY_BAN_THRESHOLD", "2"))
+    # آستانه‌ی PeerFlood روی «یک پروکسی» در ۲۴h → قرنطینه‌ی پروکسی سوخته
+    BAN_WAVE_PROXY_PF_THRESHOLD: int = int(os.getenv("BAN_WAVE_PROXY_PF_THRESHOLD", "3"))
+    # مدت قرنطینه‌ی پروکسی سوخته (ساعت)
+    BAN_PROXY_QUARANTINE_HOURS: int = int(os.getenv("BAN_PROXY_QUARANTINE_HOURS", "72"))
+    # فاصله‌گذاری claim پروکسی بعد از هر تک‌بن/فریز (ساعت)
+    BAN_PROXY_CLAIM_COOLDOWN_HOURS: int = int(os.getenv("BAN_PROXY_CLAIM_COOLDOWN_HOURS", "24"))
+    # ⚠️ DEPRECATED (v2): بن واقعی = لغوی فوری سفارش؛ اسپم = سوییچ فوری.
+    # هیچ کدی این کلید را نمی‌خواند؛ فقط برای سازگاری .env نگه داشته شده است.
+    BAN_FAILOVER_COOLDOWN_MINUTES: int = int(os.getenv("BAN_FAILOVER_COOLDOWN_MINUTES", "30"))
+
+    # ==========================================
+    # 🖼 چرخش عکس پروفایل — تنظیمات ضد چکش‌کاری
+    # ==========================================
+    # چرخش عکس فقط برای پکیجِ «تازه‌اعمال‌نشده» اجرا می‌شود؛ اگر true باشد در هر
+    # استارت/ری‌کانکت هم دوباره اجرا می‌شود (رفتار قدیم — توصیه نمی‌شود).
+    PHOTO_ROTATION_ON_STARTUP: bool = _env_flag("PHOTO_ROTATION_ON_STARTUP", "false")
+    # بودجه‌ی زمانی کل هر چرخش (ثانیه) — تضمین می‌کند اسلات سمافور/قفلِ اکانت
+    # برای همیشه اشغال نشود.
+    PHOTO_ROTATION_TIMEOUT_SECONDS: int = int(os.getenv("PHOTO_ROTATION_TIMEOUT_SECONDS", "900"))
+    # حداکثر دورِ تلاش برای پاک‌سازی عکس‌های قدیمی در هر چرخش.
+    PHOTO_WIPE_MAX_PASSES: int = int(os.getenv("PHOTO_WIPE_MAX_PASSES", "4"))
+
+    # ==========================================
+    # 🚀 استگرت استارت‌آپ ورکرها (ضد همگامی — امضای فارم)
+    # ==========================================
+    WORKER_START_STAGGER_MIN: float = float(os.getenv("WORKER_START_STAGGER_MIN", "3"))
+    WORKER_START_STAGGER_MAX: float = float(os.getenv("WORKER_START_STAGGER_MAX", "8"))
+
+    # ==========================================
+    # 🧲 حداقل اقامت اکانت روی یک پروکسی (ضد فلپینگ IP) — ساعت
+    # ==========================================
+    PROXY_MIN_DWELL_HOURS: int = int(os.getenv("PROXY_MIN_DWELL_HOURS", "24"))
+
+    # 🧊 کش منفی کانال‌های حفاظت‌شده‌ی مرده (ساعت)
+    DEAD_CHANNEL_CACHE_HOURS: int = int(os.getenv("DEAD_CHANNEL_CACHE_HOURS", "24"))
     
     @property
     def MYSQL_URL(self) -> str:

@@ -19,6 +19,7 @@
 
 import asyncio
 import logging
+import random
 import time
 from typing import Dict, Optional, Set
 
@@ -29,6 +30,38 @@ logger = logging.getLogger(__name__)
 # هر ورکر حداکثر با این فاصله یک‌بار join-check می‌شود (به‌عنوان членو باقی می‌ماند
 # حتی وقتی ری‌کانکت می‌شود؛ FloodWait به‌عنوان خطا در نظر گرفته می‌شود).
 RECHECK_TTL_SECONDS = 6 * 3600
+
+
+# 🧊 FIX (dead-channel-retry): کانال‌های مرده (حذف‌شده توسط تلگرام —
+# USERNAME_NOT_OCCUPIED / CHANNEL_PRIVATE) برای این مدت (ساعت) دیگر resolve/JOIN
+# نمی‌شوند. در لاگ bot_19 همین دو کانالِ ازقبل‌حذف‌شده ۷۰ بار تلاش بیهوده
+# (و ۷۰ فراخوانی contacts.ResolveUsername) داشتند.
+DEAD_CHANNEL_CACHE_HOURS = 24
+
+
+def _dead_channel_cfg_hours() -> int:
+    try:
+        from config import config
+        return max(1, int(getattr(config, "DEAD_CHANNEL_CACHE_HOURS", DEAD_CHANNEL_CACHE_HOURS)))
+    except (TypeError, ValueError, AttributeError):
+        return DEAD_CHANNEL_CACHE_HOURS
+
+
+async def _is_dead_channel(name: str) -> bool:
+    """آیا این کانال اخیراً مرده/حذف‌شده شناسایی شده؟ (کش منفی Redis — best-effort)"""
+    try:
+        from workers.sender import _get_redis
+        return bool(await _get_redis().get(f"dead_ch:{name}"))
+    except Exception:
+        return False
+
+
+async def _mark_dead_channel(name: str) -> None:
+    try:
+        from workers.sender import _get_redis
+        await _get_redis().set(f"dead_ch:{name}", "1", ex=_dead_channel_cfg_hours() * 3600)
+    except Exception:
+        pass
 
 # آینه‌ی محلی برای مقایسه‌ی سریع (بدون فراخوانی تلگرام)
 _usernames: Set[str] = set()
@@ -173,6 +206,31 @@ async def ensure_worker_in_protected_channels(
     if not names:
         return report
 
+    # 🧊 FIX (frozen-join): اکانت فریز اجازه‌ی جوین ندارد — FROZEN_METHOD_INVALID
+    # روی channels.JoinChannel در bot_18 دقیقاً همین‌جا رخ می‌داد (۳۵ بار در استارت).
+    if account_id is not None:
+        try:
+            from utils.freeze_guard import is_account_frozen
+            if await is_account_frozen(account_id):
+                logger.info(
+                    f"Protected channels: worker {account_id} is FROZEN — skipping join check."
+                )
+                return report
+        except Exception:
+            pass
+
+    # 🧊 FIX (dead-channel-retry): کانال‌های مرده را همین‌جا فیلتر می‌کنیم
+    alive_names = []
+    for n in names:
+        if await _is_dead_channel(n):
+            logger.debug(f"Protected channels: @{n} is cached DEAD — skipping.")
+            report[n] = "dead"
+        else:
+            alive_names.append(n)
+    names = alive_names
+    if not names:
+        return report
+
     # throttle per-account ( reconnectها هر ۶۰ ثانیه صدا زده می‌شوند؛
     # نباید هر بار join-check بزنیم )
     if account_id is not None and not force:
@@ -197,6 +255,9 @@ async def ensure_worker_in_protected_channels(
     for name in names:
         status = "error"
         try:
+            # 🧊 رفتار انسانی: مکث تصادفی قبل از هر resolve/join — قبلاً هر دو کانال
+            # برای همه‌ی ورکرها در همان ثانیه‌ی استارت‌آپ پشت‌سرهم زده می‌شد.
+            await asyncio.sleep(random.uniform(1.0, 4.0))
             # ۱. resolve و کش‌کردن chat_id (برای محافظت‌های بعدی در leave-sweep)
             try:
                 chat = await asyncio.wait_for(client.get_chat(name), timeout=15)
@@ -205,7 +266,16 @@ async def ensure_worker_in_protected_channels(
                     _resolved_ids.add(int(chat_id))
                     _known_username_to_id[name] = int(chat_id)
             except Exception as e:
-                logger.debug(f"Protected channels: get_chat(@{name}) failed: {e}")
+                _err_name = type(e).__name__
+                if _err_name in ("UsernameNotOccupied", "ChannelPrivate", "UsernameInvalid"):
+                    # کانال حذف/خصوصی شده — کش منفی تا حلقه‌های بعدی مزاحم نباشد
+                    await _mark_dead_channel(name)
+                    logger.warning(
+                        f"Protected channels: @{name} is GONE ({_err_name}) — "
+                        f"cached as dead for {_dead_channel_cfg_hours()}h."
+                    )
+                else:
+                    logger.debug(f"Protected channels: get_chat(@{name}) failed: {e}")
 
             # ۲. join (اگر از قبل عضو باشد UserAlreadyParticipant می‌گیریم)
             await asyncio.wait_for(client.join_chat(name), timeout=30)
@@ -220,11 +290,24 @@ async def ensure_worker_in_protected_channels(
                 f"(worker {account_id}); will retry later."
             )
         except Exception as e:
-            # InviteRequestSent (کانال تأییدی) و خطاهای گذرا اینجا می‌افتند
-            status = "pending" if "InviteRequestSent" in type(e).__name__ else "error"
+            # InviteRequestSent (کانال تایيیدی) و خطاهاي گذرا اينجا مي‌افتند
+            _err_name = type(e).__name__
+            if _err_name in ("UsernameNotOccupied", "ChannelPrivate", "UsernameInvalid"):
+                await _mark_dead_channel(name)
+                status = "dead"
+            else:
+                status = "pending" if "InviteRequestSent" in _err_name else "error"
+            # فریز: ثبت و قطع براي همين اکانت (تا موج فريز هم ديده شود)
+            if "FROZEN_METHOD_INVALID" in str(e).upper():
+                try:
+                    from utils.freeze_guard import mark_account_frozen
+                    await mark_account_frozen(account_id, reason=f"join @{name}: {e}")
+                except Exception:
+                    pass
+                status = "frozen"
             logger.warning(
                 f"Protected channels: join @{name} failed for worker {account_id}: "
-                f"{type(e).__name__}: {e}"
+                f"{_err_name}: {e}"
             )
         report[name] = status
 

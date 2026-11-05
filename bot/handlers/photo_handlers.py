@@ -1091,22 +1091,56 @@ async def wipe_all_workers_photos(message: types.Message):
         if not getattr(client, "is_connected", False):
             continue
         try:
-            # حلقه بی‌نهایت تا زمانی که هیچ عکسی نماند
-            while True:
+            # 🧊 FIX (infinite-hammer): حلقه‌ی قبلی «while True» وقتی حذف عکس ممکن
+            # نبود (اکانت فریز/محدود) هرگز خارج نمی‌شد و photos.GetUserPhotos را
+            # هر ~۱۱ ثانیه بی‌وقفه صدا می‌زد. الان: سقف دور + خروج روی پیشرفتِ صفر
+            # + قطع فوری روی FROZEN_METHOD_INVALID.
+            from utils.freeze_guard import is_account_frozen, is_frozen_error, mark_account_frozen
+            if await is_account_frozen(account_id):
+                logger.warning(f"wipe_all_photos: user_{account_id}/ SKIPPED — account is FROZEN.")
+                continue
+
+            # 🧊 FIX (POST-REVIEW): مقدار قبلاً هاردکد ۴ بود و PHOTO_WIPE_MAX_PASSES
+            # از .env خوانده نمی‌شد؛ اکنون مثل بقیه‌ی حلقه‌های پاک‌سازی از config می‌خواند.
+            try:
+                max_passes = max(1, int(getattr(config, "PHOTO_WIPE_MAX_PASSES", 4)))
+            except (TypeError, ValueError):
+                max_passes = 4
+            for pass_no in range(1, max_passes + 1):
                 photos = [p async for p in client.get_chat_photos("me", limit=5)]
                 if not photos:
                     break # کاملاً خالی شد
-                    
+
+                deleted_this_pass = 0
                 for photo in photos:
                     try:
                         # ارسال در قالب لیست یک‌عضوی برای جلوگیری از باگ Pyrogram
                         await client.delete_profile_photos([photo.file_id])
                         total_wiped += 1
+                        deleted_this_pass += 1
                         await asyncio.sleep(1.5)
                     except FloodWait as e:
                         await asyncio.sleep(e.value + 1)
-                    except Exception:
-                        pass
+                        try:
+                            await client.delete_profile_photos([photo.file_id])
+                            total_wiped += 1
+                            deleted_this_pass += 1
+                        except Exception as retry_err:
+                            if is_frozen_error(retry_err):
+                                await mark_account_frozen(account_id, reason=f"wipe: {retry_err}")
+                                break
+                    except Exception as del_err:
+                        if is_frozen_error(del_err):
+                            await mark_account_frozen(account_id, reason=f"wipe: {del_err}")
+                            break
+                        logger.warning(f"wipe_all_photos: failed to delete a photo for user_{account_id}/: {del_err}")
+
+                if deleted_this_pass == 0:
+                    logger.warning(
+                        f"wipe_all_photos: user_{account_id}/ pass {pass_no} deleted 0 photos "
+                        "(delete not permitted — likely frozen/restricted); skipping this account."
+                    )
+                    break
         except Exception as e:
             logger.error(f"Wipe error for user_{account_id}: {e}")
             

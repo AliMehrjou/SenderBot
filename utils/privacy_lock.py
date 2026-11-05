@@ -246,6 +246,17 @@ async def ensure_account_privacy_locked(
         logger.warning("PrivacyLock: ensure_account_privacy_locked called with invalid account_id.")
         return False
 
+    # 🧊 FIX: اکانت فریز را کامل رد می‌کنیم — فراخوانی‌های SetPrivacy روی
+    # اکانت فریز شکست می‌خورد و فقط سیگنال اسپم تولید می‌کند؛ بعد از پایان
+    # کول‌داونِ فریز، استارت/ریکانکت بعدی قفل را idempotent اعمال می‌کند.
+    try:
+        from utils.freeze_guard import is_account_frozen
+        if await is_account_frozen(account_id):
+            logger.info(f"PrivacyLock user_{account_id}/: SKIPPED — account is FROZEN.")
+            return False
+    except Exception:
+        pass
+
     lock = _get_account_lock(account_id)
     async with lock:
         try:

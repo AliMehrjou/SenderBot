@@ -13,6 +13,7 @@ from pyrogram.errors import (
     AuthKeyUnregistered,
     ChannelInvalid,
     ChatForwardsRestricted,
+    Flood,
     FloodWait,
     PeerFlood,
     PeerIdInvalid,
@@ -1356,6 +1357,73 @@ async def execute_bulk_send(
             dismiss_seen_event(client, peer_id)
             break
 
+        except Flood as e:
+            # 🧊 FIX (frozen-send): خطای 420 بدونِ FloodWait — از جمله
+            # FROZEN_METHOD_INVALID که pyrofork آن را با کلاس عمومی Flood
+            # می‌آورد. قبلاً این خطا به except Exception عمومی می‌افتید و بعد از
+            # ۳ خطای پیاپی فقط کول‌داونِ کوتاه می‌گرفت؛ اکانتِ فریز عملاً تا
+            # بن شدن مدام استفاده می‌شد.
+            from utils.freeze_guard import is_frozen_error, mark_account_frozen
+
+            if is_frozen_error(e):
+                log_status = "partial" if stage_1_delivered else "error"
+                log_msg = _log_attempt(log_status, "FROZEN_METHOD_INVALID", str(e)[:100])
+                session.add(OrderLog(
+                    order_id=order.id, account_id=account_db_id, target=target,
+                    status=log_status, error_message=log_msg
+                ))
+                await session.commit()
+
+                _frz_proxy = (account_row.proxy_string if account_row else None) or "دایرکت"
+                await _report(
+                    status=(
+                        f"🧊 اکانت توسط تلگرام فریز شد (FROZEN_METHOD_INVALID) — توقف کامل ارسال و شروع کول‌داون…\n"
+                        f"🔗 پروکسی لحظه‌ی رخداد: {_frz_proxy}"
+                    ),
+                    account=account_tag,
+                )
+
+                await mark_account_frozen(
+                    account_db_id,
+                    proxy_string=(account_row.proxy_string if account_row else None),
+                    reason=f"send_message: {e}",
+                    order_id=order.id,
+                )
+
+                stop_reason = "frozen"
+                if stage_1_delivered:
+                    unsent.extend(targets[position+1:])
+                    sent_in_chunk += 1
+                    await _bump_daily()
+                    await incr_hourly_sent_count(account_db_id)
+                else:
+                    unsent.extend(targets[position+1:])
+
+                dismiss_seen_event(client, peer_id)
+                break
+
+            # سایر خطاهای 420 بدون مقدار انتظار: مثل FloodWait سبک رفتار می‌شود
+            log_status = "partial" if stage_1_delivered else "flood"
+            log_msg = _log_attempt(log_status, "Flood(420)", str(e)[:100])
+            session.add(OrderLog(
+                order_id=order.id, account_id=account_db_id, target=target,
+                status=log_status, error_message=log_msg
+            ))
+            await session.commit()
+            await _report(status=f"⏳ محدودیت Flood (بدون زمان مشخص) — توقف chunk…", account=account_tag)
+            from utils.limit_handler import register_account_limit
+            await register_account_limit(session, account_db_id, client, "flood_wait", 120)
+            stop_reason = "flood_wait"
+            if stage_1_delivered:
+                unsent.extend(targets[position+1:])
+                sent_in_chunk += 1
+                await _bump_daily()
+                await incr_hourly_sent_count(account_db_id)
+            else:
+                unsent.extend(targets[position:])
+            dismiss_seen_event(client, peer_id)
+            break
+
         except PeerFlood as e:
             log_status = "partial" if stage_1_delivered else "restricted"
             log_msg = _log_attempt(log_status, "PeerFlood", "Spam Limit")
@@ -1495,6 +1563,39 @@ async def execute_bulk_send(
         except Exception as e:
             err_type = e.__class__.__name__
             error_str = str(e).lower()
+
+            # 🧊 FIX (frozen-send safety-net): اگر در نسخه‌ای از pyrofork خطای
+            # FROZEN_METHOD_INVALID با کلاس دیگری بیاید، اینجا هم گرفته می‌شود
+            # (قبل از هر دسته‌بندی دیگرِ خطا).
+            from utils.freeze_guard import is_frozen_error, mark_account_frozen
+            if is_frozen_error(e):
+                log_status = "partial" if stage_1_delivered else "error"
+                log_msg = _log_attempt(log_status, "FROZEN_METHOD_INVALID", str(e)[:100])
+                session.add(OrderLog(
+                    order_id=order.id, account_id=account_db_id, target=target,
+                    status=log_status, error_message=log_msg
+                ))
+                await session.commit()
+                await mark_account_frozen(
+                    account_db_id,
+                    proxy_string=(account_row.proxy_string if account_row else None),
+                    reason=f"send_message(generic): {e}",
+                    order_id=order.id,
+                )
+                await _report(
+                    status="🧊 اکانت توسط تلگرام فریز شد (FROZEN_METHOD_INVALID) — توقف کامل…",
+                    account=account_tag,
+                )
+                stop_reason = "frozen"
+                if stage_1_delivered:
+                    unsent.extend(targets[position+1:])
+                    sent_in_chunk += 1
+                    await _bump_daily()
+                    await incr_hourly_sent_count(account_db_id)
+                else:
+                    unsent.extend(targets[position+1:])
+                dismiss_seen_event(client, peer_id)
+                break
 
             fatal_message_errors = [
                 "MessageEmpty", "MessageInvalid", "MessageTooLong", 

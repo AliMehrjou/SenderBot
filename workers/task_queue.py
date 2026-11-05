@@ -175,11 +175,17 @@ async def _is_warmed_up(session: AsyncSession, acc: Account, now: datetime) -> b
     warmed = acc.warmed_up_at
     if warmed is None:
         try:
-            # زمان پایان دوره گرم‌شدن همچنان در دیتابیس ثبت می‌شود تا دیتای شما تمیز بماند
+            # 🧊 FIX (legacy-warmup): warmed_up_at=NULL یعنی این اکانت از قبلِ
+            # سیستمِ warmup وجود داشته (اکانت قدیمی/بالغ)، نه اینکه تازه لاگین
+            # شده باشد — لاگین تازه همیشه warmed_up_at را در start_single_worker
+            # ست می‌کند. قبلاً این‌جا «now + ۲۴h» نوشته می‌شد و با فعال‌شدن
+            # BYPASS_WARMUP=false همه‌ی اکانت‌های قدیمی یک‌باره ۲۴ ساعت بلاک
+            # می‌شدند. الان اکانت قدیمی «همین حالا گرم‌شده» علامت می‌خورد و
+            # دیسپچ ادامه می‌یابد؛ دوره‌ی ۲۴ ساعته فقط برای لاگین‌های تازه است.
             await session.execute(
                 update(Account)
                 .where(Account.id == acc.id, Account.warmed_up_at.is_(None))
-                .values(warmed_up_at=now + timedelta(hours=_warmup_hours()))
+                .values(warmed_up_at=now)
                 .execution_options(synchronize_session=False)
             )
         except Exception as e:
@@ -187,7 +193,8 @@ async def _is_warmed_up(session: AsyncSession, acc: Account, now: datetime) -> b
         
         if BYPASS_WARMUP:
             return True
-        return False
+        # اکانت قدیمی همین الان علامت «گرم‌شده» خورد → بلاک نمی‌شود
+        return True
 
     if warmed.tzinfo is None:
         warmed = warmed.replace(tzinfo=timezone.utc)
@@ -2250,11 +2257,13 @@ async def background_order_execution(
             # stop_reason اختصاصی دارد و مثل قبل (رفتار اصلی) بی‌درنگ به ورکر بعدی
             # سوییچ می‌کند؛ «banned»/«account_banned» هرگز به اینجا نمی‌رسند چون بلوک
             # لغوی فوریِ بالا آنها را می‌گیرد و سفارش را همان لحظه لغو می‌کند.
+            # 🧊 «frozen» اضافه شد: اکانت فریز خودش کول‌داون گرفته (freeze_guard)؛
+            # سفارش بی‌درنگ به ورکر بعدی سوییچ می‌کند — بدون خنک‌سازی سفارش.
             limit_reasons = (
                 "flood_wait", "blocked", "peer_flood", "banned", "consecutive_errors", 
                 "chunk_limit", "hourly_cap", "daily_cap", "error", 
                 "proxy_connection_error", "account_limited", 
-                "account_banned", "account_inactive"
+                "account_banned", "account_inactive", "frozen"
             )
             if not _is_extract_order(order) and stop_reason in limit_reasons and unsent_targets:
                 new_worker_found = False
@@ -2412,7 +2421,7 @@ async def background_order_execution(
 
             else:
                 # 🟢 چرخش پیشگیرانه (Proactive Rotation - فاز ۵) بین چانک‌ها
-                if stop_reason not in ("proxy_connection_error", "crash", "blocked", "peer_flood", "banned", "account_banned") and not _is_extract_order(order):
+                if stop_reason not in ("proxy_connection_error", "crash", "blocked", "peer_flood", "banned", "account_banned", "frozen") and not _is_extract_order(order):
                     try:
                         redis = _get_redis()
                         chunks_count = await redis.incr(f"worker_chunks:{primary_id}")
@@ -3092,9 +3101,6 @@ async def order_dispatcher_loop(
     extract_estimate_timeout = 20.0
 
     logger.info("Order Dispatcher Loop started.")
-    
-    _logged_pending_orders: set = set()
-    _warmup_notified_orders: set = set()
 
     while True:
         global_profile = await get_speed_profile()
@@ -3291,7 +3297,6 @@ async def order_dispatcher_loop(
             logger.debug(f"Ban-wave freeze check failed (fail-open): {banwave_err}")
 
         _batch_seen_order_ids: set = set()
-        active_pending_orders_this_cycle = set()
         
         # 🚀 فاز ۴: مخزن تسک‌های موازی
         tasks_to_launch = []
@@ -3354,6 +3359,7 @@ async def order_dispatcher_loop(
             background_scheduled = False
             link_resolver_scheduled = False
             empty_target_notify_code: Optional[str] = None
+            no_worker_reason: Optional[str] = None
             
             try:
                 async with session_maker() as session:
@@ -3387,7 +3393,6 @@ async def order_dispatcher_loop(
 
                     order_id_db = order.id
                     _batch_seen_order_ids.add(order.id)
-                    active_pending_orders_this_cycle.add(order.id)
                     order_tracking_code = (
                         order.tracking_code if order.tracking_code else f"ID-{order.id}"
                     )
@@ -3514,7 +3519,10 @@ async def order_dispatcher_loop(
                                 fallback_allowed = direct_ip_fallback_enabled(0) and await direct_budget_ok(session)
                                 
                                 if fallback_allowed:
-                                    logger.warning(f"Order #{order.id}: No proxies available but fallback is enabled globally. Keeping order pending for direct connection.")
+                                    # 🚨 با فیکس INSTANT_CLOSE_ON_NO_WORKER سفارش دیگر
+                                    # در صف نمی‌ماند؛ اگر در همین چرخه ورکری آن را
+                                    # برنمی‌دارد، توسط Fail-Fast پایین بسته می‌شود.
+                                    logger.warning(f"Order #{order.id}: No proxies available but fallback is enabled globally. No dispatchable worker this cycle; instant-close will apply if nothing picks it up.")
                                 else:
                                     await session.execute(
                                         update(Order)
@@ -3527,48 +3535,21 @@ async def order_dispatcher_loop(
                                     await _send_hold_message(session, bot, order.id)
                                     continue
 
-                        if order.id not in _logged_pending_orders:
-                            if not connected_ids:
-                                logger.info(f"Order #{order.id}: no connected workers available; staying pending.")
-                            elif order_cat_ids and accounts_passed_category == 0:
-                                logger.info(f"Order #{order.id}: no connected worker matches categories {order_cat_ids}; staying pending.")
-                            elif accounts_delayed_by_warmup > 0:
-                                logger.info(f"Order #{order.id}: {accounts_delayed_by_warmup} worker(s) matched criteria but are delayed by warmup period; staying pending.")
-                            else:
-                                logger.info(f"Order #{order.id}: no eligible worker available; staying pending.")
-                                
-                            _logged_pending_orders.add(order.id)
-                        
-                        if (accounts_delayed_by_warmup > 0 and 
-                            accounts_passed_category == accounts_delayed_by_warmup and
-                            order.id not in _warmup_notified_orders):
-                            
-                            _warmup_notified_orders.add(order.id)
+                        # 🚨 FIX (خواسته‌ی صریح کارفرما — «کلا نباید در انتظار دیسپچ بیوفته و pending»):
+                        # سفارش دیگر برای گرم‌شدن/آزاد شدن ورکر در صف نمی‌ماند. فقط دلیلِ
+                        # نبودِ ورکر آماده تشخیص داده می‌شود تا بلوک Fail-Fast پایین،
+                        # سفارش را همان لحظه مطابق الگوی «کمبود ورکر» ببندد.
+                        if not connected_ids:
+                            no_worker_reason = "عدم وجود هیچ ورکر متصلی در سیستم"
+                        elif order_cat_ids and accounts_passed_category == 0:
+                            no_worker_reason = "عدم وجود ورکر متصلِ مطابق با دسته‌بندی‌های این سفارش"
+                        elif accounts_delayed_by_warmup > 0:
                             warmup_time_str = max_warmup_end_time.strftime("%H:%M (UTC)") if max_warmup_end_time else "نامشخص"
-                            
-                            notify_text = (
-                                f"⏳ <b>تأخیر به‌دلیل دوره‌ی گرم‌شدن اکانت</b>\n\n"
-                                f"سفارش: <code>{order_tracking_code}</code>\n\n"
-                                f"<i>اکانت(های) متصل و مناسب یافت شدند، اما هنوز در دوره‌ی گرم‌شدن اولیه هستند. "
-                                f"این سفارش در صف انتظار باقی می‌ماند (تقریباً تا ساعت {warmup_time_str}).</i>"
+                            no_worker_reason = (
+                                f"گرم‌شدن ورکرهای مطابق (آماده‌شدن تقریبی تا {warmup_time_str})"
                             )
-                            await broadcast_to_admins(bot, text=notify_text)
-
-                            # 🩹 FIX (اطلاع به کاربر): این اطلاع‌رسانی قبلاً فقط به ادمین‌ها
-                            # می‌رفت و مالکِ سفارش (کاربر) هیچ‌وقت نمی‌فهمید چرا سفارشش در صف
-                            # مانده. الان همان پیام با لحن کاربرپسند برای او هم ارسال می‌شود.
-                            owner_text = (
-                                "⏳ <b>سفارش شما در صف انتظار است</b>\n\n"
-                                f"کد پیگیری: <code>{order_tracking_code}</code>\n\n"
-                                "<i>اکانت‌های سیستم هنوز در دوره‌ی گرم‌شدن اولیه هستند؛ "
-                                f"به‌محض آماده شدن، اجرای سفارش شما به‌صورت خودکار شروع می‌شود "
-                                f"(تقریباً تا ساعت {warmup_time_str}).</i>"
-                            )
-                            await _notify_owner(bot, session_maker, order.id, owner_text)
-
-                    else:
-                        _logged_pending_orders.discard(order.id)
-                        _warmup_notified_orders.discard(order.id)
+                        else:
+                            no_worker_reason = "عدم وجود ورکر آماده در همین لحظه"
 
                     if _is_extract_order(order):
                         extract_links = _parse_target_links(order.target_data)
@@ -3858,31 +3839,62 @@ async def order_dispatcher_loop(
                 dispatched_anything = bool(send_jobs or extract_jobs or resolver_jobs)
                 
                 if not dispatched_anything and not empty_target_notify_code:
-                    # --- بازنویسی منطق توقف سریع (Fail-Fast) دیسپچر ---
-                    # در این حالت هیچ تارگتی در این چرخه به ورکرها داده نشده است.
-                    
-                    fresh_prechecks = {}
-                    if eligible_accounts:
-                        try:
-                            redis = _get_redis()
-                            pipe = redis.pipeline()
-                            for acc in eligible_accounts:
-                                pipe.exists(f"busy_worker:{acc.id}")
-                            results = await pipe.execute()
-                            for idx, acc in enumerate(eligible_accounts):
-                                fresh_prechecks[acc.id] = {"is_busy": bool(results[idx])}
-                        except Exception as e:
-                            logger.error(f"Failed to fetch fresh redis states for cancellation decision: {e}")
-                            for acc in eligible_accounts:
-                                fresh_prechecks[acc.id] = {"is_busy": True}
+                    # ============================================================
+                    # 🚨 FIX (خواسته‌ی صریح کارفرما): «کلا نباید در انتظار دیسپچ
+                    # بیوفته و pending — کلا مشابه کمبود ورکر که همون موقع
+                    # سفارش رو میبنده.»
+                    # تا قبل از این فیکس، وقتی همه‌ی ورکرهای مطابقِ سفارش مشغول
+                    # سفارش‌های دیگر بودند یا در دوره‌ی گرم‌شدن/استراحت/لیمیت
+                    # بودند، سفارش در صف «در انتظار دیسپچ» می‌ماند (گاهی ساعت‌ها).
+                    # اکنون دقیقاً مطابق الگوی «کمبود ورکر» (پایان فوری وسط
+                    # اجرا): اگر در همین چرخه هیچ ورکری نتواند این سفارش را
+                    # بردارد، سفارش همان لحظه بسته می‌شود + پیام Push به کارفرما
+                    # + فایل خروجی (در صورت وجود ارسال موفق) + داشبورد لایو +
+                    # اطلاع ادمین‌ها.
+                    # قابل بازگشت: INSTANT_CLOSE_ON_NO_WORKER=false در .env
+                    # رفتار قبلی (ماندن در صف تا آزاد شدن ورکر) را برمی‌گرداند.
+                    # ============================================================
+                    close_now = bool(getattr(config, "INSTANT_CLOSE_ON_NO_WORKER", True))
 
-                    # آیا ورکری در حال ارسال (busy) هست؟ اگر بله، سیستم باید منتظر بماند.
-                    is_any_worker_busy = any(fresh_prechecks.get(acc.id, {}).get("is_busy", False) for acc in eligible_accounts)
-                    is_waiting_for_warmup = (accounts_delayed_by_warmup > 0)
-                    
-                    # اگر هیچ اکانتی نیست، یا اکانت‌ها هستند ولی هیچ‌کدام busy یا در حال warmup نیستند 
-                    # (یعنی همگی در لیمیت، استراحت یا سقف روزانه گیر کرده‌اند) -> سفارش بلافاصله متوقف می‌شود
-                    if not eligible_accounts or (not is_any_worker_busy and not is_waiting_for_warmup):
+                    if not close_now:
+                        # --- رفتار قبلی (Legacy): فقط وقتی می‌بندد که هیچ اکانتِ واجد
+                        # شرایطی نباشد، یا اکانت‌ها هستند ولی هیچ‌کدام busy یا در حال
+                        # warmup نیستند (یعنی همگی در لیمیت/استراحت/سقف روزانه) ---
+                        fresh_prechecks = {}
+                        if eligible_accounts:
+                            try:
+                                redis = _get_redis()
+                                pipe = redis.pipeline()
+                                for acc in eligible_accounts:
+                                    pipe.exists(f"busy_worker:{acc.id}")
+                                results = await pipe.execute()
+                                for idx, acc in enumerate(eligible_accounts):
+                                    fresh_prechecks[acc.id] = {"is_busy": bool(results[idx])}
+                            except Exception as e:
+                                logger.error(f"Failed to fetch fresh redis states for cancellation decision: {e}")
+                                for acc in eligible_accounts:
+                                    fresh_prechecks[acc.id] = {"is_busy": True}
+
+                        # آیا ورکری در حال ارسال (busy) هست؟ اگر بله، سیستم باید منتظر بماند.
+                        is_any_worker_busy = any(fresh_prechecks.get(acc.id, {}).get("is_busy", False) for acc in eligible_accounts)
+                        is_waiting_for_warmup = (accounts_delayed_by_warmup > 0)
+
+                        close_now = not eligible_accounts or (not is_any_worker_busy and not is_waiting_for_warmup)
+
+                    if close_now:
+                        # تعیین دلیل دقیق برای پیام کارفرما و ادمین‌ها
+                        if not no_worker_reason:
+                            if eligible_accounts:
+                                if accounts_delayed_by_warmup > 0:
+                                    warmup_time_str = max_warmup_end_time.strftime("%H:%M (UTC)") if max_warmup_end_time else "نامشخص"
+                                    no_worker_reason = (
+                                        f"مشغول یا محدود بودن ورکرهای آماده در همین لحظه و گرم‌شدن بقیه‌ی ورکرهای مطابق (تا ~{warmup_time_str})"
+                                    )
+                                else:
+                                    no_worker_reason = "مشغول بودن یا استراحت/لیمیت روزانه بودن تمام ورکرهای مطابق در همین لحظه"
+                            else:
+                                no_worker_reason = "عدم وجود ورکر آماده در همین لحظه"
+
                         # توقف فوری سفارش و ارسال خروجی
                         success_count = (
                             await session.scalar(
@@ -3892,26 +3904,45 @@ async def order_dispatcher_loop(
                             )
                             or 0
                         )
-                        
-                        finish_msg = f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). به دلیل عدم وجود ورکر آماده (لیمیت/استراحت سایر اکانت‌ها)، سفارش لغو و پایان یافت."
+
+                        if success_count > 0:
+                            finish_msg = (
+                                f"سفارش تا این مرحله انجام شد (ارسال موفق: {success_count}). "
+                                f"به دلیل {no_worker_reason}، و طبق سیاست «عدم ماندن در صف انتظار دیسپچ»، "
+                                f"سفارش همان لحظه بسته شد."
+                            )
+                        else:
+                            finish_msg = (
+                                f"هیچ ارسالی انجام نشد. به دلیل {no_worker_reason}، و طبق سیاست "
+                                f"«عدم ماندن در صف انتظار دیسپچ» (الگوی کمبود ورکر)، "
+                                f"سفارش همان لحظه بسته شد."
+                            )
+
                         final_status = OrderStatus.completed if success_count > 0 else OrderStatus.error
-                        
+
                         await session.execute(
                             update(Order)
                             .where(Order.id == order.id)
                             .values(
                                 status=final_status, 
                                 scheduled_for=None, 
-                                reject_reason="اتمام ورکرهای آماده و در دسترس"
+                                reject_reason=f"بسته‌شدن فوری در صف دیسپچ — {no_worker_reason}"
                             )
                             .execution_options(synchronize_session=False)
                         )
                         session.add(OrderLog(order_id=order.id, target="System", status=final_status, error_message=finish_msg))
                         await session.commit()
-                        
+
+                        logger.warning(
+                            f"Order #{order.id}: INSTANT CLOSE (worker-shortage pattern at dispatch) — "
+                            f"nothing dispatchable this cycle. Reason: {no_worker_reason}"
+                        )
+
+                        # ارسال اتوماتیک فایل خروجی برای کارفرما (الگوی کمبود ورکر)
                         if not _is_extract_order(order):
                             _spawn_background_task(_send_export_file(session_maker, bot, order.id, finish_msg))
-                            
+
+                        # بروزرسانی داشبورد لایو کاربر (الگوی کمبود ورکر)
                         task_type = "extract" if _is_extract_order(order) else "order"
                         if reporter := _progress_reporters.get(f"{task_type}:{order.id}"):
                             if final_status == OrderStatus.completed:
@@ -3919,10 +3950,24 @@ async def order_dispatcher_loop(
                             else:
                                 await reporter.fail(f"⛔️ <b>لغو سفارش</b>\n\n{finish_msg}")
                             _pop_progress_reporter(task_type, order.id)
-                            
+
+                        # 🟢 FIX (تکمیل الگوی کمبود ورکر): پیام Push مستقیم به
+                        # کارفرما — قبلاً فقط ادمین‌ها مطلع می‌شدند و صاحب
+                        # سفارش بی‌خبر می‌ماند.
+                        push_title = "✅ <b>پایان سفارش</b>" if final_status == OrderStatus.completed else "⛔️ <b>لغو سفارش</b>"
+                        await _notify_owner(
+                            bot, session_maker, order.id,
+                            f"{push_title}\n\n"
+                            f"کد پیگیری: <code>{order_tracking_code}</code>\n\n{finish_msg}"
+                        )
+
                         await broadcast_to_admins(
                             bot,
-                            text=f"🏁 <b>پایان سفارش به دلیل اتمام منابع</b>\n\nسفارش: <code>{order_tracking_code}</code>\n{finish_msg}"
+                            text=(
+                                f"🏁 <b>پایان سفارش (کمبود ورکر در صف دیسپچ)</b>\n\n"
+                                f"سفارش: <code>{order_tracking_code}</code>\n"
+                                f"دلیل: <i>{no_worker_reason}</i>\n{finish_msg}"
+                            )
                         )
                         continue
 
@@ -3992,9 +4037,6 @@ async def order_dispatcher_loop(
                         logger.error(f"Unhandled exception in background task: {res}", exc_info=res)
             
             _spawn_background_task(_launch_batch(tasks_to_launch))
-
-        _logged_pending_orders.intersection_update(active_pending_orders_this_cycle)
-        _warmup_notified_orders.intersection_update(active_pending_orders_this_cycle)
 
         await asyncio.sleep(max(1.0, float(getattr(config, "DISPATCH_INTERVAL_SECONDS", 2.0))))
 

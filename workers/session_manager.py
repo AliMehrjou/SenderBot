@@ -70,7 +70,9 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 _warmup_lock_key = "warmup_lock:worker_cache"
 
 def direct_ip_fallback_enabled(account_id: int) -> bool:
-    return getattr(config, "FALLBACK_TO_DIRECT_IP", True)
+    # 🧊 FIX (POST-REVIEW): fallback قبلی True بود که با پیش‌فرض امنِ false
+    # ناسازگار بود — در نبودِ attribute، مسیر ناامن (IP خام سرور) باز می‌شد.
+    return getattr(config, "FALLBACK_TO_DIRECT_IP", False)
 
 async def _acquire_warmup_slot() -> None:
     """
@@ -207,26 +209,74 @@ async def clear_profile_photos_now(account_id: int) -> bool:
     import asyncio
     from utils.advanced_anti_ban import get_photo_account_lock
 
+    # 🧊 FIX (infinite-hammer): اکانت فریز را اصلاً لمس نمی‌کنیم
+    from utils.freeze_guard import is_account_frozen, is_frozen_error, mark_account_frozen
+    if await is_account_frozen(account_id):
+        logger.warning(
+            f"clear_profile_photos_now({account_id}): SKIPPED — account is FROZEN "
+            "(no Telegram calls will be made)."
+        )
+        return False
+
     try:
         deleted_count = 0
         async with get_photo_account_lock(account_id):
-            while True:
-                # در هر دور فقط ۵ عکس می‌گیریم و پاک می‌کنیم تا آیدی‌ها منقضی نشوند
+            # 🧊 FIX (infinite-hammer): حلقه‌ی قبلی «while True» وقتی حذف عکس
+            # ممکن نبود (اکانت فریز/محدود) هرگز خارج نمی‌شد و photos.GetUserPhotos
+            # را هر ~۱۱ ثانیه ۲۴/۷ صدا می‌زد (۱۱٬۰۹۰ بار در لاگ bot_19!).
+            # الان: سقف دور + خروج فوری روی «پیشرفت صفر» + قطع روی خطای FROZEN.
+            from config import config as _cfg_obj
+            try:
+                _max_passes = max(1, int(getattr(_cfg_obj, "PHOTO_WIPE_MAX_PASSES", 4)))
+            except (TypeError, ValueError):
+                _max_passes = 4
+            # 🧊 FIX (POST-REVIEW): بودجه‌ی زمانی کل (PHOTO_ROTATION_TIMEOUT_SECONDS،
+            # پیش‌فرض ۹۰۰ ثانیه = ۱۵ دقیقه) — همان الگوی rotate_profile_photos؛
+            # تضمین می‌کند قفل per-account برای همیشه اشغال نشود (مثلاً وقتی
+            # FloodWaitهای طولانی پشت‌سرهم می‌آیند).
+            try:
+                _budget_seconds = max(60, int(getattr(_cfg_obj, "PHOTO_ROTATION_TIMEOUT_SECONDS", 900)))
+            except (TypeError, ValueError):
+                _budget_seconds = 900
+            _deadline = time.monotonic() + _budget_seconds
+
+            for _pass in range(1, _max_passes + 1):
+                if time.monotonic() > _deadline:
+                    logger.warning(
+                        f"clear_profile_photos_now({account_id}): time budget "
+                        f"({_budget_seconds}s) exceeded at pass {_pass} — aborting."
+                    )
+                    break
                 photos = [p async for p in client.get_chat_photos("me", limit=5)]
                 if not photos:
                     break
 
+                deleted_this_pass = 0
                 for photo in photos:
                     try:
                         await client.delete_profile_photos([photo.file_id])
                         deleted_count += 1
+                        deleted_this_pass += 1
                         await asyncio.sleep(1.5)
                     except Exception as e:
+                        if is_frozen_error(e):
+                            await mark_account_frozen(account_id, reason=f"clear photos: {e}")
+                            return False
                         logger.warning(f"Worker {client.name}: failed to delete a photo: {e}")
+
+                if deleted_this_pass == 0:
+                    logger.warning(
+                        f"Worker {client.name}: photo clear pass {_pass} deleted 0 photos "
+                        "(delete not permitted — likely frozen/restricted); aborting."
+                    )
+                    break
 
         logger.info(f"Worker {client.name}: {deleted_count} profile photos aggressively cleared.")
         return True
     except Exception as e:
+        if is_frozen_error(e):
+            await mark_account_frozen(account_id, reason=f"clear photos: {e}")
+            return False
         logger.warning(f"Worker {client.name}: failed to clear profile photos: {e}")
         return False
     
@@ -622,6 +672,18 @@ async def switch_worker_proxy(account_id: int, session: AsyncSession, reason: st
         await redis.set(f"worker_chunks:{account_id}", "0")
         await redis.set(f"worker_last_rot:{account_id}", str(time.time()), ex=259200) # انقضای ۳ روزه
         
+        # 🧊 FIX (proxy-flapping): حداقل اقامت (dwell) روی پروکسی جدید —
+        # چرخشِ مکررِ WEAK↔HEALTHY هر ~۲۰ دقیکه، IP اکانت را مدام عوض می‌کرد.
+        try:
+            from workers.sender import _get_redis as _gw_redis
+            from config import config as _sw_cfg
+            _dwell_h = max(0, int(getattr(_sw_cfg, "PROXY_MIN_DWELL_HOURS", 24)))
+            if _dwell_h > 0:
+                await _gw_redis().set(
+                    f"proxy_dwell:{account_id}", "1", ex=_dwell_h * 3600
+                )
+        except Exception as _dwell_err:
+            logger.debug(f"proxy dwell key failed for {account_id}: {_dwell_err}")
         return True
     except Exception as e:
         logger.error(f"Failed to start worker {account_id} with new proxy {new_proxy_str}: {e}")
@@ -890,6 +952,25 @@ async def _safe_rotate_profile_photos(
         return False
 
 
+async def _mark_photo_package_synced(account_id: int, package_id: int) -> None:
+    """
+    🧊 FIX (startup-storm): ثبت اینکه پکیج عکسِ این اکانت با موفقیت روی تلگرام
+    اعمال شده است — تا استارت‌ها/ری‌کانکت‌های بعدی دوباره کل چرخش
+    (wipe + upload + verify) را اجرا نکنند. تراکنش مستقل (الگوی BUG-30).
+    """
+    try:
+        async with async_session() as s:
+            await s.execute(
+                update(Account)
+                .where(Account.id == account_id)
+                .values(photo_package_synced_id=package_id)
+                .execution_options(synchronize_session=False)
+            )
+            await s.commit()
+    except Exception as e:
+        logger.warning(f"photo sync marker failed for account {account_id}: {e}")
+
+
 async def apply_photo_package_now(account_id: int) -> bool:
     """B13: اعمال فوری پکیج عکسِ فعلیِ اکانت روی ورکرِ متصل.
     فقط وقتی auto_set_photo روشن باشد، ورکر متصل باشد و پکیجی متصل شده باشد.
@@ -922,6 +1003,8 @@ async def apply_photo_package_now(account_id: int) -> bool:
             return False
 
         result = await _safe_rotate_profile_photos(client, photo_package, account_id=account_id)
+        if result:
+            await _mark_photo_package_synced(account_id, photo_package.id)
         if not result:
             logger.error(
                 f"apply_photo_package_now({account_id}): photo rotation did NOT complete cleanly "
@@ -1208,6 +1291,17 @@ async def start_all_workers(session: AsyncSession, bot: Optional[Bot] = None) ->
             # خطای غیرمنتظره‌ی یک ورکر نباید استارت بقیه را متوقف کند
             logger.error(f"Unexpected error while starting worker {account_id}: {e}")
 
+        # 🧊 FIX (startup-burst): فاصله‌ی تصادفی بین استارت ورکرها — قبلاً همه‌ی
+        # اکانت‌ها ظرف چند ثانیه پشت‌سرهم وصل می‌شدند و همه همزمان get_dialogs /
+        # join / profile-call می‌زدند؛ همگامیِ زمانی، امضای واضح «فارم اکانت» است.
+        try:
+            from config import config as _cfg_mod
+            _stagger_min = float(getattr(_cfg_mod, "WORKER_START_STAGGER_MIN", 3.0))
+            _stagger_max = float(getattr(_cfg_mod, "WORKER_START_STAGGER_MAX", 8.0))
+        except (TypeError, ValueError):
+            _stagger_min, _stagger_max = 3.0, 8.0
+        await asyncio.sleep(random.uniform(min(_stagger_min, _stagger_max), max(_stagger_min, _stagger_max)))
+
 
 # بازنویسی کامل: start_worker_with_rotation — workers/session_manager.py
 async def start_worker_with_rotation(
@@ -1329,11 +1423,38 @@ async def start_worker_with_rotation(
             if global_settings and getattr(global_settings, "auto_set_photo", False):
                 photo_package = await _get_photo_package_for_account(session, account_id)
                 if photo_package and photo_package.photos:
-                    task_photo = asyncio.create_task(
-                        _safe_rotate_profile_photos(client, photo_package, account_id=account_id)
+                    # 🧊 FIX (startup-storm): چرخش عکس فقط وقتی لازم است:
+                    #  • اکانت فریز نباشد (freeze_guard)
+                    #  • پکیج از آخرین بارِ اعمال‌شده عوض شده باشد (photo_package_synced_id)
+                    #  • یا PHOTO_ROTATION_ON_STARTUP صریحاً روشن باشد
+                    # قبلاً هر استارت/ری‌کانکت برای «همه‌ی» ورکرها چرخش کامل
+                    # (wipe + ۳ آپلود + verify) اجرا می‌شد = رگبار API در هر بوت.
+                    from utils.freeze_guard import is_account_frozen as _is_frozen
+                    from config import config as _cfg_mod
+                    _synced_id = await session.scalar(
+                        select(Account.photo_package_synced_id).where(Account.id == account_id)
                     )
-                    _background_tasks.add(task_photo)
-                    task_photo.add_done_callback(_background_tasks.discard)
+                    _already_synced = (_synced_id == photo_package.id)
+                    _startup_rotation_on = bool(getattr(_cfg_mod, "PHOTO_ROTATION_ON_STARTUP", False))
+                    if await _is_frozen(account_id):
+                        logger.warning(
+                            f"Worker {account_id}: startup photo rotation SKIPPED — account FROZEN."
+                        )
+                    elif _already_synced and not _startup_rotation_on:
+                        logger.info(
+                            f"Worker {account_id}: startup photo rotation SKIPPED — "
+                            f"package #{photo_package.id} already applied."
+                        )
+                    else:
+                        async def _rotate_and_mark(c, pkg, acc_id):
+                            ok = await _safe_rotate_profile_photos(c, pkg, account_id=acc_id)
+                            if ok:
+                                await _mark_photo_package_synced(acc_id, pkg.id)
+                        task_photo = asyncio.create_task(
+                            _rotate_and_mark(client, photo_package, account_id)
+                        )
+                        _background_tasks.add(task_photo)
+                        task_photo.add_done_callback(_background_tasks.discard)
 
             return True
 
@@ -1737,15 +1858,37 @@ async def start_single_worker(account: Account, session: AsyncSession) -> bool:
         task_profile.add_done_callback(_background_tasks.discard)
 
         # 🖼 پکیج عکس پروفایل: تسک مستقل — فقط با auto_set_photo روشن و پکیج متصل
+        # 🧊 FIX (startup-storm): مانند مسیر initialize — فقط برای اکانت غیرفریز و
+        # پکیجِ هنوز-اعمال‌نشده (یا وقتی PHOTO_ROTATION_ON_STARTUP روشن است).
         if global_settings and getattr(global_settings, "auto_set_photo", False):
             photo_package = await _get_photo_package_for_account(session, account.id)
             if photo_package and photo_package.photos:
-                task_photo = asyncio.create_task(
-                    _safe_rotate_profile_photos(client, photo_package, account_id=account.id)
+                from utils.freeze_guard import is_account_frozen as _is_frozen
+                from config import config as _cfg_mod
+                _already_synced = (
+                    getattr(account, "photo_package_synced_id", None) == photo_package.id
                 )
-                _background_tasks.add(task_photo)
-                task_photo.add_done_callback(_background_tasks.discard)
-            
+                _startup_rotation_on = bool(getattr(_cfg_mod, "PHOTO_ROTATION_ON_STARTUP", False))
+                if await _is_frozen(account.id):
+                    logger.warning(
+                        f"Worker {account.id}: startup photo rotation SKIPPED — account FROZEN."
+                    )
+                elif _already_synced and not _startup_rotation_on:
+                    logger.info(
+                        f"Worker {account.id}: startup photo rotation SKIPPED — "
+                        f"package #{photo_package.id} already applied."
+                    )
+                else:
+                    async def _rotate_and_mark(c, pkg, acc_id):
+                        ok = await _safe_rotate_profile_photos(c, pkg, account_id=acc_id)
+                        if ok:
+                            await _mark_photo_package_synced(acc_id, pkg.id)
+                    task_photo = asyncio.create_task(
+                        _rotate_and_mark(client, photo_package, account.id)
+                    )
+                    _background_tasks.add(task_photo)
+                    task_photo.add_done_callback(_background_tasks.discard)
+
         return True
     except Exception as e:
         logger.error(f"Failed to start new Worker {account.id} dynamically: {e}")
