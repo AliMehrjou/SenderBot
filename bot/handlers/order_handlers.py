@@ -196,6 +196,8 @@ FILTER_BY_TEXT = {
     "💬 فرستندگان پیام": "messages",
     "🥇 طلایی": "golden",
     "🟢 فقط آنلاین": "online",
+    # 🎙 استخراج شرکت‌کنندگان ویس چت (گفتگوی صوتی زنده گروه)
+    "🎙 ویس چت": "voicechat",
 }
 
 
@@ -235,6 +237,7 @@ def get_extract_strategy_keyboard() -> types.ReplyKeyboardMarkup:
     return flow_reply_keyboard([
         ["👥 همه اعضا", "💬 فرستندگان پیام"],
         ["🥇 طلایی", "🟢 فقط آنلاین"],
+        ["🎙 ویس چت"],
     ])
 
 

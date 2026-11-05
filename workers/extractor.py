@@ -715,6 +715,282 @@ async def extract_active_users(
 
 
 # ==========================================
+# 🎙 استخراج شرکت‌کنندگان ویس چت (گفتگوی صوتی زنده گروه)
+# — raw MTProto: channels.GetFullChannel / messages.GetFullChat → phone.GetGroupParticipants
+# ==========================================
+
+#: سقف امن تعداد شرکت‌کننده‌ای که از ویس چت جمع‌آوری می‌شود
+VOICE_CHAT_MAX_PARTICIPANTS = 10000
+
+#: اندازه‌ی هر صفحه‌ی phone.GetGroupParticipants (محدودیت API)
+VOICE_CHAT_PAGE_SIZE = 100
+
+#: مکث ضد-فلاد بین صفحات ویس چت (ثانیه)
+VOICE_CHAT_PAGE_PAUSE = (2.0, 4.0)
+
+
+async def _get_active_group_call(client: Client, chat_id: int):
+    """
+    🎙 یافتن ویس چتِ در حال برگزاریِ یک چت.
+    خروجی: (call_raw | None, error_status | None)
+      - call_raw: آبجکت raw GroupCall (دارای id/access_hash) اگر ویس چتی فعال/زنده باشد.
+      - error_status: اگر پیش از بررسی خطایی رخ داد (مثلاً resolve نشد).
+    """
+    from pyrogram.raw import functions as raw_functions, types as raw_types
+
+    try:
+        peer = await client.resolve_peer(chat_id)
+    except Exception as e:
+        logger.error(f"VoiceChat: resolve_peer failed for {chat_id}: {e}")
+        return None, "error"
+
+    call = None
+    try:
+        if isinstance(peer, raw_types.InputPeerChannel):
+            full = await client.invoke(
+                raw_functions.channels.GetFullChannel(channel=peer)
+            )
+            call = getattr(getattr(full, "full_chat", None), "call", None)
+        elif isinstance(peer, raw_types.InputPeerChat):
+            full = await client.invoke(
+                raw_functions.messages.GetFullChat(chat_id=peer.chat_id)
+            )
+            call = getattr(getattr(full, "full_chat", None), "call", None)
+        else:
+            logger.warning(f"VoiceChat: unsupported peer type {type(peer).__name__} for {chat_id}")
+            return None, "error"
+    except FloodWait as e:
+        # فلادویتِ متادیتا → به‌صورت limit برگردد تا دیسپچر بعداً دوباره تلاش کند
+        raise
+    except _NETWORK_ERRORS as e:
+        logger.error(f"VoiceChat: network error resolving call info for {chat_id}: {e}")
+        _report_proxy(client, False)
+        return None, "proxy_connection_error"
+    except Exception as e:
+        logger.error(f"VoiceChat: failed to fetch full chat {chat_id}: {e}")
+        return None, "error"
+
+    # ویس چتِ زمان‌بندی‌شده (هنوز شروع نشده) هم نتیجه نمی‌دهد
+    if call is not None and getattr(call, "schedule_date", None):
+        logger.info(f"VoiceChat: call on {chat_id} is scheduled but not started.")
+        return None, None
+
+    return call, None
+
+
+async def extract_voice_chat_participants(
+    client: Client,
+    group_link: str,
+    progress_cb: Optional[Callable[[int, int], Awaitable[bool]]] = None,
+    chat_id_hint: Optional[int] = None,
+    order_id: Optional[int] = None,
+    speed_profile: Optional[SpeedProfile] = None,
+) -> tuple[str, Optional[str], Optional[int], bool, int]:
+    """
+    🎙 استخراج لیست شرکت‌کنندگان (شنونده/گوینده) ویس چت فعالِ گروه.
+
+    خروجی: همان ساختار extract_active_users —
+      (status, file_path, chat_id, joined_now, no_username_count)
+    استاتوس‌های خاص:
+      - "no_voice_chat": گروه ویس چت فعال ندارد (یا هنوز شروع نشده).
+      - "voice_chat_empty": ویس چت فعال است اما کاربر قابل استخراجی (دارای یوزرنیم) ندارد.
+    """
+    from pyrogram.raw import functions as raw_functions, types as raw_types
+
+    logger.info(f"Worker {client.name} starting VOICECHAT extraction for {group_link}")
+
+    chat_id = None
+    joined_now = False
+    total_yielded = 0
+    no_username = 0
+    is_partial = False
+    is_stopped = False
+    file_path = None
+
+    try:
+        # ۱. عضویت در گروه (همان مسیر امنِ سایر استراتژی‌ها)
+        join_status, chat_obj, joined_now = await safe_join_chat(
+            client, group_link, chat_id_hint=chat_id_hint, order_id=order_id
+        )
+        chat_id = getattr(chat_obj, "id", None)
+
+        if join_status not in ("success", "already_member") or not chat_obj:
+            return (join_status, None, chat_id, joined_now, 0)
+
+        # ۲. یافتن ویس چت فعال
+        call, call_err = await _get_active_group_call(client, chat_id)
+        if call_err:
+            return (call_err, None, chat_id, joined_now, 0)
+        if call is None:
+            logger.info(f"VoiceChat: no active call on {chat_link_log(group_link)}.")
+            return ("no_voice_chat", None, chat_id, joined_now, 0)
+
+        input_call = raw_types.InputGroupCall(id=call.id, access_hash=call.access_hash)
+        call_count = getattr(call, "participants_count", 0) or 0
+        logger.info(
+            f"VoiceChat: active call found (id={call.id}, reported participants={call_count})."
+        )
+
+        # ۳. فایل خروجی
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = uuid.uuid4().hex[:8]
+        raw_name = group_link.split("/")[-1].replace("+", "").replace("joinchat-", "")
+        safe_link_name = re.sub(r'[\\/*?:"<>|]', "", raw_name)
+        file_path = f"exports/ext_voicechat_{safe_link_name}_{timestamp}_{unique_id}.txt"
+
+        # ۴. حذف ادمین‌ها از خروجی (هم‌راستا با بقیه‌ی استراتژی‌ها)
+        admin_ids: Set[int] = await _collect_admin_ids(client, chat_id)
+
+        seen_ids: Set[int] = set()
+        offset = ""
+        retries = 3
+
+        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+            while True:
+                try:
+                    res = await client.invoke(
+                        raw_functions.phone.GetGroupParticipants(
+                            call=input_call,
+                            ids=[],
+                            sources=[],
+                            offset=offset,
+                            limit=VOICE_CHAT_PAGE_SIZE,
+                        )
+                    )
+                except FloodWait as e:
+                    logger.warning(
+                        f"VoiceChat: FloodWait {e.value}s on page (offset={offset!r}). Retries left: {retries - 1}"
+                    )
+                    if retries <= 0:
+                        is_partial = True
+                        break
+                    await asyncio.sleep(e.value + random.uniform(1, 3))
+                    retries -= 1
+                    continue
+                except _NETWORK_ERRORS as e:
+                    logger.error(f"VoiceChat: network error during pagination: {e}")
+                    _report_proxy(client, False)
+                    if total_yielded > 0:
+                        is_partial = True
+                    else:
+                        return ("proxy_connection_error", None, chat_id, joined_now, no_username)
+                    break
+                except Exception as e:
+                    err_name = str(e.__class__.__name__)
+                    if "GroupCall" in err_name:
+                        # ویس چت وسط کار تمام/نامعتبر شد
+                        logger.warning(f"VoiceChat: call ended/invalid during pagination: {e}")
+                        if total_yielded > 0:
+                            is_partial = True
+                            break
+                        return ("no_voice_chat", None, chat_id, joined_now, no_username)
+                    logger.error(f"VoiceChat: pagination error: {e}")
+                    if total_yielded > 0:
+                        is_partial = True
+                    else:
+                        return ("error", None, chat_id, joined_now, no_username)
+                    break
+
+                participants = getattr(res, "participants", None) or []
+                if not participants:
+                    break
+
+                # نگاشت آیدی‌ها به آبجکت‌های کاربرِ همین صفحه
+                users_map = {u.id: u for u in (getattr(res, "users", None) or [])}
+
+                for p in participants:
+                    peer_obj = getattr(p, "peer", None)
+                    uid = getattr(peer_obj, "user_id", None)
+                    if uid is None or uid in seen_ids or uid in admin_ids:
+                        continue
+                    seen_ids.add(uid)
+
+                    user = users_map.get(uid)
+                    if user is None:
+                        continue
+                    if getattr(user, "bot", False) or getattr(user, "deleted", False):
+                        continue
+
+                    username = getattr(user, "username", None)
+                    if not username:
+                        no_username += 1
+                        continue
+
+                    target_id = f"@{username}"
+                    await f.write(f"{target_id}\n")
+                    total_yielded += 1
+
+                # 🟢 سیگنال توقف ادمین + گزارش پیشرفت زنده
+                if progress_cb and await progress_cb(total_yielded, len(seen_ids)) is False:
+                    is_stopped = True
+                    break
+
+                if total_yielded >= VOICE_CHAT_MAX_PARTICIPANTS:
+                    logger.warning(
+                        f"VoiceChat: hit participants cap ({VOICE_CHAT_MAX_PARTICIPANTS})."
+                    )
+                    is_partial = True
+                    break
+
+                next_offset = getattr(res, "next_offset", None)
+                if not next_offset:
+                    break
+                offset = next_offset
+
+                await asyncio.sleep(random.uniform(*VOICE_CHAT_PAGE_PAUSE))
+
+    except FloodWait as e:
+        logger.warning(f"VoiceChat: FloodWait {e.value}s in outer flow.")
+        if total_yielded > 0:
+            is_partial = True
+        else:
+            return (f"limit:flood_wait:{e.value}", None, chat_id, joined_now, no_username)
+    except _NETWORK_ERRORS as e:
+        logger.error(f"VoiceChat: proxy/network error for worker {client.name}: {e}")
+        _report_proxy(client, False)
+        if total_yielded > 0:
+            is_partial = True
+        else:
+            return ("proxy_connection_error", None, chat_id, joined_now, no_username)
+    except Exception as e:
+        logger.error(f"VoiceChat: critical error: {e}", exc_info=True)
+        err_name = str(e.__class__.__name__)
+        if any(b in err_name for b in ["UserDeactivated", "UserDeactivatedBan", "AuthKeyUnregistered", "SessionRevoked"]):
+            return ("limit:banned:0", file_path if total_yielded > 0 else None, chat_id, joined_now, no_username)
+        if total_yielded > 0:
+            is_partial = True
+        else:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+            return ("error", None, chat_id, joined_now, no_username)
+
+    # ---- تعیین استاتوس نهایی ----
+    if total_yielded == 0:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        if is_stopped:
+            return ("stopped", None, chat_id, joined_now, no_username)
+        # ویس چت فعال بود اما هیچ شرکت‌کننده‌ی قابل استخراجی نداشت
+        return ("voice_chat_empty", None, chat_id, joined_now, no_username)
+
+    if is_stopped:
+        final_status = "stopped"
+    elif is_partial:
+        final_status = "partial_success"
+    else:
+        final_status = "success"
+
+    _report_proxy(client, True)
+    return (final_status, file_path, chat_id, joined_now, no_username)
+
+
+def chat_link_log(group_link: str) -> str:
+    """🎙 هلپر کوچک لاگ (جلوگیری از لاگِ خام لینکهای خیلی طولانی)"""
+    link = (group_link or "").strip()
+    return link if len(link) <= 64 else link[:61] + "..."
+
+
+# ==========================================
 # 🔄 استخراج موازی (Parallel Extraction)
 # این پیاده‌سازی جایگزین کاملِ نسخه‌ی بلااستفاده‌ی extract_members_parallel است.
 # ==========================================

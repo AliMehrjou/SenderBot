@@ -17,6 +17,7 @@ from workers.extractor import (
     extract_active_users,
     extract_members_for_sending,
     extract_members_parallel,     # 🔄 فاز استخراج موازی
+    extract_voice_chat_participants,  # 🎙 فاز ویس چت: استخراج شرکت‌کنندگان گفتگوی صوتی
     _PARALLEL_SAFE_FILTERS,       # 🟢 اضافه شده برای جلوگیری از قفل اضافی در استراتژی‌های نامعتبر
 )
 
@@ -739,14 +740,21 @@ async def extractor_task_wrapper(
             pass
 
         # 🟢 Fallback تخمین برای گروه‌های خصوصی که get_chat قبل از join ناموفق بود
-        if total_estimate is None and order.filter_type != "messages":
+        # (برای ویس چت هم تخمینِ تعداد «اعضا» گمراه‌کننده است — شرکت‌کنندگان ویس چت شمرده می‌شوند)
+        if total_estimate is None and order.filter_type not in ("messages", "voicechat"):
             try:
                 total_estimate = await _estimate_member_count(clients[0], group_link)
             except Exception:
                 pass
             
         if reporter is not None:
-            if order.filter_type == "messages" or fallback_active:
+            if order.filter_type == "voicechat":
+                await reporter.update(
+                    done=int(count),
+                    status=f"در حال دریافت شرکت‌کنندگان ویس چت (یافته‌شده: {count})…",
+                    account=worker_label,
+                )
+            elif order.filter_type == "messages" or fallback_active:
                 await reporter.update(
                     done=scanned,
                     total=5000,
@@ -791,7 +799,29 @@ async def extractor_task_wrapper(
     # ============================================================
     slice_stats = ""
     no_username_total = 0
-    if is_parallel:
+    # 🎙 فاز ویس چت: موتور اختصاصی — استخراج شرکت‌کنندگان گفتگوی صوتی همیشه تک‌ورکر است
+    # (لیست شرکت‌کنندگان از یک نقطه قابل مشاهده است؛ پارتیشن‌بندی معنا ندارد)
+    if getattr(order, "filter_type", None) == "voicechat":
+        status_code, file_path, join_chat_id, joined_now, no_username_total = await extract_voice_chat_participants(
+            clients[0], group_link, progress_cb=progress_cb,
+            chat_id_hint=chat_id_hint,
+            order_id=order.id,
+            speed_profile=profile,
+        )
+        join_records = [{
+            "index": 0,
+            "join_chat_id": join_chat_id,
+            "joined_now": joined_now,
+            "status": status_code,
+        }]
+        if status_code.startswith("limit:"):
+            parts = status_code.split(":")
+            limit_records = [{
+                "index": 0,
+                "limit_type": parts[1] if len(parts) > 1 else "unknown",
+                "wait_seconds": int(parts[2]) if len(parts) > 2 else 0,
+            }]
+    elif is_parallel:
         parallel_result = await extract_members_parallel(
             clients,
             group_link,
@@ -1324,6 +1354,24 @@ async def extractor_task_wrapper(
             elif status_code == "proxy_connection_error":
                 log_entry.error_message = "خطای اتصال پروکسی یا شبکه."
                 stop_reason = "proxy_connection_error"
+            elif status_code == "no_voice_chat":
+                # 🎙 فاز ویس چت: گروه ویس چتِ فعال (یا شروع‌نشده) ندارد
+                log_entry.error_message = "ویس چت (گفتگوی صوتی) فعال در این گروه یافت نشد."
+                await broadcast_to_admins(
+                    bot,
+                    text=(
+                        f"🎙 <b>استخراج ویس چت ناموفق بود</b>\n\n"
+                        f"سفارش: <code>{order.tracking_code or order.id}</code>\n"
+                        f"تارگت: <b>{html.escape(group_link)}</b>\n\n"
+                        f"<i>در این گروه هیچ گفتگوی صوتی (ویس چت) فعالی در جریان نیست یا هنوز شروع نشده است. "
+                        f"پس از شروع ویس چت، مجدداً سفارش ثبت کنید.</i>"
+                    )
+                )
+                stop_reason = "no_voice_chat"
+            elif status_code == "voice_chat_empty":
+                # 🎙 فاز ویس چت: ویس چت فعال است اما شرکت‌کننده‌ی قابل استخراج ندارد
+                log_entry.error_message = "ویس چت فعال است اما شرکت‌کننده‌ای (دارای یوزرنیم) ندارد."
+                stop_reason = "voice_chat_empty"
             else:
                 worker_note = ""
                 if is_parallel and join_records:
@@ -1341,13 +1389,24 @@ async def extractor_task_wrapper(
             unsent_targets = [group_link]
 
         if reporter is not None and log_entry.status == "error":
-            fail_reason = (
-                "این تارگت یک کانال است و ورکر ادمین آن نیست؛ استخراج آیدی از کانال ممکن نیست."
-                if status_code == "error_not_admin"
-                else ("درخواست ورود به گروه رد شد (یا ربات بلاک شده است)." if status_code == "rejected" 
-                else ("ارتباط با پروکسی یا شبکه قطع شد." if status_code == "proxy_connection_error" 
-                else ("عملیات قبل از یافتن کاربری توسط شما لغو شد." if status_code == "stopped" else "استخراج اعضا ناموفق بود یا دسترسی وجود ندارد.")))
-            )
+            if status_code == "no_voice_chat":
+                fail_reason = (
+                    "🎙 در این گروه هیچ ویس چت (گفتگوی صوتی) فعالی در جریان نیست.\n"
+                    "پس از شروع ویس چت توسط ادمین گروه، دوباره سفارش ثبت کنید."
+                )
+            elif status_code == "voice_chat_empty":
+                fail_reason = "🎙 ویس چت فعال است، اما هیچ شرکت‌کننده‌ای (دارای یوزرنیم) برای استخراج یافت نشد."
+            elif status_code == "error_not_admin":
+                fail_reason = "این تارگت یک کانال است و ورکر ادمین آن نیست؛ استخراج آیدی از کانال ممکن نیست."
+            elif status_code == "rejected":
+                fail_reason = "درخواست ورود به گروه رد شد (یا ربات بلاک شده است)."
+            elif status_code == "proxy_connection_error":
+                fail_reason = "ارتباط با پروکسی یا شبکه قطع شد."
+            elif status_code == "stopped":
+                fail_reason = "عملیات قبل از یافتن کاربری توسط شما لغو شد."
+            else:
+                fail_reason = "استخراج اعضا ناموفق بود یا دسترسی وجود ندارد."
+
             await reporter.fail(
                 f"⛔️ <b>استخراج ناموفق بود</b>\n\n{fail_reason}"
             )
@@ -1417,6 +1476,11 @@ def _get_resolver_error_message(status_code: str) -> str:
         return "❌ درخواست عضویت ربات توسط ادمین گروه رد شد (یا ربات از گروه اخراج/بن شده است)."
     elif status_code == "invalid_link":
         return "🔗 لینک وارد شده نامعتبر یا منقضی شده است. لطفاً لینک گروه را بررسی کنید."
+    # 🎙 فاز ویس چت
+    elif status_code == "no_voice_chat":
+        return "🎙 در این گروه ویس چت (گفتگوی صوتی) فعالی در جریان نیست یا هنوز شروع نشده است."
+    elif status_code == "voice_chat_empty":
+        return "🎙 ویس چت فعال است اما هیچ شرکت‌کننده‌ی قابل استخراجی (دارای یوزرنیم) در آن یافت نشد."
     # ++++++++++++++++++++++++++++++++++
     else:
         return "استخراج اعضای گروه ناموفق بود یا دسترسی وجود ندارد."
@@ -2404,8 +2468,11 @@ async def background_order_execution(
                     pass
                 break
 
-            # 🔴 خطاهای سخت استخراج (مثل ادمین نبودن در کانال یا ریجکت شدن ریکوئست)
-            elif _is_extract_order(order) and stop_reason in ("error", "error_not_admin", "rejected"):
+            # 🔴 خطاهای سخت استخراج (مثل ادمین نبودن در کانال، ریجکت شدن ریکوئست،
+            # یا 🎙 نبودِ ویس چت فعال / خالی‌بودن ویس چت — تلاش مجدد بی‌معناست)
+            elif _is_extract_order(order) and stop_reason in (
+                "error", "error_not_admin", "rejected", "no_voice_chat", "voice_chat_empty"
+            ):
                 async with session_maker() as session:
                     db_order = await session.get(Order, order_id)
                     if db_order:
@@ -3603,7 +3670,12 @@ async def order_dispatcher_loop(
                                 parallel_acc_ids: List[int] = [picked_acc_id]
                                 total_estimate: Optional[int] = None
 
-                                if order_profile.estimate_on_critical_path and extract_parallel_max_workers > 1:
+                                # 🎙 ویس چت: تخمینِ «تعداد اعضا» برای نوار پیشرفتِ شرکت‌کنندگان گمراه‌کننده است
+                                if (
+                                    order_profile.estimate_on_critical_path
+                                    and extract_parallel_max_workers > 1
+                                    and order.filter_type != "voicechat"
+                                ):
                                     try:
                                         total_estimate = await asyncio.wait_for(
                                             _estimate_member_count(picked_client, group_link),
